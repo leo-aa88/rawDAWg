@@ -3545,6 +3545,7 @@ dependencies = [
  "rawdawg-dsp",
  "rawdawg-effects",
  "rawdawg-midi",
+ "rawdawg-plugin-host",
  "rawdawg-project",
  "rawdawg-rt",
  "rawdawg-sampler",
@@ -3641,6 +3642,20 @@ dependencies = [
  "rawdawg-effects",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "serde_json",
+]
+
+[[package]]
+name = "rawdawg-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "clack-extensions",
+ "clack-host",
+ "log",
+ "rawdawg-dsp",
+ "rawdawg-plugin-clap",
+ "rawdawg-types",
+ "serde",
  "serde_json",
 ]
 

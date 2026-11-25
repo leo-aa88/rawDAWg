@@ -58,6 +58,23 @@ pub struct Args {
     #[arg(long)]
     pub safe_mode: bool,
 
+    /// Scan the standard and user plugin directories into the catalog (isolated per-module
+    /// subprocesses), print a JSON report and exit.
+    #[arg(long)]
+    pub scan_plugins: bool,
+
+    /// Catalog file to use instead of the per-user one (tests, portable setups).
+    #[arg(long, value_name = "FILE", hide = true)]
+    pub catalog: Option<PathBuf>,
+
+    /// Scanner child: describe one plugin module and print a JSON report (internal).
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub scan_plugin: Option<PathBuf>,
+
+    /// Format of --scan-plugin (internal).
+    #[arg(long, value_name = "FORMAT", hide = true, default_value = "clap")]
+    pub scan_format: String,
+
     /// List audio hosts/devices as JSON and exit.
     #[arg(long)]
     pub list_audio_devices: bool,
@@ -114,6 +131,17 @@ pub enum WavFormatArg {
 }
 
 pub fn run(args: Args) -> anyhow::Result<i32> {
+    if let Some(path) = &args.scan_plugin {
+        let format = match args.scan_format.as_str() {
+            "clap" => rawdawg_plugin_host::Format::Clap,
+            "vst3" => rawdawg_plugin_host::Format::Vst3,
+            other => bail!("unknown --scan-format {other}"),
+        };
+        return Ok(rawdawg_plugin_host::scan::run_scanner_child(path, format));
+    }
+    if args.scan_plugins {
+        return crate::plugins::scan_cli(args.catalog.clone());
+    }
     if args.list_audio_devices {
         let snap = rawdawg_audio_io::enumerate();
         println!("{}", serde_json::to_string_pretty(&snap)?);

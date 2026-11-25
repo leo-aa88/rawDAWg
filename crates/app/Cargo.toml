@@ -24,6 +24,7 @@ rawdawg-project = { path = "../project" }
 rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-audio-io = { path = "../audio-io" }
 rawdawg-midi = { path = "../midi" }
+rawdawg-plugin-host = { path = "../plugin-host" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 eframe = { workspace = true }
