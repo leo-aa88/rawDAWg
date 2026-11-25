@@ -16,6 +16,7 @@ rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
 rawdawg-synthesizer = { path = "../synthesizer" }
 rawdawg-effects = { path = "../effects" }
+rawdawg-plugin-api = { path = "../plugin-api" }
 serde_json = { workspace = true }
 clack-plugin = { workspace = true }
 clack-extensions = { workspace = true, features = ["clack-plugin", "clack-host"] }

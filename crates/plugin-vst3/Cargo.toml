@@ -1,6 +1,6 @@
 [package]
 name = "rawdawg-plugin-vst3"
-description = "rawDAWg VST3 export: thin COM adapter over native processors (M0 ABI spike: gain effect)"
+description = "rawDAWg VST3 export: thin COM adapter exposing the flagship synth and every native effect family"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,7 +14,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
+rawdawg-plugin-api = { path = "../plugin-api" }
 vst3 = { workspace = true }
 
 [dev-dependencies]
 libloading = { workspace = true }
+rawdawg-effects = { path = "../effects" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+serde_json = { workspace = true }

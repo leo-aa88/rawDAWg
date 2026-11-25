@@ -239,7 +239,7 @@ fn exercise_every_effect(entry: &PluginEntry) {
         let mut saved = Vec::new();
         state.save(&handle, &mut saved).expect("save");
         let json: serde_json::Value = serde_json::from_slice(&saved).expect("JSON envelope");
-        assert_eq!(json["rawdawg_clap"], 1, "{id}");
+        assert_eq!(json["rawdawg_state"], 1, "{id}");
         assert_eq!(json["type_id"], exported.native_type_id, "{id}");
         assert!(json["processor"].is_object(), "{id} carries the processor state");
         state.load(&handle, &mut std::io::Cursor::new(saved.clone())).expect("load envelope");

@@ -4,14 +4,14 @@
 //! [`TimedEvent`]s and the shared [`Processor`] renders audio. No DSP lives here.
 //! One generic plugin type ([`RawPlugin`]) wraps any native processor; the
 //! factory ([`RawFactory`]) exposes the flagship synth (`rawdawg.synth`) and
-//! every listed effect family (`rawdawg.fx.<family>`). Supported extensions:
-//! audio ports (stereo main in/out, stereo sidechain where the effect reads
-//! one), note ports (instrument), params, state, latency and tail.
+//! every listed effect family (`rawdawg.fx.<family>`) from the format-neutral
+//! catalogue in `rawdawg_plugin_api`. Supported extensions: audio ports (stereo
+//! main in/out, stereo sidechain where the effect reads one), note ports
+//! (instrument), params, state, latency and tail.
 //!
-//! Effects additionally expose two wrapper parameters that the standalone app
-//! applies outside the processor: `Bypass` (latency-preserving true bypass) and
-//! `Mix` (wet/dry with the dry path delayed by the reported latency), so an
-//! exported reverb behaves like its insert in rawDAWg.
+//! Effects additionally expose the wrapper parameters `Bypass` and `Mix`
+//! (`rawdawg_plugin_api::wrap`), shared with the VST3 export, so an exported
+//! reverb behaves like its insert in rawDAWg and its state loads in both formats.
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts, PluginAudioPortsImpl};
 use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
@@ -20,163 +20,66 @@ use clack_extensions::params::{ParamDisplayWriter, ParamInfo, ParamInfoFlags, Pa
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_extensions::tail::{PluginTail, PluginTailImpl, TailLength};
 use clack_plugin::entry::prelude::*;
-use clack_plugin::plugin::features;
 use clack_plugin::prelude::*;
-use rawdawg_dsp::delayline::DelayLine;
-use rawdawg_dsp::processor::{PrepareSpec, ProcessContext, Processor, Tail, TransportView};
-use rawdawg_dsp::smooth::Smoother;
+use rawdawg_dsp::processor::{PrepareSpec, ProcessContext, Processor, TransportView};
 use rawdawg_dsp::{AudioBlock, BusLayout};
-use rawdawg_effects::EffectInfo;
-use rawdawg_synthesizer::Synth;
+use rawdawg_plugin_api::ExportedPlugin;
+use rawdawg_plugin_api::wrap::{EffectWrapper, parse_state, save_envelope, wrapper_descriptors};
 use rawdawg_types::events::{EventKind, EventSource, TimedEvent, sort_events};
-use rawdawg_types::params::ParamCategory;
-use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping, ParamUnit};
-use std::ffi::CStr;
+use rawdawg_types::{ParamDescriptor, ParamId};
+use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Stable external CLAP id of the flagship synth.
-pub const SYNTH_CLAP_ID: &str = "rawdawg.synth";
-/// Prefix of every exported effect id (`rawdawg.fx.reverb`, …).
-pub const FX_CLAP_ID_PREFIX: &str = "rawdawg.fx.";
-const NATIVE_FX_PREFIX: &str = "native.fx.";
-pub const VENDOR: &str = "rawDAWg";
-pub const URL: &str = "https://github.com/leonardo-aa/rawDAWg";
+pub use rawdawg_plugin_api::exported::{FX_CLAP_ID_PREFIX, SYNTH_CLAP_ID, URL, VENDOR, clap_id_for_native, native_type_id_for_clap};
+pub use rawdawg_plugin_api::wrap::{WRAP_BYPASS, WRAP_MIX};
 
 /// Maximum events translated per process call (bounded, preallocated).
 const MAX_EVENTS: usize = 4096;
 /// Maximum frames per process call we prepare for; larger host blocks are split.
 const MAX_FRAMES: usize = 8192;
-/// Wrapper parameter ids (outside the native descriptor id space, which is small).
-pub const WRAP_BYPASS: u32 = 0xFFFF_0000;
-pub const WRAP_MIX: u32 = 0xFFFF_0001;
-/// Upper bound on the latency the dry path can compensate (10 s at 384 kHz would be absurd; 1 M frames is plenty).
-const MAX_DRY_LATENCY: usize = 1 << 20;
 /// Hard cap for host-provided state blobs.
 const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
-static WRAP_DESCRIPTORS: [ParamDescriptor; 2] = [
-    {
-        let mut d = ParamDescriptor::continuous(WRAP_BYPASS, "wrap.bypass", "Bypass", ParamUnit::None, ParamMapping::Toggle, 0.0, ParamCategory::Mix).stepped();
-        d.flags.is_bypass = true;
-        d
-    },
-    ParamDescriptor::continuous(WRAP_MIX, "wrap.mix", "Mix", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 1.0 }, 1.0, ParamCategory::Mix),
-];
-
-/// What an exported plugin wraps.
-#[derive(Clone, Copy, Debug)]
-pub enum Kind {
-    Synth,
-    Effect(&'static EffectInfo),
+/// One plugin the entry exposes: the catalogue entry plus its CLAP descriptor.
+pub struct Exported {
+    pub plugin: ExportedPlugin,
+    descriptor: PluginDescriptor,
+    /// Owned feature strings the descriptor was built from (kept for the entry's lifetime).
+    _features: Vec<CString>,
 }
 
-/// One plugin the entry exposes.
-pub struct Exported {
-    pub clap_id: String,
-    /// The native processor type id (`native.synth`, `native.fx.reverb`, …).
-    pub native_type_id: &'static str,
-    pub kind: Kind,
-    /// Effects whose descriptors include a `sidechain` toggle get a second input port.
-    pub has_sidechain: bool,
-    pub has_mix: bool,
-    descriptor: PluginDescriptor,
+impl std::ops::Deref for Exported {
+    type Target = ExportedPlugin;
+    fn deref(&self) -> &ExportedPlugin {
+        &self.plugin
+    }
 }
 
 impl Exported {
-    pub fn descriptor(&self) -> &PluginDescriptor {
-        &self.descriptor
-    }
-    pub fn is_synth(&self) -> bool {
-        matches!(self.kind, Kind::Synth)
-    }
-    /// Display name as the host sees it (`rawDAWg Reverb`).
-    pub fn display_name(&self) -> String {
-        match self.kind {
-            Kind::Synth => rawdawg_synthesizer::DISPLAY_NAME.to_owned(),
-            Kind::Effect(info) => format!("rawDAWg {}", info.name),
-        }
-    }
-    /// A fresh, unprepared native processor for this plugin.
-    pub fn make(&self) -> Result<Box<dyn Processor>, String> {
-        match self.kind {
-            Kind::Synth => Ok(Box::new(Synth::default())),
-            Kind::Effect(info) => rawdawg_effects::make_effect(info.type_id, None),
-        }
-    }
-}
-
-/// `native.fx.reverb` → `rawdawg.fx.reverb`; `native.synth` → `rawdawg.synth`.
-pub fn clap_id_for_native(type_id: &str) -> Option<String> {
-    if type_id == rawdawg_synthesizer::TYPE_ID { Some(SYNTH_CLAP_ID.to_owned()) } else { type_id.strip_prefix(NATIVE_FX_PREFIX).map(|slug| format!("{FX_CLAP_ID_PREFIX}{slug}")) }
-}
-
-/// Inverse of [`clap_id_for_native`].
-pub fn native_type_id_for_clap(clap_id: &str) -> Option<String> {
-    if clap_id == SYNTH_CLAP_ID { Some(rawdawg_synthesizer::TYPE_ID.to_owned()) } else { clap_id.strip_prefix(FX_CLAP_ID_PREFIX).map(|slug| format!("{NATIVE_FX_PREFIX}{slug}")) }
-}
-
-fn effect_features(info: &EffectInfo) -> Vec<&'static CStr> {
-    let slug = info.type_id.strip_prefix(NATIVE_FX_PREFIX).unwrap_or(info.type_id);
-    let specific: &[&'static CStr] = match slug {
-        "eq" => &[features::EQUALIZER],
-        "compressor" => &[features::COMPRESSOR],
-        "limiter" => &[features::LIMITER, features::MASTERING],
-        "gate" => &[features::GATE],
-        "distortion" | "multiband" => &[features::DISTORTION],
-        "delay" => &[features::DELAY],
-        "chorus" => &[features::CHORUS],
-        "flanger" => &[features::FLANGER],
-        "phaser" => &[features::PHASER],
-        "pitch" => &[features::PITCH_SHIFTER],
-        "granular" => &[features::GRANULAR, features::GLITCH],
-        "spectral" => &[features::PHASE_VOCODER, features::GLITCH],
-        "reverb" | "convolution" => &[features::REVERB],
-        "stereo" => &[features::UTILITY, features::MIXING],
-        _ => &[],
-    };
-    let mut v = vec![features::AUDIO_EFFECT];
-    v.extend_from_slice(specific);
-    v.push(features::STEREO);
-    v
-}
-
-/// Every plugin the entry exports: the synth first, then the listed effects in catalogue order.
-pub fn exported_plugins() -> Vec<Exported> {
-    let mut out = Vec::with_capacity(1 + rawdawg_effects::CATALOG.len());
-    out.push(Exported {
-        clap_id: SYNTH_CLAP_ID.to_owned(),
-        native_type_id: rawdawg_synthesizer::TYPE_ID,
-        kind: Kind::Synth,
-        has_sidechain: false,
-        has_mix: false,
-        descriptor: PluginDescriptor::new(SYNTH_CLAP_ID, rawdawg_synthesizer::DISPLAY_NAME)
+    fn new(plugin: ExportedPlugin) -> Self {
+        let features: Vec<CString> = plugin.clap_features().into_iter().filter_map(|f| CString::new(f).ok()).collect();
+        let descriptor = PluginDescriptor::new(&plugin.clap_id, &plugin.name)
             .with_vendor(VENDOR)
             .with_url(URL)
             .with_version(rawdawg_types::VERSION)
-            .with_description("rawDAWg flagship experimental synthesizer. Less thinking. More noise.")
-            .with_features([features::INSTRUMENT, features::SYNTHESIZER, features::STEREO]),
-    });
-    for info in rawdawg_effects::CATALOG.iter().filter(|i| i.listed) {
-        let Some(clap_id) = clap_id_for_native(info.type_id) else { continue };
-        let has_sidechain = rawdawg_effects::make_effect(info.type_id, None).map(|p| p.descriptors().iter().any(|d| d.key == "sidechain")).unwrap_or(false);
-        let name = format!("rawDAWg {}", info.name);
-        out.push(Exported {
-            descriptor: PluginDescriptor::new(&clap_id, &name)
-                .with_vendor(VENDOR)
-                .with_url(URL)
-                .with_version(rawdawg_types::VERSION)
-                .with_description(info.description)
-                .with_features(effect_features(info)),
-            clap_id,
-            native_type_id: info.type_id,
-            kind: Kind::Effect(info),
-            has_sidechain,
-            has_mix: info.has_mix,
-        });
+            .with_description(plugin.description)
+            .with_features(features.iter().map(|c| c.as_c_str()));
+        Self { plugin, descriptor, _features: features }
     }
-    out
+    pub fn descriptor(&self) -> &PluginDescriptor {
+        &self.descriptor
+    }
+    /// Display name as the host sees it (`rawDAWg Reverb`).
+    pub fn display_name(&self) -> String {
+        self.plugin.name.clone()
+    }
+}
+
+/// Every plugin the entry exports (synth first, then the catalogue effects).
+pub fn exported_plugins() -> Vec<Exported> {
+    rawdawg_plugin_api::exported_plugins().into_iter().map(Exported::new).collect()
 }
 
 /// The generic plugin type: every exported plugin is an instance of it.
@@ -211,7 +114,7 @@ impl<'a> Shared<'a> {
     }
     fn set_wrapper_param(&self, id: u32, value: f32) -> bool {
         match id {
-            WRAP_BYPASS => {
+            WRAP_BYPASS if !self.exported.is_synth() => {
                 self.bypass.store(value >= 0.5, Ordering::Relaxed);
                 true
             }
@@ -222,13 +125,8 @@ impl<'a> Shared<'a> {
             _ => false,
         }
     }
-    /// Wrapper descriptors this plugin exposes (none for instruments).
     fn wrapper_descriptors(&self) -> &'static [ParamDescriptor] {
-        match (self.exported.is_synth(), self.exported.has_mix) {
-            (true, _) => &[],
-            (false, true) => &WRAP_DESCRIPTORS,
-            (false, false) => &WRAP_DESCRIPTORS[..1],
-        }
+        wrapper_descriptors(self.exported.is_synth(), self.exported.has_mix)
     }
     fn native_descriptors(&self) -> &'static [ParamDescriptor] {
         self.main.lock().map(|m| m.descriptors()).unwrap_or(&[])
@@ -240,50 +138,27 @@ impl<'a> Shared<'a> {
     fn descriptor_by_id(&self, id: u32) -> Option<&'static ParamDescriptor> {
         self.native_descriptors().iter().chain(self.wrapper_descriptors().iter()).find(|d| d.id.0 == id)
     }
-    /// Serialized state: raw processor state for the synth; a versioned envelope
-    /// carrying the wrapper parameters for effects.
+    /// Serialized state: raw processor state for the synth; the shared envelope for effects.
     fn save_state(&self) -> Result<Vec<u8>, PluginError> {
         let bytes = self.main.lock().map_err(|_| PluginError::Message("state lock poisoned"))?.save_state();
         if self.exported.is_synth() {
             return Ok(bytes);
         }
-        let processor: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| PluginError::Message("processor state is not JSON"))?;
-        let env = serde_json::json!({
-            "rawdawg_clap": 1,
-            "type_id": self.exported.native_type_id,
-            "bypass": self.bypass.load(Ordering::Relaxed),
-            "mix": self.mix(),
-            "processor": processor,
-        });
-        serde_json::to_vec(&env).map_err(|_| PluginError::Message("state serialization failed"))
+        save_envelope(self.exported.native_type_id, &bytes, self.bypass.load(Ordering::Relaxed), self.mix()).map_err(|_| PluginError::Message("state serialization failed"))
     }
-    /// Accepts both the envelope and a bare processor state (app presets).
+    /// Accepts both the envelope and a bare processor state (app preset).
     fn load_state(&self, bytes: &[u8]) -> Result<(), PluginError> {
-        let mut processor_bytes: &[u8] = bytes;
-        let owned: Vec<u8>;
-        let mut bypass = None;
-        let mut mix = None;
-        if !self.exported.is_synth()
-            && let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(bytes)
-            && map.contains_key("rawdawg_clap")
-        {
-            if let Some(t) = map.get("type_id").and_then(|v| v.as_str())
-                && t != self.exported.native_type_id
-            {
-                return Err(PluginError::Message("state belongs to a different rawDAWg plugin"));
-            }
-            bypass = map.get("bypass").and_then(|v| v.as_bool());
-            mix = map.get("mix").and_then(|v| v.as_f64()).map(|m| m as f32).filter(|m| m.is_finite());
-            let Some(p) = map.get("processor") else { return Err(PluginError::Message("state envelope lacks processor state")) };
-            owned = serde_json::to_vec(p).map_err(|_| PluginError::Message("state serialization failed"))?;
-            processor_bytes = &owned;
-        }
+        let parsed = if self.exported.is_synth() {
+            rawdawg_plugin_api::wrap::ParsedState { processor: bytes.to_vec(), bypass: None, mix: None }
+        } else {
+            parse_state(self.exported.native_type_id, bytes).map_err(|_| PluginError::Message("state belongs to a different rawDAWg plugin or is malformed"))?
+        };
         let mut s = self.main.lock().map_err(|_| PluginError::Message("state lock poisoned"))?;
-        s.load_state(processor_bytes).map_err(|_| PluginError::Message("invalid state rejected; current state kept"))?;
-        if let Some(b) = bypass {
+        s.load_state(&parsed.processor).map_err(|_| PluginError::Message("invalid state rejected; current state kept"))?;
+        if let Some(b) = parsed.bypass {
             self.bypass.store(b, Ordering::Relaxed);
         }
-        if let Some(m) = mix {
+        if let Some(m) = parsed.mix {
             self.mix_bits.store(m.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
         Ok(())
@@ -366,12 +241,8 @@ pub struct AudioProcessor<'a> {
     /// Scratch outputs for hosts offering fewer than two output channels.
     out_l: Vec<f32>,
     out_r: Vec<f32>,
-    dry: [DelayLine; 2],
-    latency: usize,
-    mix: Smoother,
-    bypass: bool,
+    wrapper: EffectWrapper,
     is_synth: bool,
-    has_mix: bool,
     has_sidechain: bool,
     sample_rate: f64,
     shared: &'a Shared<'a>,
@@ -474,77 +345,21 @@ impl<'a> AudioProcessor<'a> {
         }
     }
 
-    /// Apply wrapper parameter events (bypass/mix) and drop them from the native event list.
-    fn take_wrapper_events(&mut self) {
-        for e in &self.events {
-            if let EventKind::Param { id, value } = e.kind {
-                match id.0 {
-                    WRAP_BYPASS => self.bypass = value >= 0.5,
-                    WRAP_MIX if self.has_mix => self.mix.set_target(value),
-                    _ => {}
-                }
-            }
-        }
-        self.events.retain(|e| !matches!(e.kind, EventKind::Param { id, .. } if id.0 == WRAP_BYPASS || id.0 == WRAP_MIX));
-    }
-
-    /// Render one prepared chunk of an effect: the scratch inputs (offset 0) → `out` with dry path, mix and bypass.
+    /// Render one prepared chunk of an effect from the scratch inputs (offset 0) into `out`.
     fn process_effect_chunk(&mut self, n: usize, events: &[TimedEvent], transport: &TransportView, sidechain_fed: bool, out: [&mut [f32]; 2]) {
-        let [out_l, out_r] = out;
-        let start = 0usize;
-        let end = start + n;
-        if self.bypass {
-            // parameters still arrive so the effect's state stays current
-            for ev in events {
-                if let EventKind::Param { id, value } = ev.kind {
-                    self.processor.set_param(id, value);
-                }
-            }
-            out_l.copy_from_slice(&self.in_l[start..end]);
-            out_r.copy_from_slice(&self.in_r[start..end]);
-            if self.latency > 0 {
-                self.dry[0].delay_block(out_l, self.latency);
-                self.dry[1].delay_block(out_r, self.latency);
-            }
-            return;
-        }
-        {
-            let inputs: [&[f32]; 2] = [&self.in_l[start..end], &self.in_r[start..end]];
-            let sc: [&[f32]; 2] = [&self.sc_l[start..end], &self.sc_r[start..end]];
-            let mut outputs: [&mut [f32]; 2] = [out_l, out_r];
-            let mut ctx =
-                ProcessContext { audio: AudioBlock { frames: n, inputs: &inputs, outputs: &mut outputs, sidechain: if sidechain_fed { &sc } else { &[] } }, events, transport };
-            self.processor.process(&mut ctx);
-        }
-        let lat = self.latency;
-        if self.has_mix {
-            for i in 0..n {
-                let m = self.mix.next();
-                self.dry[0].push(self.in_l[start + i]);
-                self.dry[1].push(self.in_r[start + i]);
-                let (dl, dr) = (self.dry[0].read(lat), self.dry[1].read(lat));
-                out_l[i] = out_l[i] * m + dl * (1.0 - m);
-                out_r[i] = out_r[i] * m + dr * (1.0 - m);
-            }
-        } else {
-            for i in 0..n {
-                self.dry[0].push(self.in_l[start + i]);
-                self.dry[1].push(self.in_r[start + i]);
-            }
-        }
+        let Self { processor, wrapper, in_l, in_r, sc_l, sc_r, .. } = self;
+        let sidechain = sidechain_fed.then_some([&sc_l[..n], &sc_r[..n]]);
+        wrapper.process_chunk(processor.as_mut(), n, events, transport, [&in_l[..n], &in_r[..n]], sidechain, out);
     }
 
     fn status(&self) -> ProcessStatus {
         if self.is_synth {
             return if self.processor.active_voices() > 0 { ProcessStatus::Continue } else { ProcessStatus::ContinueIfNotQuiet };
         }
-        if self.bypass {
-            return ProcessStatus::ContinueIfNotQuiet;
-        }
-        match self.processor.tail() {
-            Tail::None => ProcessStatus::ContinueIfNotQuiet,
-            Tail::Frames(_) => ProcessStatus::Tail,
-            Tail::Unknown | Tail::Infinite => ProcessStatus::Continue,
+        match self.wrapper.tail_frames(self.processor.as_ref()) {
+            Some(0) => ProcessStatus::ContinueIfNotQuiet,
+            Some(_) => ProcessStatus::Tail,
+            None => ProcessStatus::Continue,
         }
     }
 }
@@ -557,14 +372,16 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
         processor.load_state(&bytes).map_err(|_| PluginError::Message("invalid processor state"))?;
         let max_frames = (config.max_frames_count as usize).clamp(1, MAX_FRAMES);
         processor.prepare(&PrepareSpec::new(config.sample_rate, max_frames, BusLayout::Stereo)).map_err(|_| PluginError::Message("prepare failed"))?;
-        let latency = (processor.latency_frames() as usize).min(MAX_DRY_LATENCY);
-        shared.latency.store(latency as u32, Ordering::Relaxed);
+        let latency = processor.latency_frames();
+        shared.latency.store(latency, Ordering::Relaxed);
         let is_synth = shared.exported.is_synth();
         let scratch = |len: usize| vec![0.0f32; len];
         let fx_len = if is_synth { 0 } else { max_frames };
-        let dry_len = if is_synth { 1 } else { (latency + 1).next_power_of_two() };
-        let mut mix = Smoother::new(shared.mix(), 0.01, config.sample_rate as f32);
-        mix.snap(shared.mix());
+        let mut wrapper = EffectWrapper::new(shared.exported.has_mix);
+        if !is_synth {
+            wrapper.prepare(latency, config.sample_rate, shared.mix());
+            wrapper.bypass = shared.bypass.load(Ordering::Relaxed);
+        }
         Ok(Self {
             processor,
             events: Vec::with_capacity(MAX_EVENTS),
@@ -574,12 +391,8 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
             sc_r: scratch(fx_len),
             out_l: scratch(fx_len),
             out_r: scratch(fx_len),
-            dry: [DelayLine::new(dry_len), DelayLine::new(dry_len)],
-            latency,
-            mix,
-            bypass: shared.bypass.load(Ordering::Relaxed),
+            wrapper,
             is_synth,
-            has_mix: shared.exported.has_mix,
             has_sidechain: shared.exported.has_sidechain,
             sample_rate: config.sample_rate,
             shared,
@@ -591,7 +404,7 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
         let total = frames as usize;
         translate_events(events.input, &mut self.events, frames);
         if !self.is_synth {
-            self.take_wrapper_events();
+            self.wrapper.take_wrapper_events(&mut self.events);
         }
         let transport = transport_view(&process, self.sample_rate);
         // Split oversized host blocks into prepared chunks; events keep their offsets.
@@ -636,7 +449,6 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
                     if count >= 2 {
                         let (mut a, mut b) = channels.split_at_mut(1);
                         if let (Some(l), Some(r)) = (a.channel_mut(0), b.channel_mut(0)) {
-                            // the scratch inputs hold this chunk at offset 0
                             self.process_effect_chunk(n, chunk, &transport, sidechain_fed, [&mut l[done..end], &mut r[done..end]]);
                             wrote = true;
                         }
@@ -671,9 +483,7 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
 
     fn reset(&mut self) {
         self.processor.reset();
-        self.dry[0].reset();
-        self.dry[1].reset();
-        self.mix.snap(self.shared.mix());
+        self.wrapper.reset(self.shared.mix());
     }
 }
 
@@ -743,13 +553,12 @@ impl PluginLatencyImpl for MainThread<'_> {
 
 impl PluginTailImpl for AudioProcessor<'_> {
     fn get(&self) -> TailLength {
-        if self.is_synth || self.bypass {
+        if self.is_synth {
             return TailLength::Finite(0);
         }
-        match self.processor.tail() {
-            Tail::None => TailLength::Finite(0),
-            Tail::Frames(n) => TailLength::Finite(n.saturating_add(self.latency as u32)),
-            Tail::Unknown | Tail::Infinite => TailLength::Infinite,
+        match self.wrapper.tail_frames(self.processor.as_ref()) {
+            Some(n) => TailLength::Finite(n),
+            None => TailLength::Infinite,
         }
     }
 }
@@ -848,12 +657,8 @@ impl PluginAudioProcessorParams for AudioProcessor<'_> {
                 && let Some(id) = p.param_id()
             {
                 let v = p.value() as f32;
-                match id.get() {
-                    WRAP_BYPASS if !self.is_synth => self.bypass = v >= 0.5,
-                    WRAP_MIX if self.has_mix => self.mix.set_target(v.clamp(0.0, 1.0)),
-                    id => {
-                        self.processor.set_param(ParamId(id), v);
-                    }
+                if self.is_synth || !self.wrapper.apply_param(id.get(), v) {
+                    self.processor.set_param(ParamId(id.get()), v);
                 }
             }
         }

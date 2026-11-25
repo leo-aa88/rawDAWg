@@ -1,0 +1,15 @@
+[package]
+name = "rawdawg-plugin-api"
+description = "rawDAWg format-neutral plugin export contract: the exported plugin catalogue, stable ids and the effect wrapper shared by the CLAP and VST3 adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-dsp = { path = "../dsp" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-effects = { path = "../effects" }
+serde_json = { workspace = true }

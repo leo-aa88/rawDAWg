@@ -3631,6 +3631,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawdawg-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "rawdawg-dsp",
+ "rawdawg-effects",
+ "rawdawg-synthesizer",
+ "rawdawg-types",
+ "serde_json",
+]
+
+[[package]]
 name = "rawdawg-plugin-clap"
 version = "0.1.0"
 dependencies = [
@@ -3640,6 +3651,7 @@ dependencies = [
  "clap-sys",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-plugin-api",
  "rawdawg-synthesizer",
  "rawdawg-types",
  "serde_json",
@@ -3669,7 +3681,11 @@ version = "0.1.0"
 dependencies = [
  "libloading 0.9.1",
  "rawdawg-dsp",
+ "rawdawg-effects",
+ "rawdawg-plugin-api",
+ "rawdawg-synthesizer",
  "rawdawg-types",
+ "serde_json",
  "vst3",
 ]
 
@@ -5520,7 +5536,9 @@ dependencies = [
  "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-plugin-api",
  "rawdawg-plugin-host",
+ "rawdawg-plugin-vst3",
  "rawdawg-project",
  "rawdawg-sampler",
  "rawdawg-synthesizer",

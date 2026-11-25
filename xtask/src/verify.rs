@@ -971,20 +971,43 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
     let profile_dir = root.join("target").join(if cfg!(debug_assertions) { "debug" } else { "release" });
     let clap_name = if cfg!(target_os = "windows") { "rawdawg_clap.dll" } else { "librawdawg_clap.so" };
     let vst3_name = if cfg!(target_os = "windows") { "rawdawg_vst3.dll" } else { "librawdawg_vst3.so" };
-    checks.push(check("PL-01 CLAP and VST3 modules built", &["PLUG-01"], || {
+    checks.push(check("PL-01 CLAP and VST3 modules built and laid out as bundles", &["PLUG-01"], || {
         let c = profile_dir.join(clap_name);
         let v = profile_dir.join(vst3_name);
         if !c.is_file() || !v.is_file() {
             bail!("missing {} or {} (run cargo build --workspace)", c.display(), v.display());
         }
-        Ok((format!("{} ({} bytes), {} ({} bytes)", clap_name, c.metadata()?.len(), vst3_name, v.metadata()?.len()), Some(profile_dir.display().to_string())))
+        // Standard bundle layouts (VST3 SDK "bundle format", CLAP single-file module).
+        let bundles = out.join("bundles");
+        let _ = std::fs::remove_dir_all(&bundles);
+        let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
+        let vst3_dir = bundles.join("rawDAWg.vst3").join("Contents").join(arch);
+        std::fs::create_dir_all(&vst3_dir)?;
+        let vst3_target = vst3_dir.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" });
+        std::fs::copy(&v, &vst3_target)?;
+        let plugins = rawdawg_plugin_api::exported_plugins();
+        let classes: Vec<serde_json::Value> = plugins
+            .iter()
+            .map(|p| {
+                let (pc, _) = p.vst3_class_ids();
+                serde_json::json!({ "CID": format!("{:08X}{:08X}{:08X}{:08X}", pc.0, pc.1, pc.2, pc.3), "Category": "Audio Module Class", "Name": p.name, "Vendor": "rawDAWg", "Version": rawdawg_types::VERSION, "SDKVersion": rawdawg_vst3::SDK_VERSION, "Sub Categories": p.vst3_subcategories().split('|').collect::<Vec<_>>(), "Class Flags": 0, "Cardinality": 2147483647 })
+            })
+            .collect();
+        let moduleinfo = serde_json::json!({ "Name": "rawDAWg", "Version": rawdawg_types::VERSION, "Factory Info": { "Vendor": "rawDAWg", "URL": rawdawg_plugin_api::exported::URL, "E-Mail": "", "Flags": { "Unicode": true, "Classes Discardable": false, "Component Non Discardable": false } }, "Compatibility": [], "Classes": classes });
+        std::fs::create_dir_all(bundles.join("rawDAWg.vst3").join("Contents").join("Resources"))?;
+        std::fs::write(bundles.join("rawDAWg.vst3").join("Contents").join("Resources").join("moduleinfo.json"), serde_json::to_vec_pretty(&moduleinfo)?)?;
+        std::fs::copy(&c, bundles.join("rawDAWg.clap"))?;
+        Ok((
+            format!("{} ({} bytes) → rawDAWg.clap; {} ({} bytes) → rawDAWg.vst3/Contents/{arch}/ + moduleinfo.json ({} classes)", clap_name, c.metadata()?.len(), vst3_name, v.metadata()?.len(), plugins.len()),
+            Some(bundles.display().to_string()),
+        ))
     }));
     checks.push(check("PL-02 CLAP/VST3 ABI round-trip tests (cargo test)", &["PLUG-01", "T-PLUGIN"], || {
-        let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-clap", "-p", "rawdawg-plugin-vst3", "-p", "rawdawg-plugin-host"]).status()?;
+        let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-api", "-p", "rawdawg-plugin-clap", "-p", "rawdawg-plugin-vst3", "-p", "rawdawg-plugin-host"]).status()?;
         if !status.success() {
             bail!("plugin tests failed");
         }
-        Ok(("CLAP export (17 plugins) and VST3 fixture through the built modules; CLAP host bridge: hosted vs native renders, migration, state, params".into(), None))
+        Ok(("CLAP and VST3 exports (17 plugins each) through the built modules: audio, events, sidechain, latency/tail, params, state envelope; CLAP host bridge: hosted vs native renders, migration, state, params".into(), None))
     }));
     checks.push(check(
         "E2E-07 (headless subset) isolated scan of rawDAWg's own CLAP module into a catalog, hang/crash quarantine, safe-mode skip, hosted render equals native",
