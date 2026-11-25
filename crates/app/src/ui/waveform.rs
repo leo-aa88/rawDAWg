@@ -70,13 +70,27 @@ fn basic_cycle(wave: rawdawg_dsp::oscillator::BasicWave) -> Vec<f32> {
     }
 }
 
+/// Harmonic-mode additive cycle for display.
+pub(crate) fn additive_cycle(a: &rawdawg_synthesizer::patch::AdditiveSettings) -> Vec<f32> {
+    let mut mag = vec![0.0f32];
+    mag.extend_from_slice(&a.amplitudes);
+    mag.resize(CYCLE_LEN / 2 + 1, 0.0);
+    let mut ph = vec![0.0f32];
+    ph.extend_from_slice(&a.phases);
+    ph.resize(CYCLE_LEN / 2 + 1, 0.0);
+    sculpt::synthesize(&sculpt::Harmonics { magnitude: mag, phase: ph })
+}
+
 /// Current editable cycle of the layer (or the basic wave it would become).
 fn layer_cycle(app: &App, instance: InstanceId, layer: usize) -> Option<(Vec<f32>, bool)> {
     let patch = app.synth_mirrors.get(&instance)?.patch();
     let l = patch.layers.get(layer)?;
     Some(match &l.generator {
-        Generator::Wavetable { cycle, .. } => (cycle.clone(), true),
+        Generator::Wavetable { cycle, frames, .. } => (frames.first().cloned().unwrap_or_else(|| cycle.clone()), true),
         Generator::Basic { wave, .. } => (basic_cycle(*wave), false),
+        Generator::Granular { source, .. } => (source.clone(), true),
+        Generator::Additive(a) => (crate::ui::waveform::additive_cycle(a), false),
+        Generator::Fm(_) | Generator::Pluck(_) => (cycles::sine(), false),
     })
 }
 
@@ -86,7 +100,17 @@ fn apply_cycle_live(app: &mut App, instance: InstanceId, layer: usize, cycle: &[
     if let Some(m) = app.synth_mirrors.get_mut(&instance) {
         let mut patch = m.patch().clone();
         if let Some(l) = patch.layers.get_mut(layer) {
-            l.generator = Generator::Wavetable { cycle: cycle.to_vec(), remove_dc: true };
+            match &mut l.generator {
+                Generator::Wavetable { cycle: c, frames, .. } => {
+                    if let Some(f) = frames.first_mut() {
+                        *f = cycle.to_vec();
+                    } else {
+                        *c = cycle.to_vec();
+                    }
+                }
+                Generator::Granular { source, .. } => *source = cycle.to_vec(),
+                _ => l.generator = Generator::Wavetable { cycle: cycle.to_vec(), remove_dc: true, frames: vec![], position: 0.0 },
+            }
             let _ = m.set_patch(patch);
         }
     }
@@ -96,7 +120,7 @@ fn apply_cycle_live(app: &mut App, instance: InstanceId, layer: usize, cycle: &[
 fn send_table(app: &mut App, instance: InstanceId, layer: usize, table: Box<MipTable>) {
     // keep only the newest pending table (coalescing)
     let table = match app.table_senders.get_mut(&instance) {
-        Some(s) => s.send(layer, table).err(),
+        Some(s) => s.send(layer, 0, table).err(),
         None => None,
     };
     app.synth_panel.waveform.pending_table = table.map(|t| (instance, layer, t));

@@ -1,14 +1,18 @@
-//! One polyphonic voice: layered oscillators → stereo pan → amp envelope → filter.
+//! One polyphonic voice: per-layer generators (with unison) → stereo pan →
+//! amp envelope → filter, with control-rate modulation.
 
-use crate::patch::{Generator, MAX_LAYERS, Patch};
+use crate::generators::{AdditiveState, FmState, GranularState, PluckState, read_frames, unison_detune, unison_gain, unison_pan};
+use crate::modulation::{LfoState, ModInputs, ModOutputs};
+use crate::patch::{Generator, Lfo, MAX_LAYERS, MAX_LFOS, MAX_UNISON, ModTarget, Patch};
 use crate::registry::NoteKey;
 use rawdawg_dsp::envelope::{Adsr, AdsrParams, EnvStage};
 use rawdawg_dsp::filter::Svf;
 use rawdawg_dsp::oscillator::{BasicOscillator, BasicTables, BasicWave};
+use rawdawg_dsp::rng::DeterministicRng;
 use rawdawg_dsp::smooth::Smoother;
-use rawdawg_dsp::wavetable::MipTable;
+use rawdawg_dsp::wavetable::{MipTable, TableBuilder};
 
-/// Control-rate interval in samples for pitch/filter coefficient updates.
+/// Control-rate interval in samples for pitch/filter/modulation updates.
 pub const CONTROL_INTERVAL: usize = 16;
 
 /// Prepared per-layer engine data shared by all voices (owned by the synth).
@@ -21,8 +25,13 @@ pub struct LayerEngine {
     pub pan_r: f32,
     pub semitone_offset: f64,
     pub reset_phase: bool,
-    /// Previous table during a crossfade (retired when the fade completes).
-    pub prev_table: Option<Box<MipTable>>,
+    pub unison: usize,
+    pub unison_detune_cents: f32,
+    pub unison_spread: f32,
+    /// Previous frame table during a crossfade (capacity 1, allocated once; drained
+    /// into the retire queue when the fade completes).
+    pub prev_frames: Vec<Box<MipTable>>,
+    pub fading: bool,
     /// Crossfade position 0..1 (1 = fully on the new table) and per-sample step.
     pub xfade: f32,
     pub xfade_step: f32,
@@ -34,8 +43,22 @@ pub enum LayerKind {
         wave: BasicWave,
         pulse_width: f64,
     },
-    /// Prepared table built from the layer's editable cycle.
-    Table(Box<MipTable>),
+    /// Motion frames built from the layer's editable cycles.
+    Table {
+        frames: Vec<Box<MipTable>>,
+        position: f32,
+    },
+    Fm(crate::patch::FmSettings),
+    /// Harmonic mode renders through `table`; detuned mode uses the per-voice bank.
+    Additive {
+        settings: crate::patch::AdditiveSettings,
+        table: Box<MipTable>,
+    },
+    Granular {
+        settings: crate::patch::GranularSettings,
+        source: Box<MipTable>,
+    },
+    Pluck(crate::patch::PluckSettings),
 }
 
 /// Table swap crossfade length (DSP.md: 5–10 ms).
@@ -51,7 +74,11 @@ impl LayerEngine {
             pan_r: 0.0,
             semitone_offset: 0.0,
             reset_phase: true,
-            prev_table: None,
+            unison: 1,
+            unison_detune_cents: 0.0,
+            unison_spread: 0.0,
+            prev_frames: Vec::with_capacity(1),
+            fading: false,
             xfade: 1.0,
             xfade_step: 0.0,
         }
@@ -59,12 +86,20 @@ impl LayerEngine {
 
     /// Non-RT: build engine data for a patch layer (allocates for tables).
     pub fn build(layer: &crate::patch::Layer) -> Self {
+        let mut b = TableBuilder::new();
         let kind = match &layer.generator {
             Generator::Basic { wave, pulse_width } => LayerKind::Basic { wave: *wave, pulse_width: f64::from(*pulse_width) },
-            Generator::Wavetable { cycle, remove_dc } => {
-                let mut b = rawdawg_dsp::wavetable::TableBuilder::new();
-                LayerKind::Table(Box::new(b.build(cycle, *remove_dc)))
+            Generator::Wavetable { remove_dc, position, .. } => {
+                let frames = layer.generator.frames().iter().map(|c| Box::new(b.build(&normalized_cycle(c), *remove_dc))).collect();
+                LayerKind::Table { frames, position: *position }
             }
+            Generator::Fm(s) => LayerKind::Fm(*s),
+            Generator::Additive(s) => {
+                let cycle = crate::sculpt::synthesize(&crate::sculpt::Harmonics { magnitude: pad_dc(&s.amplitudes), phase: pad_dc(&s.phases) });
+                LayerKind::Additive { settings: s.clone(), table: Box::new(b.build(&normalized_cycle(&cycle), true)) }
+            }
+            Generator::Granular { settings, source } => LayerKind::Granular { settings: *settings, source: Box::new(b.build(&normalized_cycle(source), true)) },
+            Generator::Pluck(s) => LayerKind::Pluck(*s),
         };
         let mut e = Self {
             enabled: layer.enabled,
@@ -74,7 +109,11 @@ impl LayerEngine {
             pan_r: 0.0,
             semitone_offset: 0.0,
             reset_phase: layer.reset_phase,
-            prev_table: None,
+            unison: 1,
+            unison_detune_cents: 0.0,
+            unison_spread: 0.0,
+            prev_frames: Vec::with_capacity(1),
+            fading: false,
             xfade: 1.0,
             xfade_step: 0.0,
         };
@@ -82,50 +121,7 @@ impl LayerEngine {
         e
     }
 
-    /// RT: install a new table, starting a crossfade from the current one. Returns a
-    /// table that must be retired now (a previous crossfade that was still running).
-    pub fn install_table(&mut self, table: Box<MipTable>, sample_rate: f32) -> Option<Box<MipTable>> {
-        let leftover = self.prev_table.take();
-        let old = std::mem::replace(&mut self.kind, LayerKind::Table(table));
-        if let LayerKind::Table(t) = old {
-            self.prev_table = Some(t);
-            self.xfade = 0.0;
-            self.xfade_step = 1.0 / (TABLE_XFADE_S * sample_rate).max(1.0);
-        } else {
-            self.xfade = 1.0;
-            self.xfade_step = 0.0;
-        }
-        leftover
-    }
-
-    /// RT: advance the crossfade by one sample; returns a finished previous table.
-    #[inline]
-    pub fn tick_xfade(&mut self) -> Option<Box<MipTable>> {
-        if self.prev_table.is_some() {
-            self.xfade += self.xfade_step;
-            if self.xfade >= 1.0 {
-                self.xfade = 1.0;
-                return self.prev_table.take();
-            }
-        }
-        None
-    }
-
-    /// RT: read the layer's table(s) at phase, honoring a running crossfade.
-    #[inline]
-    pub fn read_table(&self, level: usize, phase: f64) -> f32 {
-        match (&self.kind, &self.prev_table) {
-            (LayerKind::Table(t), Some(p)) if self.xfade < 1.0 => {
-                let a = p.read(level, phase);
-                let b = t.read(level, phase);
-                a + (b - a) * self.xfade
-            }
-            (LayerKind::Table(t), _) => t.read(level, phase),
-            _ => 0.0,
-        }
-    }
-
-    /// RT-safe: refresh gain/pan/tuning from the layer settings.
+    /// RT-safe: refresh gain/pan/tuning/unison/generator scalars from the layer settings.
     pub fn update_mix(&mut self, layer: &crate::patch::Layer) {
         self.enabled = layer.enabled;
         self.gain = rawdawg_dsp::math::db_to_lin(layer.level_db);
@@ -134,17 +130,115 @@ impl LayerEngine {
         self.pan_r = r;
         self.semitone_offset = f64::from(layer.coarse_semitones) + f64::from(layer.fine_cents) / 100.0;
         self.reset_phase = layer.reset_phase;
-        if let (LayerKind::Basic { wave, pulse_width }, Generator::Basic { wave: w, pulse_width: pw }) = (&mut self.kind, &layer.generator) {
-            *wave = *w;
-            *pulse_width = f64::from(*pw);
+        self.unison = usize::from(layer.unison).clamp(1, MAX_UNISON);
+        self.unison_detune_cents = layer.unison_detune_cents;
+        self.unison_spread = layer.unison_spread;
+        match (&mut self.kind, &layer.generator) {
+            (LayerKind::Basic { wave, pulse_width }, Generator::Basic { wave: w, pulse_width: pw }) => {
+                *wave = *w;
+                *pulse_width = f64::from(*pw);
+            }
+            (LayerKind::Table { position, .. }, Generator::Wavetable { position: p, .. }) => *position = *p,
+            (LayerKind::Fm(s), Generator::Fm(p)) => *s = *p,
+            (LayerKind::Additive { settings, .. }, Generator::Additive(p)) => {
+                settings.stretch = p.stretch;
+                settings.detuned = p.detuned;
+            }
+            (LayerKind::Granular { settings, .. }, Generator::Granular { settings: p, .. }) => *settings = *p,
+            (LayerKind::Pluck(s), Generator::Pluck(p)) => *s = *p,
+            _ => {}
+        }
+    }
+
+    /// RT: install a new table for `frame`, starting a crossfade. Returns tables that
+    /// must be retired now (a previous crossfade still running, or a replaced table
+    /// when the layer is not a wavetable).
+    pub fn install_table(&mut self, frame: usize, table: Box<MipTable>, sample_rate: f32, retire: &mut dyn FnMut(Box<MipTable>)) {
+        match &mut self.kind {
+            LayerKind::Table { frames, .. } => {
+                // a fade still running: retire its source first (capacity stays allocated)
+                while let Some(t) = self.prev_frames.pop() {
+                    retire(t);
+                }
+                if frames.is_empty() {
+                    retire(table);
+                    return;
+                }
+                let f = frame.min(frames.len() - 1);
+                // swap the edited frame in place (no allocation) and keep the old one for the fade
+                let replaced = std::mem::replace(&mut frames[f], table);
+                if self.prev_frames.capacity() == 0 {
+                    retire(replaced); // cannot hold it without allocating: hard switch
+                    self.fading = false;
+                    return;
+                }
+                self.prev_frames.push(replaced);
+                self.fading = true;
+                self.xfade = 0.0;
+                self.xfade_step = 1.0 / (TABLE_XFADE_S * sample_rate).max(1.0);
+            }
+            LayerKind::Additive { table: t, .. } | LayerKind::Granular { source: t, .. } => {
+                let old = std::mem::replace(t, table);
+                retire(old);
+            }
+            _ => retire(table),
+        }
+    }
+
+    /// RT: advance the crossfade by `samples`; finished sources go to `retire`.
+    #[inline]
+    pub fn tick_xfade(&mut self, samples: usize, retire: &mut dyn FnMut(Box<MipTable>)) {
+        if self.fading {
+            self.xfade += self.xfade_step * samples as f32;
+            if self.xfade >= 1.0 {
+                self.xfade = 1.0;
+                self.fading = false;
+                while let Some(t) = self.prev_frames.pop() {
+                    retire(t);
+                }
+            }
+        }
+    }
+
+    /// RT: read the layer's frames at phase/position, honoring a running crossfade.
+    #[inline]
+    pub fn read_table(&self, level: usize, phase: f64, position: f32) -> f32 {
+        let LayerKind::Table { frames, .. } = &self.kind else { return 0.0 };
+        let v = read_frames(frames, level, phase, position);
+        if self.fading
+            && let Some(prev) = self.prev_frames.first()
+        {
+            let a = prev.read(level, phase);
+            a + (v - a) * self.xfade
+        } else {
+            v
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+fn pad_dc(v: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rawdawg_dsp::wavetable::CYCLE_LEN / 2 + 1);
+    out.push(0.0);
+    out.extend_from_slice(v);
+    out.resize(rawdawg_dsp::wavetable::CYCLE_LEN / 2 + 1, 0.0);
+    out
+}
+
+/// Peak guard: cycles above full scale are scaled down for playback; the stored
+/// cycle stays editable (reversible representation).
+fn normalized_cycle(c: &[f32]) -> Vec<f32> {
+    let peak = rawdawg_dsp::math::peak(c);
+    if peak > 1.0 { c.iter().map(|s| s / peak).collect() } else { c.to_vec() }
+}
+
+#[derive(Clone, Debug)]
 struct LayerVoice {
-    osc: BasicOscillator,
+    osc: [BasicOscillator; MAX_UNISON],
     level: usize,
+    fm: [FmState; MAX_UNISON],
+    additive: AdditiveState,
+    granular: GranularState,
+    pluck: PluckState,
 }
 
 /// A voice slot.
@@ -157,7 +251,7 @@ pub struct Voice {
     /// Note-off arrived while sustain was down; release when pedal lifts.
     pub sustained: bool,
     pub velocity: f32,
-    layers: [LayerVoice; MAX_LAYERS],
+    layers: Vec<LayerVoice>,
     amp: Adsr,
     fenv: Adsr,
     filter_l: Svf,
@@ -165,29 +259,53 @@ pub struct Voice {
     /// Current (gliding) pitch in MIDI semitones including transpose/detune.
     pitch: Smoother,
     bend_semitones: f32,
+    mod_wheel: f32,
+    aftertouch: f32,
+    random: f32,
+    lfo: [LfoState; MAX_LFOS],
+    rng: DeterministicRng,
     sample_rate: f64,
     control_counter: usize,
+    mods: ModOutputs,
+    seed: u64,
 }
 
 impl Voice {
-    pub fn new(sample_rate: f64, patch: &Patch) -> Self {
+    pub fn new(sample_rate: f64, patch: &Patch, index: usize) -> Self {
         let sr = sample_rate as f32;
-        let lv = LayerVoice { osc: BasicOscillator::new(sample_rate), level: 0 };
+        let seed = 0x0B00_B1E5 + index as u64;
+        let layers = (0..MAX_LAYERS)
+            .map(|l| LayerVoice {
+                osc: [BasicOscillator::new(sample_rate); MAX_UNISON],
+                level: 0,
+                fm: [FmState::new(sample_rate); MAX_UNISON],
+                additive: AdditiveState::new(sample_rate),
+                granular: GranularState::new(sample_rate, seed ^ (l as u64 + 1)),
+                pluck: PluckState::new(sample_rate, seed ^ (0x10 + l as u64)),
+            })
+            .collect();
         Self {
             key: None,
             age: 0,
             released: false,
             sustained: false,
             velocity: 0.0,
-            layers: [lv; MAX_LAYERS],
+            layers,
             amp: Adsr::new(sr, patch.amp_env),
             fenv: Adsr::new(sr, patch.filter_env),
             filter_l: Svf::new(sr),
             filter_r: Svf::new(sr),
             pitch: Smoother::new(60.0, 0.0, sr),
             bend_semitones: 0.0,
+            mod_wheel: 0.0,
+            aftertouch: 0.0,
+            random: 0.0,
+            lfo: [LfoState::default(); MAX_LFOS],
+            rng: DeterministicRng::new(seed, 0x77),
             sample_rate,
             control_counter: 0,
+            mods: ModOutputs::default(),
+            seed,
         }
     }
 
@@ -200,10 +318,13 @@ impl Voice {
     pub fn amp_level(&self) -> f32 {
         self.amp.level()
     }
-
     pub fn set_envelopes(&mut self, amp: AdsrParams, fenv: AdsrParams) {
         self.amp.set_params(amp);
         self.fenv.set_params(fenv);
+    }
+    pub fn set_controllers(&mut self, mod_wheel: f32, aftertouch: f32) {
+        self.mod_wheel = mod_wheel;
+        self.aftertouch = aftertouch;
     }
 
     /// Start a note. With `retrigger == false` the current pitch glides to the target (legato).
@@ -215,6 +336,8 @@ impl Voice {
         self.sustained = false;
         self.velocity = velocity;
         let sr = self.sample_rate as f32;
+        self.rng = DeterministicRng::new(self.seed ^ u64::from(key.note_id), age);
+        self.random = self.rng.bipolar_f32();
         if retrigger {
             if portamento_s > 0.0 && self.amp.is_active() {
                 self.pitch.set_time(portamento_s / 3.0, sr);
@@ -224,9 +347,27 @@ impl Voice {
             }
             self.amp.note_on();
             self.fenv.note_on();
-            for (lv, le) in self.layers.iter_mut().zip(layers.iter()) {
+            for l in &mut self.lfo {
+                l.reset();
+            }
+            for (li, (lv, le)) in self.layers.iter_mut().zip(layers.iter()).enumerate() {
                 if le.reset_phase {
-                    lv.osc.reset_phase(0.0);
+                    for o in &mut lv.osc {
+                        o.reset_phase(0.0);
+                    }
+                    for f in &mut lv.fm {
+                        f.reset();
+                    }
+                }
+                match &le.kind {
+                    LayerKind::Additive { settings, .. } => lv.additive.reset(settings),
+                    LayerKind::Granular { .. } => lv.granular.reset(self.seed ^ (age << 2) ^ li as u64),
+                    LayerKind::Pluck(s) => {
+                        lv.pluck.reset(self.seed ^ age ^ (li as u64) << 8);
+                        let f = rawdawg_types::units::Pitch(key.pitch).frequency_hz(440.0, 0.0);
+                        lv.pluck.pluck(s, f, velocity);
+                    }
+                    _ => {}
                 }
             }
         } else {
@@ -277,54 +418,104 @@ impl Voice {
         self.filter_l.set_sample_rate(sr as f32);
         self.filter_r.set_sample_rate(sr as f32);
         for l in &mut self.layers {
-            l.osc.set_sample_rate(sr);
+            for o in &mut l.osc {
+                o.set_sample_rate(sr);
+            }
+            l.fm = [FmState::new(sr); MAX_UNISON];
+            l.additive = AdditiveState::new(sr);
+            l.granular = GranularState::new(sr, self.seed);
+            l.pluck = PluckState::new(sr, self.seed);
         }
     }
 
-    fn update_control(&mut self, patch: &Patch, layers: &[LayerEngine; MAX_LAYERS]) {
-        let p = f64::from(self.pitch.current()) + f64::from(self.bend_semitones);
+    /// Control-rate update: modulation, pitch, filter coefficients.
+    fn update_control(&mut self, patch: &Patch, layers: &[LayerEngine; MAX_LAYERS], global_lfo: &[f32; MAX_LFOS], tempo_bpm: f64) {
+        let Some(key) = self.key else { return };
+        // per-voice LFOs advance by one control interval
+        let mut lfo_vals = *global_lfo;
+        for (i, lfo) in patch.lfos.iter().enumerate().take(MAX_LFOS) {
+            if lfo.per_voice {
+                lfo_vals[i] = self.lfo[i].advance(lfo, CONTROL_INTERVAL, self.sample_rate, tempo_bpm, &mut self.rng);
+            }
+        }
+        let inputs = ModInputs {
+            lfo: lfo_vals,
+            amp_env: self.amp.level(),
+            filter_env: self.fenv.level(),
+            velocity: self.velocity,
+            key: (f32::from(key.pitch) - 60.0) / 60.0,
+            mod_wheel: self.mod_wheel,
+            aftertouch: self.aftertouch,
+            random: self.random,
+        };
+        self.mods = ModOutputs::evaluate(&patch.mod_routes, &inputs);
+        let p = f64::from(self.pitch.current()) + f64::from(self.bend_semitones) + f64::from(self.mods.get(ModTarget::Pitch) * 24.0);
         let a4 = f64::from(patch.tuning.a4_hz);
+        let pw_mod = f64::from(self.mods.get(ModTarget::PulseWidth) * 0.45);
         for (lv, le) in self.layers.iter_mut().zip(layers.iter()) {
             if !le.enabled {
                 continue;
             }
-            let hz = a4 * 2f64.powf((p + le.semitone_offset - 69.0) / 12.0);
-            lv.osc.set_frequency(hz);
-            lv.level = MipTable::level_for_increment(lv.osc.increment());
+            let n = le.unison;
+            for u in 0..n {
+                let det = unison_detune(u, n, le.unison_detune_cents);
+                let hz = a4 * 2f64.powf((p + le.semitone_offset + det - 69.0) / 12.0);
+                lv.osc[u].set_frequency(hz);
+            }
+            lv.level = MipTable::level_for_increment(lv.osc[0].increment());
             if let LayerKind::Basic { wave, pulse_width } = &le.kind {
-                lv.osc.set_wave(*wave);
-                lv.osc.set_pulse_width(*pulse_width);
+                for o in lv.osc.iter_mut().take(n) {
+                    o.set_wave(*wave);
+                    o.set_pulse_width(pulse_width + pw_mod);
+                }
             }
         }
         if patch.filter.enabled {
             let f = &patch.filter;
             let env = self.fenv.level() * f.env_octaves;
-            let key = f.key_track * (self.pitch.current() - 60.0) / 12.0;
-            let cutoff = f.cutoff_hz * 2f32.powf(env + key);
+            let key_track = f.key_track * (self.pitch.current() - 60.0) / 12.0;
+            let cutoff = f.cutoff_hz * 2f32.powf(env + key_track + self.mods.get(ModTarget::Cutoff) * 4.0);
+            let res = (f.resonance * 2f32.powf(self.mods.get(ModTarget::Resonance) * 2.0)).clamp(0.5, 20.0);
             self.filter_l.set_mode(f.mode);
             self.filter_r.set_mode(f.mode);
-            self.filter_l.set(cutoff, f.resonance);
-            self.filter_r.set(cutoff, f.resonance);
+            self.filter_l.set(cutoff, res);
+            self.filter_r.set(cutoff, res);
         }
     }
 
-    /// Render `out_l.len()` samples, **adding** into the outputs. Returns `false`
-    /// when the voice finished (envelope idle) and the slot can be freed.
+    /// Render `out_l.len()` samples (≤ CONTROL_INTERVAL), **adding** into the outputs.
+    /// Returns `false` when the voice finished and the slot can be freed.
     #[inline(never)]
-    pub fn render_add(&mut self, out_l: &mut [f32], out_r: &mut [f32], patch: &Patch, layers: &[LayerEngine; MAX_LAYERS], tables: &BasicTables) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_add(
+        &mut self,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        patch: &Patch,
+        layers: &[LayerEngine; MAX_LAYERS],
+        tables: &BasicTables,
+        global_lfo: &[f32; MAX_LFOS],
+        tempo_bpm: f64,
+    ) -> bool {
         if self.key.is_none() {
             return false;
         }
-        let vel_gain = 1.0 - patch.velocity_sensitivity * (1.0 - self.velocity);
+        if self.control_counter == 0 {
+            self.update_control(patch, layers, global_lfo, tempo_bpm);
+        }
+        self.control_counter += out_l.len();
+        if self.control_counter >= CONTROL_INTERVAL {
+            self.control_counter = 0;
+        }
+        let vel_gain = (1.0 - patch.velocity_sensitivity * (1.0 - self.velocity)) * (1.0 + self.mods.get(ModTarget::Amp)).max(0.0);
         let use_filter = patch.filter.enabled;
+        let pan_mod = self.mods.get(ModTarget::Pan);
+        let wt_mod = self.mods.get(ModTarget::WavePosition);
+        let fm_scale = (1.0 + self.mods.get(ModTarget::FmIndex)).max(0.0);
+        let grain_mod = self.mods.get(ModTarget::GrainPosition);
+        let level_mods =
+            [self.mods.get(ModTarget::LayerLevel1), self.mods.get(ModTarget::LayerLevel2), self.mods.get(ModTarget::LayerLevel3), self.mods.get(ModTarget::LayerLevel4)];
         for i in 0..out_l.len() {
-            if self.control_counter == 0 {
-                self.update_control(patch, layers);
-            }
-            self.control_counter += 1;
-            if self.control_counter >= CONTROL_INTERVAL {
-                self.control_counter = 0;
-            }
             self.pitch.next();
             let env = self.amp.next();
             self.fenv.next();
@@ -334,20 +525,68 @@ impl Voice {
             }
             let mut l = 0.0f32;
             let mut r = 0.0f32;
-            for (lv, le) in self.layers.iter_mut().zip(layers.iter()) {
+            for (li, (lv, le)) in self.layers.iter_mut().zip(layers.iter()).enumerate() {
                 if !le.enabled {
                     continue;
                 }
-                let s = match &le.kind {
-                    LayerKind::Basic { .. } => lv.osc.next(tables),
-                    LayerKind::Table(_) => {
-                        let v = le.read_table(lv.level, lv.osc.phase());
-                        lv.osc.advance();
-                        v
+                let gain = le.gain * (1.0 + level_mods[li]).max(0.0);
+                match &le.kind {
+                    LayerKind::Basic { .. } | LayerKind::Table { .. } | LayerKind::Fm(_) => {
+                        let n = le.unison;
+                        let ug = unison_gain(n);
+                        for u in 0..n {
+                            let s = match &le.kind {
+                                LayerKind::Basic { .. } => lv.osc[u].next(tables),
+                                LayerKind::Table { position, .. } => {
+                                    let v = le.read_table(lv.level, lv.osc[u].phase(), (position + wt_mod).clamp(0.0, 1.0));
+                                    lv.osc[u].advance();
+                                    v
+                                }
+                                LayerKind::Fm(s) => {
+                                    let hz = lv.osc[u].increment() * self.sample_rate;
+                                    lv.fm[u].next(s, hz, fm_scale)
+                                }
+                                _ => 0.0,
+                            } * gain
+                                * ug;
+                            let up = unison_pan(u, n, le.unison_spread);
+                            let (pl, pr) = rawdawg_types::units::Pan(f64::from((up + pan_mod).clamp(-1.0, 1.0))).equal_power_gains();
+                            // combine layer pan with unison pan (both equal-power)
+                            l += s * le.pan_l * pl * std::f32::consts::SQRT_2;
+                            r += s * le.pan_r * pr * std::f32::consts::SQRT_2;
+                        }
                     }
-                } * le.gain;
-                l += s * le.pan_l;
-                r += s * le.pan_r;
+                    LayerKind::Additive { settings, .. } => {
+                        let hz = lv.osc[0].increment() * self.sample_rate;
+                        let s = if settings.detuned {
+                            lv.additive.next(settings, hz)
+                        } else {
+                            // harmonic mode: the prepared table
+                            let v = match &le.kind {
+                                LayerKind::Additive { table, .. } => table.read(lv.level, lv.osc[0].phase()),
+                                _ => 0.0,
+                            };
+                            lv.osc[0].advance();
+                            v
+                        } * gain;
+                        l += s * le.pan_l;
+                        r += s * le.pan_r;
+                    }
+                    LayerKind::Granular { settings, source } => {
+                        let hz = lv.osc[0].increment() * self.sample_rate;
+                        let pos = (grain_mod + 0.5 * (1.0 + self.random * 0.0)).clamp(0.0, 1.0);
+                        let s = lv.granular.next(settings, source, hz, pos) * gain;
+                        l += s * le.pan_l;
+                        r += s * le.pan_r;
+                    }
+                    LayerKind::Pluck(s) => {
+                        let hz = lv.osc[0].increment() * self.sample_rate;
+                        // gain-matched to the other generators (a noise-excited loop sits ~4 dB lower)
+                        let v = lv.pluck.next(s, hz, self.velocity) * gain * 1.6;
+                        l += v * le.pan_l;
+                        r += v * le.pan_r;
+                    }
+                }
             }
             if use_filter {
                 l = self.filter_l.process(l);
@@ -359,4 +598,13 @@ impl Voice {
         }
         true
     }
+}
+
+/// Resolve the LFO definitions for the global clock (used by the synth).
+pub fn lfo_defs(patch: &Patch) -> [Lfo; MAX_LFOS] {
+    let mut out = [Lfo::default(); MAX_LFOS];
+    for (i, l) in patch.lfos.iter().enumerate().take(MAX_LFOS) {
+        out[i] = *l;
+    }
+    out
 }

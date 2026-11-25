@@ -42,6 +42,23 @@ pub fn dominant_frequency(buf: &[f32], sample_rate: f64) -> f64 {
     (k as f64 + f64::from(delta)) * sample_rate / n as f64
 }
 
+/// Estimate the fundamental: the lowest spectral peak whose magnitude is at least
+/// `threshold` (0..1) of the strongest peak, with parabolic interpolation.
+pub fn fundamental_frequency(buf: &[f32], sample_rate: f64, threshold: f32) -> f64 {
+    let spec = magnitude_spectrum(buf);
+    let n = (spec.len() - 1) * 2;
+    let max = spec.iter().skip(1).cloned().fold(0.0f32, f32::max);
+    for k in 2..spec.len() - 1 {
+        if spec[k] >= max * threshold && spec[k] > spec[k - 1] && spec[k] >= spec[k + 1] {
+            let (a, b, c) = (spec[k - 1].max(1e-12).ln(), spec[k].max(1e-12).ln(), spec[k + 1].max(1e-12).ln());
+            let denom = a - 2.0 * b + c;
+            let delta = if denom.abs() < 1e-12 { 0.0 } else { 0.5 * (a - c) / denom };
+            return (k as f64 + f64::from(delta)) * sample_rate / n as f64;
+        }
+    }
+    0.0
+}
+
 /// Ratio in dB between the fundamental's magnitude and the strongest spectral
 /// peak that is **not** near a harmonic of `f0`. Higher = less aliasing.
 pub fn harmonic_alias_ratio_db(buf: &[f32], f0: f64, sample_rate: f64) -> f64 {

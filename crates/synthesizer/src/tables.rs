@@ -8,6 +8,8 @@ use rawdawg_rt::queue::{ControlQueue, QueueConsumer, QueueProducer};
 /// One prepared table for a layer.
 pub struct TableUpdate {
     pub layer: usize,
+    /// Motion frame index (ignored for non-wavetable layers).
+    pub frame: usize,
     pub table: Box<MipTable>,
     /// Generation stamp so stale builds are ignored by the receiver.
     pub generation: u64,
@@ -37,10 +39,10 @@ pub fn table_channel() -> (TableSender, TableInbox) {
 
 impl TableSender {
     /// Offer a table; returns it back if the queue is full (coalesce and retry later).
-    pub fn send(&mut self, layer: usize, table: Box<MipTable>) -> Result<u64, Box<MipTable>> {
+    pub fn send(&mut self, layer: usize, frame: usize, table: Box<MipTable>) -> Result<u64, Box<MipTable>> {
         self.generation += 1;
         let g = self.generation;
-        self.updates.push(TableUpdate { layer, table, generation: g }).map(|_| g).map_err(|u| u.table)
+        self.updates.push(TableUpdate { layer, frame, table, generation: g }).map(|_| g).map_err(|u| u.table)
     }
     /// Drop retired tables here (off RT). Returns how many were freed.
     pub fn collect_retired(&mut self) -> usize {
@@ -63,7 +65,7 @@ impl TableInbox {
     #[inline]
     pub fn pop(&mut self) -> Option<TableUpdate> {
         while let Some(u) = self.updates.pop() {
-            if u.layer < crate::patch::MAX_LAYERS && u.generation > self.last_generation[u.layer] {
+            if u.layer < crate::patch::MAX_LAYERS && u.generation > self.last_generation[u.layer] && u.frame < crate::patch::MAX_FRAMES {
                 self.last_generation[u.layer] = u.generation;
                 return Some(u);
             }

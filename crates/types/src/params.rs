@@ -128,6 +128,14 @@ impl ParamDescriptor {
         self
     }
 
+    /// Not settable through the real-time path (e.g. structure changes that allocate).
+    pub const fn read_only(mut self) -> Self {
+        self.flags.read_only = true;
+        self.flags.automatable = false;
+        self.flags.modulatable = false;
+        self
+    }
+
     /// Map normalized → physical. Input is clamped to [0,1]; NaN maps to the default.
     pub fn to_physical(&self, normalized: f32) -> f64 {
         let n = if normalized.is_finite() { f64::from(normalized.clamp(0.0, 1.0)) } else { f64::from(self.default_normalized) };

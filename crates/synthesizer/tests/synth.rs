@@ -357,7 +357,7 @@ fn live_table_update_changes_sound_without_retrigger_and_retires_old_table() {
     // send a square table while the note is held
     let mut b = TableBuilder::new();
     let table = Box::new(b.build(&cycles::square(), true));
-    assert!(sender.send(0, table).is_ok(), "queued");
+    assert!(sender.send(0, 0, table).is_ok(), "queued");
     let during = h.render(2048, 256, &[]);
     assert!(during.iter().all(|s| s.is_finite()));
     // crossfade completes within ~8 ms (384 samples): no discontinuity larger than the
@@ -375,8 +375,8 @@ fn live_table_update_changes_sound_without_retrigger_and_retires_old_table() {
     // stale generations are ignored: queue two, only the newest applies
     let t1 = Box::new(b.build(&cycles::sine(), true));
     let t2 = Box::new(b.build(&cycles::saw(), true));
-    assert!(sender.send(0, t1).is_ok());
-    assert!(sender.send(0, t2).is_ok());
+    assert!(sender.send(0, 0, t1).is_ok());
+    assert!(sender.send(0, 0, t2).is_ok());
     h.render(4096, 256, &[]);
     let (_, c_final, _) = features(&h.render(24_000, 256, &[])[12_000..], SR);
     assert!(c_final > c_before * 0.8, "saw (newest) should be bright, got centroid {c_final}");
@@ -404,10 +404,122 @@ fn migrate_from_carries_voices_and_tables_into_a_new_instance() {
     assert!(cont.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max) < 0.25);
     // the table inbox moved with the voices: a live table update still reaches them
     let mut b = rawdawg_dsp::wavetable::TableBuilder::new();
-    assert!(sender.send(0, Box::new(b.build(&rawdawg_dsp::wavetable::cycles::square(), true))).is_ok());
+    assert!(sender.send(0, 0, Box::new(b.build(&rawdawg_dsp::wavetable::cycles::square(), true))).is_ok());
     h2.render(4096, 256, &[]);
     assert_eq!(sender.collect_retired(), 1);
     // releasing through the new instance works (note ids survived)
     h2.render(48_000, 256, &[(0, off(1, 60)), (0, off(2, 64))]);
     assert_eq!(h2.synth.stats().active_voices, 0);
+}
+
+fn layer_patch(generator: rawdawg_synthesizer::patch::Generator) -> Patch {
+    Patch { layers: vec![Layer::with_generator(generator)], ..Patch::default() }
+}
+
+#[test]
+fn every_generator_plays_in_tune_and_finite() {
+    use rawdawg_dsp::analysis::fundamental_frequency;
+    use rawdawg_synthesizer::patch::*;
+    let gens = [
+        ("fm", Generator::Fm(FmSettings::default())),
+        ("additive", Generator::Additive(AdditiveSettings::default())),
+        ("additive-detuned", Generator::Additive(AdditiveSettings { detuned: true, ..AdditiveSettings::default() })),
+        ("granular", Generator::Granular { settings: GranularSettings { jitter: 0.0, ..GranularSettings::default() }, source: rawdawg_dsp::wavetable::cycles::saw() }),
+        ("pluck", Generator::Pluck(PluckSettings::default())),
+        ("basic-pulse", Generator::Basic { wave: rawdawg_dsp::oscillator::BasicWave::Pulse, pulse_width: 0.3 }),
+    ];
+    for (name, g) in gens {
+        let mut h = Harness::new(layer_patch(g), SR, 256);
+        let buf = h.render(48_000, 256, &[(0, on(1, 57, 1.0))]);
+        assert!(buf.iter().all(|s| s.is_finite()), "{name}");
+        assert!(rms(&buf[4800..12_000]) > 0.01, "{name} is audible");
+        let f = fundamental_frequency(&buf[4800..30_000], SR, 0.15);
+        assert!((f - 220.0).abs() < 2.5, "{name}: fundamental {f}");
+        assert_eq!(h.synth.stats().active_voices, 1, "{name}");
+    }
+}
+
+#[test]
+fn unison_widens_stereo_image_and_normalizes_gain() {
+    let mono = sine_patch();
+    let mut wide = sine_patch();
+    wide.layers[0].unison = 6;
+    wide.layers[0].unison_detune_cents = 30.0;
+    wide.layers[0].unison_spread = 1.0;
+    let mut h1 = Harness::new(mono, SR, 4096);
+    let mut h2 = Harness::new(wide, SR, 4096);
+    h1.render(2400, 256, &[(0, on(1, 60, 1.0))]);
+    h2.render(2400, 256, &[(0, on(1, 60, 1.0))]);
+    let (l1, r1) = h1.block(4096, &[]);
+    let (l2, r2) = h2.block(4096, &[]);
+    let diff1: f32 = l1.iter().zip(&r1).map(|(a, b)| (a - b).abs()).sum::<f32>() / 4096.0;
+    let diff2: f32 = l2.iter().zip(&r2).map(|(a, b)| (a - b).abs()).sum::<f32>() / 4096.0;
+    assert!(diff1 < 1e-6, "mono is identical on both sides");
+    assert!(diff2 > 0.01, "unison spread differs between channels: {diff2}");
+    let loud1 = rms(&l1).max(rms(&r1));
+    let loud2 = rms(&l2).max(rms(&r2));
+    assert!(loud2 < loud1 * 2.0, "unison does not multiply loudness: {loud1} vs {loud2}");
+}
+
+#[test]
+fn lfo_vibrato_and_mod_wheel_routes_change_the_sound() {
+    use rawdawg_synthesizer::patch::*;
+    let mut p = sine_patch();
+    p.lfos[0] = Lfo { shape: LfoShape::Sine, rate_hz: 6.0, sync_beats: 0.0, depth: 1.0, per_voice: false };
+    p.mod_routes.push(ModRoute { source: ModSource::Lfo1, target: ModTarget::Pitch, depth: 1.0 / 24.0, enabled: true }); // ±1 semitone
+    let mut h = Harness::new(p, SR, 256);
+    let buf = h.render(48_000, 256, &[(0, on(1, 69, 1.0))]);
+    // frequency measured over short windows must swing around 440 Hz
+    let mut fs = Vec::new();
+    for w in (8000..40_000).step_by(2000) {
+        fs.push(dominant_frequency(&buf[w..w + 2048], SR));
+    }
+    let (lo, hi) = fs.iter().fold((f64::MAX, f64::MIN), |(lo, hi), f| (lo.min(*f), hi.max(*f)));
+    assert!(hi - lo > 20.0 && lo > 400.0 && hi < 480.0, "vibrato range {lo}..{hi}");
+    // mod wheel → cutoff on a bright saw
+    let mut p2 = Patch { layers: vec![Layer::basic(rawdawg_dsp::oscillator::BasicWave::Saw)], ..Patch::default() };
+    p2.filter.cutoff_hz = 300.0;
+    p2.mod_routes.push(ModRoute { source: ModSource::ModWheel, target: ModTarget::Cutoff, depth: 1.0, enabled: true }); // +4 octaves at full wheel
+    let mut h2 = Harness::new(p2, SR, 256);
+    let dark = h2.render(24_000, 256, &[(0, on(1, 48, 1.0))]);
+    let wheel = TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::Control { cc: 1, value: 1.0 });
+    let bright = h2.render(24_000, 256, &[(0, wheel)]);
+    let (_, c_dark, _) = features(&dark[6000..], SR);
+    let (_, c_bright, _) = features(&bright[6000..], SR);
+    assert!(c_bright > c_dark * 1.5, "mod wheel opened the filter: {c_dark} -> {c_bright}");
+}
+
+#[test]
+fn all_generators_process_path_is_allocation_free() {
+    use rawdawg_synthesizer::patch::*;
+    let layers = vec![
+        Layer { unison: 4, ..Layer::default_soft_saw() },
+        Layer::with_generator(Generator::Fm(FmSettings::default())),
+        Layer::with_generator(Generator::Granular { settings: GranularSettings::default(), source: rawdawg_dsp::wavetable::cycles::saw() }),
+        Layer::with_generator(Generator::Pluck(PluckSettings::default())),
+    ];
+    let mut p = Patch { layers, ..Patch::default() };
+    p.lfos[0].depth = 1.0;
+    p.lfos[1] = Lfo { per_voice: true, depth: 1.0, shape: LfoShape::SampleHold, ..Lfo::default() };
+    p.mod_routes.push(ModRoute { source: ModSource::Lfo1, target: ModTarget::Cutoff, depth: 0.5, enabled: true });
+    p.mod_routes.push(ModRoute { source: ModSource::Lfo2, target: ModTarget::Pan, depth: 0.5, enabled: true });
+    p.max_voices = 8;
+    let mut h = Harness::new(p, SR, 1024);
+    h.render(4096, 256, &[(0, on(1, 50, 1.0))]);
+    let mut events: Vec<TimedEvent> = (0..12u32).map(|i| on(10 + i, 40 + i as u8 * 2, 0.8)).collect();
+    events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::Control { cc: 1, value: 0.7 }));
+    events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::ChannelPressure { value: 0.5 }));
+    events.push(TimedEvent::new(0, EventSource::Transport, 0, EventKind::Param { id: ParamId(params::gen_param(1, params::G_FM_LEVEL2)), value: 0.8 }));
+    events.push(TimedEvent::new(0, EventSource::Transport, 0, EventKind::Param { id: ParamId(params::mod_param(5, params::MOD_ENABLED)), value: 1.0 }));
+    let (_, allocs) = measure_rt(|| {
+        for i in 0..60 {
+            let n = [32usize, 127, 256, 1024][i % 4];
+            rawdawg_types::events::sort_events(&mut events);
+            let mut outs: [&mut [f32]; 2] = [&mut h.l[..n], &mut h.r[..n]];
+            let mut ctx = ProcessContext { audio: AudioBlock::output_only(n, &mut outs), events: &events, transport: &h.transport };
+            h.synth.process(&mut ctx);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations with all generators active");
+    assert!(h.synth.stats().nonfinite_samples == 0);
 }

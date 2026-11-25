@@ -1,19 +1,23 @@
 //! The `native.synth` processor.
 
-use crate::params::{self, DESCRIPTORS};
-use crate::patch::{Generator, Layer, MAX_LAYERS, Patch, VoiceMode};
+use crate::modulation::LfoState;
+use crate::params::{self, DESCRIPTORS, ParamBlock};
+use crate::patch::{FmAlgorithm, Generator, GrainWindow, Layer, LfoShape, MAX_LAYERS, MAX_LFOS, MAX_MOD_ROUTES, ModRoute, ModSource, ModTarget, Patch, VoiceMode};
 use crate::registry::{HeldNotes, NoteKey, SustainTable, source_slot};
 use crate::tables::TableInbox;
-use crate::voice::{LayerEngine, Voice};
+use crate::voice::{CONTROL_INTERVAL, LayerEngine, Voice, lfo_defs};
 use rawdawg_dsp::math::sanitize;
 use rawdawg_dsp::oscillator::{BasicTables, BasicWave};
 use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail, find_descriptor};
+use rawdawg_dsp::rng::DeterministicRng;
 use rawdawg_dsp::smooth::Smoother;
+use rawdawg_dsp::wavetable::MipTable;
+use rawdawg_types::ParamId;
 use rawdawg_types::events::{EventKind, TimedEvent};
-use rawdawg_types::{ParamId, ParamMapping};
 
 /// Extra voice slots reserved so stolen voices can fade out instead of clicking.
 pub const SPARE_VOICES: usize = 8;
+const CC_MOD_WHEEL: u8 = 1;
 const CC_SUSTAIN: u8 = 64;
 const CC_ALL_SOUND_OFF: u8 = 120;
 const CC_ALL_NOTES_OFF: u8 = 123;
@@ -33,12 +37,14 @@ pub struct Synth {
     inbox: Option<TableInbox>,
     /// Boxed on purpose: unboxing would free the `Box` allocation on the audio thread.
     #[allow(clippy::vec_box)]
-    pending_retire: Vec<Box<rawdawg_dsp::wavetable::MipTable>>,
+    pending_retire: Vec<Box<MipTable>>,
     tables: Option<BasicTables>,
     voices: Vec<Voice>,
     sustain: SustainTable,
     held: HeldNotes,
     bend: [f32; 16],
+    mod_wheel: [f32; 16],
+    aftertouch: [f32; 16],
     master: Smoother,
     age: u64,
     sample_rate: f64,
@@ -46,6 +52,10 @@ pub struct Synth {
     stats: SynthStats,
     /// Mono-mode note id of the voice currently sounding (slot 0).
     mono_active: Option<NoteKey>,
+    global_lfo: [LfoState; MAX_LFOS],
+    global_lfo_values: [f32; MAX_LFOS],
+    lfo_rng: DeterministicRng,
+    tempo_bpm: f64,
 }
 
 impl Default for Synth {
@@ -61,18 +71,24 @@ impl Synth {
             patch,
             layers,
             inbox: None,
-            pending_retire: Vec::with_capacity(crate::tables::TABLE_QUEUE_DEPTH * 2),
+            pending_retire: Vec::with_capacity(crate::tables::TABLE_QUEUE_DEPTH * 4),
             tables: None,
             voices: Vec::new(),
             sustain: SustainTable::new(),
             held: HeldNotes::new(),
             bend: [0.0; 16],
+            mod_wheel: [0.0; 16],
+            aftertouch: [0.0; 16],
             master: Smoother::new(0.0, 0.0, 48_000.0),
             age: 0,
             sample_rate: 48_000.0,
             prepared: false,
             stats: SynthStats::default(),
             mono_active: None,
+            global_lfo: [LfoState::default(); MAX_LFOS],
+            global_lfo_values: [0.0; MAX_LFOS],
+            lfo_rng: DeterministicRng::new(0x1F0, 0),
+            tempo_bpm: 120.0,
         }
     }
 
@@ -88,57 +104,6 @@ impl Synth {
     /// Per-layer crossfade progress (1.0 = settled), for tests/UI.
     pub fn layer_xfade(&self, layer: usize) -> f32 {
         self.layers.get(layer).map(|l| l.xfade).unwrap_or(1.0)
-    }
-
-    /// RT: apply queued table updates and retire finished crossfades.
-    fn poll_tables(&mut self) {
-        // retire anything parked earlier when the retire queue was full
-        if let Some(inbox) = self.inbox.as_mut() {
-            while let Some(t) = self.pending_retire.pop() {
-                if let Err(t) = inbox.retire(t) {
-                    self.pending_retire.push(t);
-                    break;
-                }
-            }
-        }
-        let sr = self.sample_rate as f32;
-        for _ in 0..crate::tables::TABLE_QUEUE_DEPTH {
-            let Some(inbox) = self.inbox.as_mut() else { return };
-            if !inbox.can_retire() {
-                return; // never swap without room to retire the old table
-            }
-            let Some(update) = inbox.pop() else { return };
-            if update.layer >= self.layers.len() {
-                let _ = inbox.retire(update.table);
-                continue;
-            }
-            if let Some(leftover) = self.layers[update.layer].install_table(update.table, sr)
-                && let Err(t) = inbox.retire(leftover)
-            {
-                self.pending_retire.push(t);
-            }
-            // a table arriving for a layer that was basic/disabled becomes playable
-            if self.patch.layers.get(update.layer).is_some_and(|l| !l.enabled) {
-                // keep patch semantics: table only sounds if the layer is enabled
-            }
-        }
-    }
-
-    /// RT: advance crossfades one sample for every layer, parking finished tables.
-    #[inline]
-    fn tick_xfades(&mut self) {
-        for l in self.layers.iter_mut() {
-            if let Some(done) = l.tick_xfade() {
-                match self.inbox.as_mut() {
-                    Some(inbox) => {
-                        if let Err(t) = inbox.retire(done) {
-                            self.pending_retire.push(t);
-                        }
-                    }
-                    None => self.pending_retire.push(done),
-                }
-            }
-        }
     }
 
     pub fn stats(&self) -> SynthStats {
@@ -170,7 +135,7 @@ impl Synth {
         }
         let wanted = self.patch.max_voices as usize + SPARE_VOICES;
         if self.voices.len() != wanted {
-            self.voices = (0..wanted).map(|_| Voice::new(self.sample_rate, &self.patch)).collect();
+            self.voices = (0..wanted).map(|i| Voice::new(self.sample_rate, &self.patch, i)).collect();
         } else {
             for v in &mut self.voices {
                 v.kill();
@@ -182,6 +147,49 @@ impl Synth {
         self.master.set_time(0.01, self.sample_rate as f32);
         self.mono_active = None;
         self.held.clear();
+        for l in &mut self.global_lfo {
+            l.reset();
+        }
+    }
+
+    /// RT: apply queued table updates and park finished crossfades for retirement.
+    fn poll_tables(&mut self) {
+        let Some(inbox) = self.inbox.as_mut() else { return };
+        while let Some(t) = self.pending_retire.pop() {
+            if let Err(t) = inbox.retire(t) {
+                self.pending_retire.push(t);
+                break;
+            }
+        }
+        let sr = self.sample_rate as f32;
+        let layers = &mut self.layers;
+        let pending = &mut self.pending_retire;
+        for _ in 0..crate::tables::TABLE_QUEUE_DEPTH {
+            if !inbox.can_retire() {
+                return;
+            }
+            let Some(update) = inbox.pop() else { return };
+            if update.layer >= layers.len() {
+                let _ = inbox.retire(update.table);
+                continue;
+            }
+            let mut retire = |t: Box<MipTable>| {
+                if let Err(t) = inbox.retire(t) {
+                    pending.push(t);
+                }
+            };
+            layers[update.layer].install_table(update.frame, update.table, sr, &mut retire);
+        }
+    }
+
+    /// RT: advance crossfades for every layer by `samples`, parking finished tables.
+    #[inline]
+    fn tick_xfades(&mut self, samples: usize) {
+        let pending = &mut self.pending_retire;
+        let mut retire = |t: Box<MipTable>| pending.push(t);
+        for l in self.layers.iter_mut() {
+            l.tick_xfade(samples, &mut retire);
+        }
     }
 
     fn logical_voice_count(&self) -> usize {
@@ -197,7 +205,6 @@ impl Synth {
         {
             return i;
         }
-        // Must steal. Pick oldest released (not fading) else oldest active.
         let mut best: Option<(usize, u64)> = None;
         for (i, v) in self.voices.iter().enumerate() {
             if v.is_active() && v.released && !v.is_fading() && best.is_none_or(|(_, age)| v.age < age) {
@@ -214,8 +221,6 @@ impl Synth {
         let victim = best.map(|(i, _)| i).unwrap_or(0);
         self.stats.stolen_voices += 1;
         self.voices[victim].steal();
-        // The stolen voice keeps fading in its slot; use a free slot for the new
-        // note if any remains, otherwise hard-cut the oldest fading voice.
         if let Some(i) = self.voices.iter().position(|v| !v.is_active()) {
             return i;
         }
@@ -238,10 +243,11 @@ impl Synth {
         self.age += 1;
         let age = self.age;
         let target = self.target_pitch(key.pitch);
-        let bend = self.bend[usize::from(key.channel) % 16] * self.patch.tuning.bend_range_semitones;
+        let ch = usize::from(key.channel) % 16;
+        let bend = self.bend[ch] * self.patch.tuning.bend_range_semitones;
+        let (mw, at) = (self.mod_wheel[ch], self.aftertouch[ch]);
         match self.patch.voice_mode {
             VoiceMode::Poly => {
-                // Re-trigger of the exact same note id (same source) restarts it.
                 let slot = match self.voices.iter().position(|v| v.key == Some(key)) {
                     Some(i) => i,
                     None => self.allocate_voice(),
@@ -249,6 +255,7 @@ impl Synth {
                 let layers = &self.layers;
                 let v = &mut self.voices[slot];
                 v.set_bend(bend);
+                v.set_controllers(mw, at);
                 v.note_on(key, velocity, age, target, self.patch.portamento_s, true, layers);
             }
             VoiceMode::MonoRetrigger | VoiceMode::MonoLegato => {
@@ -258,6 +265,7 @@ impl Synth {
                 let layers = &self.layers;
                 let v = &mut self.voices[0];
                 v.set_bend(bend);
+                v.set_controllers(mw, at);
                 v.note_on(key, velocity, age, target, self.patch.portamento_s, !legato, layers);
                 self.mono_active = Some(key);
             }
@@ -282,7 +290,6 @@ impl Synth {
                 self.held.remove(key);
                 if self.mono_active == Some(key) {
                     if let Some((prev, vel)) = self.held.top() {
-                        // return to the previously held note
                         let age = self.age;
                         let target = self.target_pitch(prev.pitch);
                         let legato = self.patch.voice_mode == VoiceMode::MonoLegato;
@@ -349,6 +356,7 @@ impl Synth {
             return;
         }
         let source = source_slot(ev.source);
+        let ch = usize::from(ev.channel);
         match ev.kind {
             EventKind::NoteOn { note_id, pitch, velocity } => {
                 self.handle_note_on(NoteKey { source, channel: ev.channel, note_id, pitch }, velocity);
@@ -357,6 +365,15 @@ impl Synth {
                 self.handle_note_off(NoteKey { source, channel: ev.channel, note_id, pitch });
             }
             EventKind::Control { cc, value } => match cc {
+                CC_MOD_WHEEL => {
+                    self.mod_wheel[ch] = value;
+                    let at = self.aftertouch[ch];
+                    for v in self.voices.iter_mut() {
+                        if v.key.is_some_and(|k| k.channel == ev.channel) {
+                            v.set_controllers(value, at);
+                        }
+                    }
+                }
                 CC_SUSTAIN => {
                     let down = value >= 0.5;
                     self.sustain.set(source, ev.channel, down);
@@ -368,8 +385,17 @@ impl Synth {
                 CC_ALL_SOUND_OFF => self.hard_reset(),
                 _ => {}
             },
+            EventKind::ChannelPressure { value } => {
+                self.aftertouch[ch] = value;
+                let mw = self.mod_wheel[ch];
+                for v in self.voices.iter_mut() {
+                    if v.key.is_some_and(|k| k.channel == ev.channel) {
+                        v.set_controllers(mw, value);
+                    }
+                }
+            }
             EventKind::PitchBend { value } => {
-                self.bend[usize::from(ev.channel)] = value;
+                self.bend[ch] = value;
                 let semis = value * self.patch.tuning.bend_range_semitones;
                 for v in self.voices.iter_mut() {
                     if let Some(k) = v.key
@@ -384,103 +410,94 @@ impl Synth {
             EventKind::Param { id, value } => {
                 self.apply_param(id, value);
             }
-            EventKind::ParamMod { .. } | EventKind::ChannelPressure { .. } | EventKind::NotePressure { .. } | EventKind::NoteExpression { .. } => {}
+            EventKind::ParamMod { .. } | EventKind::NotePressure { .. } | EventKind::NoteExpression { .. } => {}
         }
     }
 
-    /// RT-safe parameter application (no allocation; wavetable cycles are not params).
+    /// RT-safe parameter application (no allocation; structure changes are not params).
     fn apply_param(&mut self, id: ParamId, normalized: f32) -> bool {
         let Some(d) = find_descriptor(&DESCRIPTORS, id) else { return false };
+        if d.flags.read_only {
+            return false;
+        }
         let phys = d.to_physical(normalized);
-        let p = &mut self.patch;
+        let Some(block) = params::decode(id.0) else { return false };
         let mut env_changed = false;
         let mut mode_changed = false;
-        match id.0 {
-            params::MASTER_GAIN => {
-                p.master_db = phys as f32;
-                self.master.set_target(rawdawg_dsp::math::db_to_lin(p.master_db));
-            }
-            params::VELOCITY_SENS => p.velocity_sensitivity = phys as f32,
-            params::AMP_ATTACK => {
-                p.amp_env.attack_s = phys as f32;
-                env_changed = true;
-            }
-            params::AMP_DECAY => {
-                p.amp_env.decay_s = phys as f32;
-                env_changed = true;
-            }
-            params::AMP_SUSTAIN => {
-                p.amp_env.sustain = phys as f32;
-                env_changed = true;
-            }
-            params::AMP_RELEASE => {
-                p.amp_env.release_s = phys as f32;
-                env_changed = true;
-            }
-            params::FILTER_CUTOFF => p.filter.cutoff_hz = phys as f32,
-            params::FILTER_RESONANCE => p.filter.resonance = phys as f32,
-            params::FILTER_MODE => p.filter.mode = rawdawg_dsp::filter::FilterMode::from_index(phys as usize),
-            params::FILTER_ENV_AMOUNT => p.filter.env_octaves = phys as f32,
-            params::FILTER_KEYTRACK => p.filter.key_track = phys as f32,
-            params::FILTER_ENABLED => p.filter.enabled = phys >= 0.5,
-            params::FENV_ATTACK => {
-                p.filter_env.attack_s = phys as f32;
-                env_changed = true;
-            }
-            params::FENV_DECAY => {
-                p.filter_env.decay_s = phys as f32;
-                env_changed = true;
-            }
-            params::FENV_SUSTAIN => {
-                p.filter_env.sustain = phys as f32;
-                env_changed = true;
-            }
-            params::FENV_RELEASE => {
-                p.filter_env.release_s = phys as f32;
-                env_changed = true;
-            }
-            params::VOICE_MODE => {
-                let m = VoiceMode::from_index(phys as usize);
-                if m != p.voice_mode {
-                    p.voice_mode = m;
-                    mode_changed = true;
+        match block {
+            ParamBlock::Global => {
+                let p = &mut self.patch;
+                match id.0 {
+                    params::MASTER_GAIN => {
+                        p.master_db = phys as f32;
+                        self.master.set_target(rawdawg_dsp::math::db_to_lin(p.master_db));
+                    }
+                    params::VELOCITY_SENS => p.velocity_sensitivity = phys as f32,
+                    params::AMP_ATTACK => {
+                        p.amp_env.attack_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::AMP_DECAY => {
+                        p.amp_env.decay_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::AMP_SUSTAIN => {
+                        p.amp_env.sustain = phys as f32;
+                        env_changed = true;
+                    }
+                    params::AMP_RELEASE => {
+                        p.amp_env.release_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::FILTER_CUTOFF => p.filter.cutoff_hz = phys as f32,
+                    params::FILTER_RESONANCE => p.filter.resonance = phys as f32,
+                    params::FILTER_MODE => p.filter.mode = rawdawg_dsp::filter::FilterMode::from_index(phys as usize),
+                    params::FILTER_ENV_AMOUNT => p.filter.env_octaves = phys as f32,
+                    params::FILTER_KEYTRACK => p.filter.key_track = phys as f32,
+                    params::FILTER_ENABLED => p.filter.enabled = phys >= 0.5,
+                    params::FENV_ATTACK => {
+                        p.filter_env.attack_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::FENV_DECAY => {
+                        p.filter_env.decay_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::FENV_SUSTAIN => {
+                        p.filter_env.sustain = phys as f32;
+                        env_changed = true;
+                    }
+                    params::FENV_RELEASE => {
+                        p.filter_env.release_s = phys as f32;
+                        env_changed = true;
+                    }
+                    params::VOICE_MODE => {
+                        let m = VoiceMode::from_index(phys as usize);
+                        if m != p.voice_mode {
+                            p.voice_mode = m;
+                            mode_changed = true;
+                        }
+                    }
+                    params::PORTAMENTO => p.portamento_s = phys as f32,
+                    params::BEND_RANGE => p.tuning.bend_range_semitones = phys as f32,
+                    params::MAX_VOICES => {
+                        let want = (phys as u32 + 1).clamp(1, 64);
+                        let pool_logical = (self.voices.len().saturating_sub(SPARE_VOICES)).max(1) as u32;
+                        p.max_voices = want.min(pool_logical);
+                    }
+                    params::TRANSPOSE => p.tuning.transpose_semitones = phys as i32 - 48,
+                    params::DETUNE => p.tuning.detune_cents = phys as f32,
+                    _ => return false,
                 }
             }
-            params::PORTAMENTO => p.portamento_s = phys as f32,
-            params::BEND_RANGE => p.tuning.bend_range_semitones = phys as f32,
-            params::MAX_VOICES => {
-                // Changing the pool size requires re-preparation (allocation); clamp to pool.
-                let want = (phys as u32 + 1).clamp(1, 64);
-                let pool_logical = (self.voices.len().saturating_sub(SPARE_VOICES)).max(1) as u32;
-                p.max_voices = want.min(pool_logical);
-            }
-            params::TRANSPOSE => p.tuning.transpose_semitones = phys as i32 - 48,
-            params::DETUNE => p.tuning.detune_cents = phys as f32,
-            _ => {
-                let Some((layer_idx, offset)) = params::decode_layer_param(id.0) else { return false };
-                if layer_idx >= p.layers.len() {
-                    // Layers beyond the patch's count can only be enabled via set_patch (allocation).
-                    return false;
-                }
-                let layer: &mut Layer = &mut p.layers[layer_idx];
+            ParamBlock::Layer { layer: li, offset } => {
+                let Some(layer) = self.patch.layers.get_mut(li) else { return false };
                 match offset {
                     params::L_ENABLED => layer.enabled = phys >= 0.5,
                     params::L_WAVE => {
-                        let idx = phys as usize;
-                        if idx < 4 {
-                            // switching to a basic wave never allocates
-                            match &mut layer.generator {
-                                Generator::Basic { wave, .. } => *wave = BasicWave::from_index(idx),
-                                Generator::Wavetable { .. } => {
-                                    // keep the table engine but mark basic playback via engine kind swap
-                                    // (table data stays resident; no allocation)
-                                    self.layers[layer_idx].kind = crate::voice::LayerKind::Basic { wave: BasicWave::from_index(idx), pulse_width: 0.5 };
-                                    self.layers[layer_idx].update_mix(layer);
-                                    return true;
-                                }
-                            }
+                        if let Generator::Basic { wave, .. } = &mut layer.generator {
+                            *wave = BasicWave::from_index(phys as usize);
                         } else {
-                            // index 4 = wavetable; requires a prepared cycle (set_patch); ignore if none
                             return false;
                         }
                     }
@@ -494,16 +511,100 @@ impl Synth {
                     params::L_COARSE => layer.coarse_semitones = phys as i32 - 48,
                     params::L_FINE => layer.fine_cents = phys as f32,
                     params::L_RESET_PHASE => layer.reset_phase = phys >= 0.5,
+                    params::L_UNISON => layer.unison = (phys as u8 + 1).clamp(1, 8),
+                    params::L_UNISON_DETUNE => layer.unison_detune_cents = phys as f32,
+                    params::L_UNISON_SPREAD => layer.unison_spread = phys as f32,
+                    params::L_WT_POSITION => {
+                        if let Generator::Wavetable { position, .. } = &mut layer.generator {
+                            *position = phys as f32;
+                        }
+                    }
                     _ => return false,
                 }
-                self.layers[layer_idx].update_mix(layer);
+                self.layers[li].update_mix(layer);
+                return true;
+            }
+            ParamBlock::Gen { layer: li, offset } => {
+                let Some(layer) = self.patch.layers.get_mut(li) else { return false };
+                let ok = match (&mut layer.generator, offset) {
+                    (Generator::Fm(s), o) if o <= params::G_FM_ALGORITHM => {
+                        match o {
+                            params::G_FM_RATIO1..=params::G_FM_RATIO4 => s.operators[(o - params::G_FM_RATIO1) as usize].ratio = phys as f32,
+                            params::G_FM_LEVEL1..=params::G_FM_LEVEL4 => s.operators[(o - params::G_FM_LEVEL1) as usize].level = phys as f32,
+                            params::G_FM_FEEDBACK => s.feedback = phys as f32,
+                            _ => s.algorithm = FmAlgorithm::from_index(phys as usize),
+                        }
+                        true
+                    }
+                    (Generator::Additive(s), params::G_ADD_STRETCH) => {
+                        s.stretch = phys as f32;
+                        true
+                    }
+                    (Generator::Additive(s), params::G_ADD_DETUNED) => {
+                        s.detuned = phys >= 0.5;
+                        true
+                    }
+                    (Generator::Granular { settings, .. }, o) if (params::G_GRAIN_SIZE..=params::G_GRAIN_WINDOW).contains(&o) => {
+                        match o {
+                            params::G_GRAIN_SIZE => settings.size_ms = phys as f32,
+                            params::G_GRAIN_DENSITY => settings.density_hz = phys as f32,
+                            params::G_GRAIN_JITTER => settings.jitter = phys as f32,
+                            params::G_GRAIN_SPREAD => settings.pitch_spread_semitones = phys as f32,
+                            _ => settings.window = [GrainWindow::Hann, GrainWindow::Triangle, GrainWindow::Rect][(phys as usize).min(2)],
+                        }
+                        true
+                    }
+                    (Generator::Pluck(s), o) if o >= params::G_PLUCK_DAMPING => {
+                        match o {
+                            params::G_PLUCK_DAMPING => s.damping = phys as f32,
+                            params::G_PLUCK_BRIGHTNESS => s.brightness = phys as f32,
+                            _ => s.excitation = [crate::patch::Excitation::Noise, crate::patch::Excitation::Impulse, crate::patch::Excitation::Pick][(phys as usize).min(2)],
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if ok {
+                    self.layers[li].update_mix(layer);
+                }
+                return ok;
+            }
+            ParamBlock::Lfo { lfo, offset } => {
+                let Some(l) = self.patch.lfos.get_mut(lfo) else { return false };
+                match offset {
+                    params::LFO_SHAPE => l.shape = LfoShape::from_index(phys as usize),
+                    params::LFO_RATE => l.rate_hz = phys as f32,
+                    params::LFO_SYNC => l.sync_beats = phys as f32,
+                    params::LFO_DEPTH => l.depth = phys as f32,
+                    params::LFO_PER_VOICE => l.per_voice = phys >= 0.5,
+                    _ => return false,
+                }
+                return true;
+            }
+            ParamBlock::Mod { route, offset } => {
+                // routes beyond the current count become enabled defaults (no allocation
+                // beyond MAX_MOD_ROUTES: the Vec was sized at prepare)
+                while self.patch.mod_routes.len() <= route && self.patch.mod_routes.len() < MAX_MOD_ROUTES {
+                    if self.patch.mod_routes.capacity() == self.patch.mod_routes.len() {
+                        return false; // would allocate on the RT thread
+                    }
+                    self.patch.mod_routes.push(ModRoute { source: ModSource::Lfo1, target: ModTarget::Pitch, depth: 0.0, enabled: false });
+                }
+                let Some(r) = self.patch.mod_routes.get_mut(route) else { return false };
+                match offset {
+                    params::MOD_SOURCE => r.source = ModSource::from_index(phys as usize),
+                    params::MOD_TARGET => r.target = ModTarget::from_index(phys as usize),
+                    params::MOD_DEPTH => r.depth = phys as f32,
+                    params::MOD_ENABLED => r.enabled = phys >= 0.5,
+                    _ => return false,
+                }
                 return true;
             }
         }
         if env_changed {
-            let (a, f) = (p.amp_env.clamped(), p.filter_env.clamped());
-            p.amp_env = a;
-            p.filter_env = f;
+            let (a, f) = (self.patch.amp_env.clamped(), self.patch.filter_env.clamped());
+            self.patch.amp_env = a;
+            self.patch.filter_env = f;
             for v in &mut self.voices {
                 v.set_envelopes(a, f);
             }
@@ -514,37 +615,32 @@ impl Synth {
         true
     }
 
+    /// Render a span in control-interval chunks: global LFOs and crossfades advance per chunk.
     fn render_span(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
         if self.tables.is_none() {
             return;
         }
-        let fading = self.layers.iter().any(|l| l.prev_table.is_some());
-        if !fading {
-            let tables = self.tables.as_ref().expect("checked above");
-            for v in self.voices.iter_mut() {
-                if v.is_active() {
-                    v.render_add(out_l, out_r, &self.patch, &self.layers, tables);
+        let defs = lfo_defs(&self.patch);
+        let n = out_l.len();
+        let mut pos = 0;
+        while pos < n {
+            let end = (pos + CONTROL_INTERVAL).min(n);
+            let chunk = end - pos;
+            for (i, lfo) in defs.iter().enumerate() {
+                if !lfo.per_voice {
+                    self.global_lfo_values[i] = self.global_lfo[i].advance(lfo, chunk, self.sample_rate, self.tempo_bpm, &mut self.lfo_rng);
                 }
             }
-            return;
-        }
-        // During a table crossfade render in short sub-spans so the fade position
-        // advances smoothly for all voices (bounded: 16-sample steps).
-        let mut pos = 0;
-        let n = out_l.len();
-        while pos < n {
-            let end = (pos + 16).min(n);
             {
                 let tables = self.tables.as_ref().expect("checked above");
+                let lfo_vals = self.global_lfo_values;
                 for v in self.voices.iter_mut() {
                     if v.is_active() {
-                        v.render_add(&mut out_l[pos..end], &mut out_r[pos..end], &self.patch, &self.layers, tables);
+                        v.render_add(&mut out_l[pos..end], &mut out_r[pos..end], &self.patch, &self.layers, tables, &lfo_vals, self.tempo_bpm);
                     }
                 }
             }
-            for _ in pos..end {
-                self.tick_xfades();
-            }
+            self.tick_xfades(chunk);
             pos = end;
         }
     }
@@ -571,13 +667,15 @@ impl Processor for Synth {
         std::mem::swap(&mut self.sustain, &mut old.sustain);
         std::mem::swap(&mut self.held, &mut old.held);
         std::mem::swap(&mut self.bend, &mut old.bend);
+        std::mem::swap(&mut self.mod_wheel, &mut old.mod_wheel);
+        std::mem::swap(&mut self.aftertouch, &mut old.aftertouch);
         std::mem::swap(&mut self.age, &mut old.age);
         std::mem::swap(&mut self.mono_active, &mut old.mono_active);
         std::mem::swap(&mut self.layers, &mut old.layers);
         std::mem::swap(&mut self.inbox, &mut old.inbox);
         std::mem::swap(&mut self.pending_retire, &mut old.pending_retire);
+        std::mem::swap(&mut self.global_lfo, &mut old.global_lfo);
         self.master.snap(old.master.current());
-        // voices keep their envelope params from the old patch; refresh to ours (same state)
         let (a, f) = (self.patch.amp_env, self.patch.filter_env);
         for v in &mut self.voices {
             v.set_envelopes(a, f);
@@ -601,6 +699,8 @@ impl Processor for Synth {
             return Err(PrepareError::UnsupportedLayout);
         }
         self.patch.validate().map_err(PrepareError::InvalidState)?;
+        // reserve the modulation route capacity so RT param events never allocate
+        self.patch.mod_routes.reserve(MAX_MOD_ROUTES.saturating_sub(self.patch.mod_routes.len()));
         self.sample_rate = spec.sample_rate;
         self.prepared = true;
         self.voices.clear();
@@ -613,6 +713,9 @@ impl Processor for Synth {
         ctx.audio.clear_outputs();
         if !self.prepared || ctx.audio.outputs.len() < 2 {
             return;
+        }
+        if ctx.transport.tempo_bpm.is_finite() && ctx.transport.tempo_bpm > 0.0 {
+            self.tempo_bpm = ctx.transport.tempo_bpm;
         }
         self.poll_tables();
         let (first, rest) = ctx.audio.outputs.split_at_mut(1);
@@ -647,7 +750,6 @@ impl Processor for Synth {
     }
 
     fn tail(&self) -> Tail {
-        // release time of the amp envelope bounds the tail after note-off
         Tail::Frames((self.patch.amp_env.release_s * self.sample_rate as f32).ceil() as u32 + 64)
     }
 
@@ -658,37 +760,39 @@ impl Processor for Synth {
     fn param(&self, id: ParamId) -> Option<f32> {
         let d = find_descriptor(&DESCRIPTORS, id)?;
         let p = &self.patch;
-        let phys: f64 = match id.0 {
-            params::MASTER_GAIN => p.master_db.into(),
-            params::VELOCITY_SENS => p.velocity_sensitivity.into(),
-            params::AMP_ATTACK => p.amp_env.attack_s.into(),
-            params::AMP_DECAY => p.amp_env.decay_s.into(),
-            params::AMP_SUSTAIN => p.amp_env.sustain.into(),
-            params::AMP_RELEASE => p.amp_env.release_s.into(),
-            params::FILTER_CUTOFF => p.filter.cutoff_hz.into(),
-            params::FILTER_RESONANCE => p.filter.resonance.into(),
-            params::FILTER_MODE => p.filter.mode.index() as f64,
-            params::FILTER_ENV_AMOUNT => p.filter.env_octaves.into(),
-            params::FILTER_KEYTRACK => p.filter.key_track.into(),
-            params::FILTER_ENABLED => f64::from(u8::from(p.filter.enabled)),
-            params::FENV_ATTACK => p.filter_env.attack_s.into(),
-            params::FENV_DECAY => p.filter_env.decay_s.into(),
-            params::FENV_SUSTAIN => p.filter_env.sustain.into(),
-            params::FENV_RELEASE => p.filter_env.release_s.into(),
-            params::VOICE_MODE => p.voice_mode.index() as f64,
-            params::PORTAMENTO => p.portamento_s.into(),
-            params::BEND_RANGE => p.tuning.bend_range_semitones.into(),
-            params::MAX_VOICES => f64::from(p.max_voices - 1),
-            params::TRANSPOSE => f64::from(p.tuning.transpose_semitones + 48),
-            params::DETUNE => p.tuning.detune_cents.into(),
-            _ => {
-                let (li, off) = params::decode_layer_param(id.0)?;
+        let phys: f64 = match params::decode(id.0)? {
+            ParamBlock::Global => match id.0 {
+                params::MASTER_GAIN => p.master_db.into(),
+                params::VELOCITY_SENS => p.velocity_sensitivity.into(),
+                params::AMP_ATTACK => p.amp_env.attack_s.into(),
+                params::AMP_DECAY => p.amp_env.decay_s.into(),
+                params::AMP_SUSTAIN => p.amp_env.sustain.into(),
+                params::AMP_RELEASE => p.amp_env.release_s.into(),
+                params::FILTER_CUTOFF => p.filter.cutoff_hz.into(),
+                params::FILTER_RESONANCE => p.filter.resonance.into(),
+                params::FILTER_MODE => p.filter.mode.index() as f64,
+                params::FILTER_ENV_AMOUNT => p.filter.env_octaves.into(),
+                params::FILTER_KEYTRACK => p.filter.key_track.into(),
+                params::FILTER_ENABLED => f64::from(u8::from(p.filter.enabled)),
+                params::FENV_ATTACK => p.filter_env.attack_s.into(),
+                params::FENV_DECAY => p.filter_env.decay_s.into(),
+                params::FENV_SUSTAIN => p.filter_env.sustain.into(),
+                params::FENV_RELEASE => p.filter_env.release_s.into(),
+                params::VOICE_MODE => p.voice_mode.index() as f64,
+                params::PORTAMENTO => p.portamento_s.into(),
+                params::BEND_RANGE => p.tuning.bend_range_semitones.into(),
+                params::MAX_VOICES => f64::from(p.max_voices - 1),
+                params::TRANSPOSE => f64::from(p.tuning.transpose_semitones + 48),
+                params::DETUNE => p.tuning.detune_cents.into(),
+                _ => return None,
+            },
+            ParamBlock::Layer { layer: li, offset } => {
                 let layer = p.layers.get(li)?;
-                match off {
+                match offset {
                     params::L_ENABLED => f64::from(u8::from(layer.enabled)),
                     params::L_WAVE => match &layer.generator {
                         Generator::Basic { wave, .. } => wave.index() as f64,
-                        Generator::Wavetable { .. } => 4.0,
+                        _ => 0.0,
                     },
                     params::L_PULSE_WIDTH => match &layer.generator {
                         Generator::Basic { pulse_width, .. } => f64::from(*pulse_width),
@@ -699,14 +803,65 @@ impl Processor for Synth {
                     params::L_COARSE => f64::from(layer.coarse_semitones + 48),
                     params::L_FINE => layer.fine_cents.into(),
                     params::L_RESET_PHASE => f64::from(u8::from(layer.reset_phase)),
+                    params::L_UNISON => f64::from(layer.unison.saturating_sub(1)),
+                    params::L_UNISON_DETUNE => layer.unison_detune_cents.into(),
+                    params::L_UNISON_SPREAD => layer.unison_spread.into(),
+                    params::L_WT_POSITION => match &layer.generator {
+                        Generator::Wavetable { position, .. } => f64::from(*position),
+                        _ => 0.0,
+                    },
+                    params::L_KIND => layer.generator.kind_index() as f64,
+                    _ => return None,
+                }
+            }
+            ParamBlock::Gen { layer: li, offset } => {
+                let layer = p.layers.get(li)?;
+                match (&layer.generator, offset) {
+                    (Generator::Fm(s), o) if o <= params::G_FM_RATIO4 => s.operators[o as usize].ratio.into(),
+                    (Generator::Fm(s), o) if o <= params::G_FM_LEVEL4 => s.operators[(o - params::G_FM_LEVEL1) as usize].level.into(),
+                    (Generator::Fm(s), params::G_FM_FEEDBACK) => s.feedback.into(),
+                    (Generator::Fm(s), params::G_FM_ALGORITHM) => s.algorithm.index() as f64,
+                    (Generator::Additive(s), params::G_ADD_STRETCH) => s.stretch.into(),
+                    (Generator::Additive(s), params::G_ADD_DETUNED) => f64::from(u8::from(s.detuned)),
+                    (Generator::Granular { settings, .. }, params::G_GRAIN_SIZE) => settings.size_ms.into(),
+                    (Generator::Granular { settings, .. }, params::G_GRAIN_DENSITY) => settings.density_hz.into(),
+                    (Generator::Granular { settings, .. }, params::G_GRAIN_JITTER) => settings.jitter.into(),
+                    (Generator::Granular { settings, .. }, params::G_GRAIN_SPREAD) => settings.pitch_spread_semitones.into(),
+                    (Generator::Granular { settings, .. }, params::G_GRAIN_WINDOW) => {
+                        [GrainWindow::Hann, GrainWindow::Triangle, GrainWindow::Rect].iter().position(|w| *w == settings.window).unwrap_or(0) as f64
+                    }
+                    (Generator::Pluck(s), params::G_PLUCK_DAMPING) => s.damping.into(),
+                    (Generator::Pluck(s), params::G_PLUCK_BRIGHTNESS) => s.brightness.into(),
+                    (Generator::Pluck(s), params::G_PLUCK_EXCITATION) => {
+                        [crate::patch::Excitation::Noise, crate::patch::Excitation::Impulse, crate::patch::Excitation::Pick].iter().position(|e| *e == s.excitation).unwrap_or(0)
+                            as f64
+                    }
+                    _ => return None,
+                }
+            }
+            ParamBlock::Lfo { lfo, offset } => {
+                let l = p.lfos.get(lfo)?;
+                match offset {
+                    params::LFO_SHAPE => l.shape.index() as f64,
+                    params::LFO_RATE => l.rate_hz.into(),
+                    params::LFO_SYNC => l.sync_beats.into(),
+                    params::LFO_DEPTH => l.depth.into(),
+                    params::LFO_PER_VOICE => f64::from(u8::from(l.per_voice)),
+                    _ => return None,
+                }
+            }
+            ParamBlock::Mod { route, offset } => {
+                let r = p.mod_routes.get(route).copied().unwrap_or(ModRoute { source: ModSource::Lfo1, target: ModTarget::Pitch, depth: 0.0, enabled: false });
+                match offset {
+                    params::MOD_SOURCE => r.source.index() as f64,
+                    params::MOD_TARGET => r.target.index() as f64,
+                    params::MOD_DEPTH => r.depth.into(),
+                    params::MOD_ENABLED => f64::from(u8::from(r.enabled)),
                     _ => return None,
                 }
             }
         };
-        let n = d.to_normalized(phys);
-        // Discrete mappings: to_normalized gives phys/(steps-1), matching to_physical's rounding.
-        let _ = ParamMapping::Toggle;
-        Some(n)
+        Some(d.to_normalized(phys))
     }
 
     fn set_param(&mut self, id: ParamId, normalized: f32) -> bool {
@@ -725,3 +880,7 @@ impl Processor for Synth {
         self.set_patch(patch)
     }
 }
+
+/// Keep the unused-import check honest for `Layer` (used by callers via patch).
+#[allow(dead_code)]
+fn _layer_marker(_: &Layer) {}

@@ -6,6 +6,8 @@
 //! source-isolated note registry with sustain, pitch bend, tuning.
 //! Later milestones add the remaining generators, modulation and mutation.
 
+pub mod generators;
+pub mod modulation;
 pub mod params;
 pub mod patch;
 pub mod registry;
