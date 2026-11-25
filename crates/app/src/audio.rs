@@ -24,17 +24,36 @@ pub struct AudioSystem {
     pub stream: OutputStream,
     pub handle: EngineHandle,
     pub sample_rate: SampleRate,
+    /// Human-readable note when the actual configuration differs from the request.
+    pub note: Option<String>,
 }
 
 impl AudioSystem {
-    /// Open the requested device and start the engine with an empty plan.
-    pub fn start(req: &StreamConfigRequest, limits: &EngineLimits) -> anyhow::Result<Self> {
+    fn open_once(req: &StreamConfigRequest, limits: &EngineLimits) -> anyhow::Result<Self> {
         let (rate_hz, _ch) = OutputStream::negotiate_only(req).context("negotiating audio format")?;
         let rate = SampleRate::new(rate_hz).context("device reported a zero sample rate")?;
         let max_frames = rawdawg_audio_io::stream::MAX_CHUNK_FRAMES;
         let (engine, handle) = Engine::new(rate, max_frames, limits);
         let stream = OutputStream::open(req, move |_sr| EngineSource { engine }).context("opening audio stream")?;
-        Ok(Self { stream, handle, sample_rate: rate })
+        Ok(Self { stream, handle, sample_rate: rate, note: None })
+    }
+
+    /// Open the requested device and start the engine with an empty plan.
+    ///
+    /// If the device accepts the configuration but fails as soon as it runs (seen with
+    /// fixed period sizes on some ALSA bridges), retry once with the device's default
+    /// buffer size and report that in `note`. Stored preferences are never changed here.
+    pub fn start(req: &StreamConfigRequest, limits: &EngineLimits) -> anyhow::Result<Self> {
+        match Self::open_once(req, limits) {
+            Ok(s) => Ok(s),
+            Err(first) if req.buffer_frames.is_some() => {
+                let fallback = StreamConfigRequest { buffer_frames: None, ..req.clone() };
+                let mut s = Self::open_once(&fallback, limits).map_err(|second| anyhow::anyhow!("{first:#}; fallback to device default buffer also failed: {second:#}"))?;
+                s.note = Some(format!("Buffer of {} frames was refused by the device ({first:#}); using the device default buffer", req.buffer_frames.unwrap_or(0)));
+                Ok(s)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -62,6 +62,7 @@ pub struct StreamStatus {
     pub max_callback_ns: AtomicU64,
     pub output_latency_s: AtomicF64,
     pub failed: AtomicBool,
+    pub errors: Counter,
     pub error: Mutex<Option<String>>,
 }
 
@@ -201,28 +202,76 @@ fn format_rank(f: cpal::SampleFormat) -> u8 {
     }
 }
 
-/// Negotiate a stereo (or mono) output config for the request.
-fn negotiate(device: &cpal::Device, req: &StreamConfigRequest) -> Result<cpal::SupportedStreamConfig, StreamError> {
-    let default = device.default_output_config().map_err(|e| StreamError::Build(e.to_string()))?;
-    let want_rate = req.sample_rate_hz.unwrap_or(default.sample_rate());
-    let ranges: Vec<_> = device.supported_output_configs().map_err(|e| StreamError::Build(e.to_string()))?.collect();
-    let mut candidates: Vec<&cpal::SupportedStreamConfigRange> = ranges.iter().filter(|r| r.channels() >= 1 && r.contains_rate(want_rate)).collect();
-    // prefer exactly stereo, then more channels, then mono; prefer f32
+/// A candidate configuration range as offered by a device (backend-independent).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigRange {
+    pub channels: u16,
+    pub min_rate_hz: u32,
+    pub max_rate_hz: u32,
+    pub sample_format: cpal::SampleFormat,
+}
+
+impl ConfigRange {
+    fn contains(&self, rate: u32) -> bool {
+        self.min_rate_hz <= rate && rate <= self.max_rate_hz
+    }
+}
+
+/// Pure selection policy (testable without devices): prefer exactly stereo, then
+/// more channels, then mono; prefer f32, then i32/i16/u16. Returns the chosen
+/// range, or the list of what the device offers for the error message.
+pub fn choose_config(ranges: &[ConfigRange], want_rate: u32) -> Result<ConfigRange, Vec<String>> {
+    let mut candidates: Vec<&ConfigRange> = ranges.iter().filter(|r| r.channels >= 1 && r.contains(want_rate)).collect();
     candidates.sort_by_key(|r| {
-        let ch_rank = match r.channels() {
+        let ch_rank = match r.channels {
             2 => 0,
             n if n > 2 => 1,
             _ => 2,
         };
-        (ch_rank, format_rank(r.sample_format()))
+        (ch_rank, format_rank(r.sample_format))
     });
     if let Some(r) = candidates.first() {
-        return Ok((**r).with_sample_rate(want_rate));
+        return Ok((*r).clone());
     }
-    let mut nearest: Vec<String> = ranges.iter().map(|r| format!("{}ch {}-{} Hz {:?}", r.channels(), r.min_sample_rate(), r.max_sample_rate(), r.sample_format())).collect();
+    let mut nearest: Vec<String> = ranges.iter().map(|r| format!("{}ch {}-{} Hz {:?}", r.channels, r.min_rate_hz, r.max_rate_hz, r.sample_format)).collect();
     nearest.sort();
     nearest.dedup();
-    Err(StreamError::UnsupportedConfig(format!("{want_rate} Hz"), nearest.join("; ")))
+    Err(nearest)
+}
+
+/// Project rates a device can actually open (for the nearest-supported suggestion).
+pub fn offered_project_rates(ranges: &[ConfigRange]) -> Vec<u32> {
+    rawdawg_types::SampleRate::SUPPORTED.iter().copied().filter(|r| ranges.iter().any(|c| c.contains(*r))).collect()
+}
+
+/// Negotiate a stereo (or mono) output config for the request.
+fn negotiate(device: &cpal::Device, req: &StreamConfigRequest) -> Result<cpal::SupportedStreamConfig, StreamError> {
+    let default = device.default_output_config().map_err(|e| StreamError::Build(e.to_string()))?;
+    let want_rate = req.sample_rate_hz.unwrap_or(default.sample_rate());
+    let ranges: Vec<cpal::SupportedStreamConfigRange> = device.supported_output_configs().map_err(|e| StreamError::Build(e.to_string()))?.collect();
+    let plain: Vec<ConfigRange> = ranges
+        .iter()
+        .map(|r| ConfigRange { channels: r.channels(), min_rate_hz: r.min_sample_rate(), max_rate_hz: r.max_sample_rate(), sample_format: r.sample_format() })
+        .collect();
+    match choose_config(&plain, want_rate) {
+        Ok(chosen) => {
+            let r = ranges
+                .iter()
+                .find(|r| {
+                    r.channels() == chosen.channels
+                        && r.min_sample_rate() == chosen.min_rate_hz
+                        && r.max_sample_rate() == chosen.max_rate_hz
+                        && r.sample_format() == chosen.sample_format
+                })
+                .expect("chosen range comes from the list");
+            Ok((*r).with_sample_rate(want_rate))
+        }
+        Err(nearest) => {
+            let rates = offered_project_rates(&plain);
+            let hint = if rates.is_empty() { nearest.join("; ") } else { format!("project rates offered: {rates:?}; {}", nearest.join("; ")) };
+            Err(StreamError::UnsupportedConfig(format!("{want_rate} Hz"), hint))
+        }
+    }
 }
 
 impl OutputStream {
@@ -269,9 +318,17 @@ impl OutputStream {
         };
         let err_status = status.clone();
         let err_cb = move |e: cpal::Error| {
-            log::error!("audio stream error: {e}");
+            // Backends can report the same failure on every period: count, log the
+            // first occurrence and then every 1000th, never flood.
+            let n = err_status.errors.get();
+            err_status.errors.incr();
+            if n == 0 || n.is_multiple_of(1000) {
+                log::error!("audio stream error (#{n}): {e}");
+            }
             err_status.failed.store(true, Ordering::SeqCst);
-            if let Ok(mut g) = err_status.error.lock() {
+            if n == 0
+                && let Ok(mut g) = err_status.error.lock()
+            {
                 *g = Some(e.to_string());
             }
         };
@@ -288,7 +345,21 @@ impl OutputStream {
         }
         .map_err(|e| StreamError::Build(e.to_string()))?;
         stream.play().map_err(|e| StreamError::Play(e.to_string()))?;
-        Ok(Self { _stream: stream, status, config: actual })
+        let out = Self { _stream: stream, status, config: actual };
+        // Some backends accept a configuration and only fail once running (e.g. a
+        // fixed period size the server rejects). Give the stream a short window to
+        // either call back or report an error so callers can fall back explicitly.
+        let deadline = Instant::now() + std::time::Duration::from_millis(250);
+        while Instant::now() < deadline {
+            if out.is_failed() {
+                return Err(StreamError::Lost(out.status.error_message().unwrap_or_else(|| "stream failed right after start".into())));
+            }
+            if out.status.callbacks.get() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok(out)
     }
 
     /// Resolve the sample rate and channel count that `open` would use, without opening.
@@ -326,6 +397,36 @@ mod tests {
         assert_eq!(to_i16_saturating(-2.0), i16::MIN);
         assert_eq!(to_i16_saturating(0.0), 0);
         assert!((to_i16_saturating(0.5) as i32 - 16384).abs() <= 1);
+    }
+
+    fn fake_device() -> Vec<ConfigRange> {
+        vec![
+            ConfigRange { channels: 1, min_rate_hz: 8000, max_rate_hz: 48_000, sample_format: cpal::SampleFormat::I16 },
+            ConfigRange { channels: 2, min_rate_hz: 44_100, max_rate_hz: 96_000, sample_format: cpal::SampleFormat::I16 },
+            ConfigRange { channels: 2, min_rate_hz: 44_100, max_rate_hz: 96_000, sample_format: cpal::SampleFormat::F32 },
+            ConfigRange { channels: 6, min_rate_hz: 48_000, max_rate_hz: 192_000, sample_format: cpal::SampleFormat::F32 },
+        ]
+    }
+
+    #[test]
+    fn fake_device_negotiation_prefers_stereo_f32_and_reports_nearest() {
+        let dev = fake_device();
+        let c = choose_config(&dev, 48_000).unwrap();
+        assert_eq!((c.channels, c.sample_format), (2, cpal::SampleFormat::F32));
+        // 192 kHz only offered on the 6-channel range: pick it rather than fail
+        let c = choose_config(&dev, 192_000).unwrap();
+        assert_eq!(c.channels, 6);
+        // 22.05 kHz only on mono i16
+        let c = choose_config(&dev, 22_050).unwrap();
+        assert_eq!((c.channels, c.sample_format), (1, cpal::SampleFormat::I16));
+        // unsupported rate → explicit error listing what is offered
+        let err = choose_config(&dev, 384_000).unwrap_err();
+        assert!(err.iter().any(|s| s.contains("2ch 44100-96000 Hz F32")), "{err:?}");
+        assert_eq!(offered_project_rates(&dev), vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000]);
+        assert!(choose_config(&[], 48_000).is_err());
+        // mono-only device still works (engine downmixes at the edge)
+        let mono = vec![ConfigRange { channels: 1, min_rate_hz: 48_000, max_rate_hz: 48_000, sample_format: cpal::SampleFormat::U16 }];
+        assert_eq!(choose_config(&mono, 48_000).unwrap().channels, 1);
     }
 
     #[test]

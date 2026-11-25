@@ -1,0 +1,16 @@
+[package]
+name = "rawdawg-midi"
+description = "rawDAWg MIDI input adapter (midir), byte-stream parser with note identity, and SMF support (later)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-rt = { path = "../rt" }
+midir = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

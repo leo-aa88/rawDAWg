@@ -4,7 +4,7 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 
 ## Current state
 
-- **Milestone:** M0 (bootstrap and risk reduction) **complete** on Ubuntu; M1 (audio engine and first playable instrument) **in progress** — engine, synth, typing keyboard and headless render are implemented and tested; MIDI input (midir) and the device settings UI are the next M1 tasks.
+- **Milestone:** M0 (bootstrap and risk reduction) **complete** on Ubuntu; M1 (audio engine and first playable instrument) **implemented** — engine, synth, typing/MIDI/on-screen keyboards, synth parameter editing with gesture undo, audio/MIDI settings, headless render. M1's hardware gates (real audio device, physical MIDI keyboard) remain open; see "Open gates".
 - **Environment used:** Ubuntu 22.04 (WSL2, WSLg), Rust 1.99.0, 16 cores. Audio output available through WSLg's PulseAudio bridge via ALSA (`Default Audio Device`), which is *not* a real Ubuntu desktop/hardware device. No Windows machine, no display screenshots captured, no MIDI hardware, no independent plugin hosts or validators installed.
 - **Build label:** intermediate build; not a release candidate.
 
@@ -26,6 +26,14 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 | `./target/release/rawdawg --audio-smoke` | ALSA default 48 kHz F32, 132 callbacks, 0 xruns, max callback 0.207 ms, peak 0.154 |
 | `./target/release/rawdawg --headless-render fixtures/demo.rawdawg --output … --format pcm24` | 144000 frames, peak 0.340, 0 clipped, ~230× realtime |
 | `cargo xtask package --format deb` | refuses: scheduled for M8 |
+
+## M1 additions (2026-11-25)
+
+- `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
+- App: menu bar (File/Edit/View/Help), transport with bar:beat and metronome toggle, shortcuts (Space, Esc, Ctrl+Z/Ctrl+Shift+Z/Ctrl+Y, Ctrl+S, F6/F7), Settings window (output device/rate/buffer with nearest-supported hints and requested-vs-actual, MIDI device toggles with connection state and message counters, typing map), preferences in the OS config dir (device, rate, buffer, MIDI devices, octave/velocity, recent projects), channel rack with select/mute/solo/gain/pan gestures, synth panel (simple/advanced parameter sliders with live `Param` preview and one `SetInstanceState` undo entry per gesture, reset to Init), on-screen piano (click/drag, Mouse source), `--screenshot <png>` self-capture for GUI evidence.
+- Audio I/O: pure negotiation policy with fake-device tests, rate-limited stream error reporting, early-failure detection window, one-time automatic fallback to the device-default buffer when a fixed buffer is refused at run time (preferences untouched, status explains).
+- Evidence: `docs/verification/screenshots/m1-wslg-1440x900.png` (self-captured under WSLg, GLES backend; dark-only surfaces, synth panel, keyboard, honest "Audio unavailable" status).
+- Environment note: the WSLg PulseAudio bridge accepted a 1024-frame fixed buffer and device-default streams early in the session (`--audio-smoke` exit 0, 0 xruns), then started failing every PCM with `snd_pcm_avail_delay: I/O error (5)` after repeated fixed-256 failures; `pactl info` still answers. This is bridge flakiness, not a device under our control; the app shows "Audio unavailable" with Retry and keeps editing/offline render working. Real-device evidence remains BLOCKED.
 
 ## Implemented (M0 + M1 subset)
 
@@ -53,6 +61,7 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 | Windows build/test (PLAT-01, QUAL-03) | NOT RUN | Run CI workflow on `windows-2022` or build locally with MSVC: `cargo test --workspace --locked`. |
 | Ubuntu 24.04 build/test | NOT RUN (22.04 used) | CI job `Ubuntu 24.04`; also verify `pipewire` feature builds there. |
 | HW-01 real audio devices (PLAT-02) | BLOCKED | On real hardware: `rawdawg --list-audio-devices`, `rawdawg --audio-smoke --device <id> --buffer 256`; record device, backend, rate, buffer, xruns, duration in `docs/verification/hardware.md`. Repeat for WASAPI (Windows) and ALSA/PipeWire/JACK (Ubuntu). |
+| MIDI-01 physical MIDI keyboard (IO-01) | BLOCKED | No MIDI backend/ports here (no ALSA sequencer). On real hardware: Settings > MIDI, enable the device, play; verify note on/off, velocity, sustain, bend, disconnect release. |
 | GUI-01 manual GUI (PLAT-03, QUAL-04) | BLOCKED | Launch `rawdawg` on a display at 1024×720 / 1440×900 / 1920×1080, 100/150/200 %; confirm dark-only surfaces, typing keyboard plays within 10 s, screenshots to `docs/verification/screenshots/`. |
 | PL-03 clap-validator | BLOCKED | Install clap-validator; `cargo xtask verify --suite plugins` runs it automatically when on PATH. |
 | PL-04 VST3 validator | BLOCKED (M7) | Needs SDK validator build and `.vst3` bundle layout. |
@@ -71,9 +80,10 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 
 ## Next action
 
-M1 continuation, in order:
-1. `rawdawg-midi` crate: midir input adapter with monotonic timestamps → engine `Live` events (source `MidiDevice(n)`), device list/enable in the UI, hotplug/reconnect, release-on-disconnect; T-MIDI mock-timestamp tests.
-2. Settings > Audio in the GUI: device/rate/buffer selection with requested vs actual, nearest-supported suggestions, no silent preference changes.
-3. On-screen keyboard and channel-rack note audition; parameter edits as `SetInstanceState` gestures with live preview through `Param` events.
-4. Release build, `cargo xtask bench-audio`, then run the M1 gate list (T-RT/T-TIME/T-OSC/T-VOICE/T-IO/T-MIDI subsets) and update the evidence table.
-Then M2 (sculpting canvas with live table handoff, spectral paint, mutation/evolution/morph, remaining generators, sampler/SF2).
+M2 — flagship experimental synth, in vertical slices:
+1. Live wavetable handoff: editable cycle → off-thread table build → bounded handoff into the running synth voices (crossfade, no retrigger); carry processor state across plan swaps by instance id so edits never cut held notes.
+2. Waveform canvas with Draw/Deform/Smooth/Sharpen/Stretch/Distort/Noise brushes (circular indices, seam wrap, radius/strength), gesture-granular undo, live scope; T-SCULPT tests.
+3. Spectral painting (harmonic magnitudes, optional phase) and motion frames (2–16 keyframes, position morph).
+4. Remaining generators (FM/PM, additive, granular, plucked string), unison, LFOs/modulation matrix; graph compiler + bounded expression nodes.
+5. Randomize/Chaos/locks, evolution 3×3 with cached auditions, breed, XY morph; factory presets and preset browser; sampler and SF2.
+Known M1 limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement with the stream clock arrives with recording in M3); gain/pan previews recompile the plan and restart processors (fixed by item 1).

@@ -7,7 +7,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | ID | Status | Milestone | Evidence / notes |
 |---|---|---|---|
 | PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 145 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
-| PLAT-02 | PARTIAL | M0/M1 | CPAL enumeration (`rawdawg --list-audio-devices`), negotiation (rate/channel/format, requested vs actual in `ActualConfig`), stream open, xrun heuristic, no-device/failed states in UI with Retry. Evidence: `rawdawg --audio-smoke` on this machine → ALSA default device 48 kHz F32, 134 callbacks, peak 0.154 (WSLg PulseAudio bridge, **not** a real Ubuntu desktop device). Real-device matrix: BLOCKED (HW-01). |
+| PLAT-02 | PARTIAL | M0/M1 | CPAL enumeration, pure negotiation policy with fake-device tests (stereo/f32 preference, nearest-supported hints), explicit device/rate/buffer controls in Settings with requested vs actual, rate-limited error reporting, automatic one-time fallback to the device buffer (preferences untouched), no-device/failed states with Retry. Evidence: `rawdawg --audio-smoke` → ALSA default 48 kHz F32, 0 xruns (WSLg PulseAudio bridge, **not** real hardware; the bridge later wedged, see PROGRESS.md). Real-device matrix: BLOCKED (HW-01). |
 | PLAT-03 | PARTIAL | M0 | Dark-only visuals forced every frame (`crates/app/src/theme.rs`), no theme toggle anywhere. Manual screenshot verification: BLOCKED (GUI-01). |
 | PLAT-04 | NOT RUN | M8 | `cargo xtask package` exists and refuses with an explicit message; no packaging yet. |
 | PLAT-05 | PASS (design) | M0 | No network, account or telemetry code; `deny.toml` bans `openssl-sys`; all operation offline. Re-verified at each milestone. |
@@ -20,8 +20,8 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | CORE-06 | NOT RUN | M3 | Browser panel lists instruments/devices only. |
 | CORE-07 | PARTIAL | M0 | Command model with inverses, gestures (one undo entry, cancel restores exactly), revision/dirty tracking: `crates/project/src/commands.rs` tests. UI Undo/Redo buttons wired. Save/open via CLI/`--open`; Save/Save-as UI and autosave: M6. |
 | CORE-08 | NOT RUN | M3/M4 | Automation model validated; no playback/recording yet. |
-| IO-01 | NOT RUN | M1 | midir not wired yet (next task). Source isolation and sustain handling tested at the synth level. |
-| IO-02 | PARTIAL | M1 | Typing keyboard in the GUI: default Z–/ map, octave ±, velocity, no capture while a text field is focused, release on focus loss/disable, OS key repeat ignored, release uses original pitch. Manual verification: BLOCKED (GUI-01). |
+| IO-01 | PARTIAL | M1 | midir adapter with device list/enable/rescan/disconnect release, running-status parser, FIFO note identity, CC/bend/pressure; events routed to the selected channel with source `MidiDevice(n)`. Tests: `crates/midi`. Physical keyboard: BLOCKED (MIDI-01). Sample-accurate timestamp placement: M3. |
+| IO-02 | PARTIAL | M1 | Typing keyboard (Z–/ map, octave ±, velocity, no capture in text fields or with Ctrl/Alt, release on focus loss/disable, OS repeat ignored, release uses original pitch) and on-screen piano (click/drag, Mouse source). Screenshot evidence `docs/verification/screenshots/m1-wslg-1440x900.png`; interactive verification: BLOCKED (GUI-01). |
 | IO-03 | NOT RUN | M3 | |
 | IO-04 | NOT RUN | M5 | |
 | IO-05 | NOT RUN | M2/M5 | |
@@ -54,8 +54,9 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | T-DATA | PARTIAL (round trip, malformed/newer schema, nesting bomb, atomic save) | `crates/project/src/persist.rs` |
 | T-EXPORT | PARTIAL (WAV formats, sample counts, content) | `crates/audio-engine/tests/engine.rs` |
 | T-PLUGIN | PARTIAL (ABI lifecycle, process, params, state through built modules) | `crates/plugin-clap/tests`, `crates/plugin-vst3/tests` |
-| T-IO | PARTIAL (negotiation logic, enumeration never panics) | `crates/audio-io` |
-| T-SCULPT, T-MUTATE, T-MORPH, T-FX, T-SAMPLER, T-MIDI | NOT RUN | later milestones |
+| T-IO | PARTIAL (fake-device negotiation across formats/channels/rates, nearest-supported reporting, queue saturation counters, enumeration never panics, edge conversion saturation) | `crates/audio-io`, `crates/rt` |
+| T-MIDI | PARTIAL (byte parser: running status, velocity-0 off, FIFO identity, SysEx/realtime, controllers; disconnect release) | `crates/midi` |
+| T-SCULPT, T-MUTATE, T-MORPH, T-FX, T-SAMPLER | NOT RUN | later milestones |
 
 ## Manual / platform gates currently open
 

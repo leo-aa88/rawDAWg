@@ -3,6 +3,7 @@
 
 mod audio;
 mod cli;
+mod prefs;
 mod theme;
 mod ui;
 

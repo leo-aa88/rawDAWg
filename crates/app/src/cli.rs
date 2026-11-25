@@ -73,6 +73,15 @@ pub struct Args {
     /// Start the GUI without opening any audio device.
     #[arg(long)]
     pub no_audio: bool,
+
+    /// Capture a PNG screenshot of the main window after `--screenshot-delay-ms`, then exit
+    /// (GUI verification evidence).
+    #[arg(long, value_name = "FILE.png")]
+    pub screenshot: Option<PathBuf>,
+
+    /// Delay before the screenshot is captured.
+    #[arg(long, default_value_t = 2000)]
+    pub screenshot_delay_ms: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +160,13 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
         }
         return Ok(0);
     }
-    crate::ui::run_gui(crate::ui::GuiOptions { open: args.open.clone(), safe_mode: args.safe_mode, device: args.device.clone(), buffer: args.buffer, no_audio: args.no_audio })?;
+    crate::ui::run_gui(crate::ui::GuiOptions {
+        open: args.open.clone(),
+        safe_mode: args.safe_mode,
+        device: args.device.clone(),
+        buffer: args.buffer,
+        no_audio: args.no_audio,
+        screenshot: args.screenshot.clone().map(|p| (p, std::time::Duration::from_millis(args.screenshot_delay_ms))),
+    })?;
     Ok(0)
 }

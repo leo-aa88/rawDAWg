@@ -21,10 +21,12 @@ rawdawg-synthesizer = { path = "../synthesizer" }
 rawdawg-project = { path = "../project" }
 rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-audio-io = { path = "../audio-io" }
+rawdawg-midi = { path = "../midi" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+image = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
