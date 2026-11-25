@@ -1,25 +1,37 @@
-# rawDAWg — User guide (intermediate build, M0/M1)
+# rawDAWg — User guide
 
-**rawDAWg** — *Less thinking. More noise.* This guide covers what the current build actually does. Features listed in the specification but not yet implemented are marked as such inside the app.
+**rawDAWg** — *Less thinking. More noise.* This guide describes what the current build (0.1.0, release candidate work in progress) actually does. Open gates and known limits are listed in `PROGRESS.md`.
+
+## Quickstart (ten minutes)
+
+1. **Install and start.** Install the package for your system (see **Installing** below) or build from source, then start rawDAWg. It opens a new project with one playable **rawDAWg Synth** channel. If no audio device can be opened, the status bar says **Audio unavailable**: everything except playback still works.
+2. **Play.** Hold `Z X C V B N M` (white keys) and `S D G H J` (black keys) on your computer keyboard, or play a MIDI keyboard after enabling it in **Settings › MIDI input**.
+3. **Find a sound.** In the synth panel, click a preset to hear it and double-click to load it, or press **New generation from current** in the evolve section to hear nine variations of the current sound. Undo (Ctrl+Z) always takes a change back.
+4. **Make a pattern.** Open the **Channel rack** (F6) and click steps, or the **Piano roll** (F7) and draw notes. Press **Play** (Space): pattern mode loops the selected pattern.
+5. **Add effects.** Open the **Mixer** (F9), pick the channel's strip, press **+ Add effect** and type a name (try *Reverb* or *Delay*). Click the effect to open its editor.
+6. **Arrange.** Switch to **Song**, add a playlist track with **+ Track**, and click in its lane to place the pattern. Drop an audio file on a lane to use it as an audio clip.
+7. **Save and export.** **Ctrl+S** saves the project (a folder ending in `.rawdawg`). **File › Export…** renders WAV or FLAC, with optional stems.
 
 ## Starting
 
 ```sh
-cargo run --release -p rawdawg            # GUI with the default audio device
-cargo run --release -p rawdawg -- --help  # all options
+rawdawg                          # installed package: GUI with the default audio device
+cargo run --release -p rawdawg   # from source
+rawdawg --help                   # all options
 ```
 
 Options:
 
 | Flag | Effect |
 |---|---|
-| `--open <PATH>` | Open a project folder (`Something.rawdawg`) or its `project.json`. |
+| `--open <PATH>` | Open a project folder (`Something.rawdawg`), its `project.json` or its `project.rawdawg` marker; or import a `.rawdawgpreset` into a new project. |
 | `--no-audio` | Start without opening an audio device (editing and offline render still work). |
 | `--device <ID>` / `--buffer <FRAMES>` | Choose the output device (ids from `--list-audio-devices`) and request a buffer size. The status bar shows the actual negotiated configuration. |
-| `--safe-mode` | Start without loading third-party plugins (placeholders preserve project state). Third-party hosting arrives in M7; the flag is honored and shown. |
+| `--safe-mode` | Start without loading any third-party plugin; projects that use them keep their state in placeholders. |
+| `--scan-plugins` | Scan the plugin folders into the catalog (each module in its own process) and print a JSON report. |
 | `--list-audio-devices` | Print hosts and devices as JSON and exit. |
-| `--audio-smoke` | Open the output device, play a 1 s A4 from the synth, print callback/xrun statistics and exit. |
-| `--headless-render <PROJECT> --output <FILE.wav>` | Render without GUI or audio device. Options: `--mode pattern|song`, `--format pcm16|pcm24|float32`, `--tail <s>`, `--sample-rate <Hz>`, `--start-tick`, `--end-tick`, `--unprotected` (bypass master protection). |
+| `--audio-smoke` / `--capture-smoke` | Open the output (play a 1 s A4) or the input (capture 1 s), print the statistics and exit. |
+| `--headless-render <PROJECT> --output <FILE>` | Render without GUI or audio device to `.wav` or `.flac`. Options: `--mode pattern|song`, `--format pcm16|pcm24|float32|flac16|flac24`, `--stems <DIR>`, `--tail <s>`, `--sample-rate <Hz>`, `--start-tick`, `--end-tick`, `--unprotected` (bypass master protection). |
 
 Exit codes: 0 ok, 2 usage/IO error, 3 render reported engine health counters, 4 no usable device, 5 device opened but audio did not flow.
 
@@ -111,6 +123,14 @@ A project is a folder (`Song.rawdawg/`); every save writes a small `project.rawd
 
 ## Troubleshooting
 
-- **"Audio unavailable"** in the status bar: no output device could be opened. Check `--list-audio-devices`, then **Retry audio**. Everything except playback keeps working.
-- **xruns** increasing: raise the buffer (`--buffer 512`) or reduce polyphony (synth `Voices` parameter).
+- **"Audio unavailable"** in the status bar: no output device could be opened. Check `rawdawg --list-audio-devices`, pick a device in **Settings › Audio**, then **Apply** (or **Start audio** in the status bar). Everything except playback keeps working.
+- **Crackles or rising xrun count**: raise the buffer (**Settings › Audio**, or `--buffer 512`), lower the synth's voice count, or bypass heavy effects (Reverb, Spectral and Pitch cost the most; Convolution with a long impulse response too). Under WSL or a virtual machine, occasional slow blocks come from the environment as well.
+- **No sound from a MIDI keyboard**: enable the device in **Settings › MIDI input** (on Ubuntu the user must be allowed to open ALSA sequencer devices; under WSL there is usually no MIDI at all). The status bar's MIDI counter shows how many messages arrive.
+- **Notes ring on after Stop**: long synth releases keep sounding until they fade; **Panic** silences everything at once.
+- **rawDAWg closed unexpectedly**: reopen the project; if autosaved changes are newer than the saved file, rawDAWg offers to recover them. An unfinished audio take is rebuilt onto a “Recovered” track. If third-party plugins were loaded at the time, **Settings › Plugins** says which; start with `--safe-mode` if the crash repeats.
+- **"Project is open elsewhere" / read-only**: the project is locked by another rawDAWg window (or by one that crashed). Close the other window, or take over the lock when asked.
+- **A sample is missing**: the browser marks it; **Relink** and pick the same file (or a replacement, applied everywhere and undoable). The clip or sampler stays silent until then.
+- **A plugin shows as a stand-in**: it is not in the catalog, quarantined, or you started in safe mode. The reason is in the status line and the panel; scan your plugin folders in **Settings › Plugins**. Its state stays in the project untouched.
+- **A plugin module is quarantined**: it crashed, hung or did not load during the scan. **retry** scans it again next time; nothing from it is loaded until then.
+- **Double-clicking a project folder does not open it**: folders cannot be associated with an app; open the `project.rawdawg` file inside the folder instead (installed packages register it), or use **File › Open…**.
 - On Ubuntu, ALSA is the baseline; JACK and PipeWire backends are compile-time features (`--features jack` / `pipewire`) that need the corresponding development packages.
