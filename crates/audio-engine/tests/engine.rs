@@ -84,7 +84,7 @@ fn pattern_loop_retriggers_and_truncates_at_boundary() {
     let plan = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
     engine.install_plan(plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut out = Vec::new();
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
@@ -120,7 +120,7 @@ fn stop_releases_notes_and_seek_has_no_retroactive_attack() {
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 512, &limits);
     engine.install_plan(compile(&p, 1, 512, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 512];
     let mut r = vec![0.0f32; 512];
     let mut render = |engine: &mut Engine, blocks: usize| {
@@ -141,7 +141,7 @@ fn stop_releases_notes_and_seek_has_no_retroactive_attack() {
     assert_eq!(engine.position_frame(), 0);
     // seek into the middle of the held note and play: no retroactive attack
     handle.send(EngineCommand::SeekTick(1920)).unwrap();
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let c = render(&mut engine, 20);
     assert_eq!(peak(&c), 0.0, "note that started before the seek must not sound");
     assert_eq!(engine.position_frame(), 48_000 + 20 * 512);
@@ -188,7 +188,7 @@ fn plan_swap_at_block_boundary_keeps_audio_running_and_retires_off_rt() {
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
     engine.install_plan(compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
     for _ in 0..40 {
@@ -210,7 +210,7 @@ fn render_block_is_allocation_free_under_traffic() {
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 2048, &limits);
     engine.install_plan(compile(&p, 1, 2048, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     handle.send(EngineCommand::SetMetronome(true)).unwrap();
     let mut l = vec![0.0f32; 2048];
     let mut r = vec![0.0f32; 2048];
@@ -289,7 +289,7 @@ fn wav_export_round_trips_sample_count_and_content() {
 fn song_mode_renders_clips_with_tempo_map() {
     let mut p = project_with_notes(&[(0, 960, 69)]);
     let pid = p.patterns[0].id;
-    let track = rawdawg_project::Track { id: rawdawg_types::TrackId::new(), name: "T".into(), color: None, mute: false, solo: false, height: None };
+    let track = rawdawg_project::Track { id: rawdawg_types::TrackId::new(), name: "T".into(), color: None, mute: false, solo: false, height: None, mixer_id: None };
     let tid = track.id;
     p.tracks.push(track);
     // clip at bar 2, one bar long, looped (pattern is one bar)
@@ -320,7 +320,7 @@ fn plan_swap_carries_live_voices_when_state_fingerprint_matches() {
     let first = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
     let live = first.fingerprints.clone();
     engine.install_plan(first.plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
     let mut out = Vec::new();
@@ -411,7 +411,7 @@ fn editing_notes_while_playing_keeps_note_offs_and_picks_up_new_notes() {
     let first = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
     let live = first.fingerprints.clone();
     engine.install_plan(first.plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
     for _ in 0..20 {
@@ -508,7 +508,7 @@ fn automation_song(points: Vec<(i64, f32, rawdawg_project::Interpolation)>, mode
     // one held note for two bars in song mode, master gain automated
     let mut p = project_with_notes(&[(0, 3840, 60)]);
     let tid = TrackId::new();
-    p.tracks.push(Track { id: tid, name: "T".into(), color: None, mute: false, solo: false, height: None });
+    p.tracks.push(Track { id: tid, name: "T".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
     p.clips.push(Clip {
         id: ClipId::new(),
         track_id: tid,
@@ -578,11 +578,11 @@ fn seeking_into_automation_chases_the_current_value() {
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
     let plan = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
     engine.install_plan(plan);
-    handle.send(EngineCommand::SetMode(TransportMode::Song)).unwrap();
+    assert!(handle.send(EngineCommand::SetMode(TransportMode::Song)).is_ok());
     // seek to bar 2 (gain = 1.0 by the curve) and play: no note-on happened at bar 2 start in the pattern
     // (the looped clip retriggers at tick 3840), so the note is heard at full gain right away
-    handle.send(EngineCommand::SeekTick(3840)).unwrap();
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::SeekTick(3840)).is_ok());
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
     let mut out = Vec::new();
@@ -762,7 +762,7 @@ fn insert_effect_processes_audio_receives_params_and_carries_over() {
     let fx_id = p.mixer_channel(bus).unwrap().inserts[0].id;
     let live = out.fingerprints.clone();
     engine.install_plan(out.plan);
-    handle.send(EngineCommand::Play).unwrap();
+    assert!(handle.send(EngineCommand::Play).is_ok());
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
     let mut quiet = Vec::new();
@@ -791,4 +791,167 @@ fn insert_effect_processes_audio_receives_params_and_carries_over() {
     }
     assert_eq!(engine.status().plan_revision.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+}
+
+/// A project folder with a 0.5 s 440 Hz tone imported as an asset, an "Audio" track and
+/// one audio clip of it at bar 2 (song mode). Returns (project dir, project, track id, clip id).
+fn audio_clip_project(tag: &str) -> (std::path::PathBuf, Project, rawdawg_types::TrackId, rawdawg_types::ClipId) {
+    use rawdawg_project::{Clip, ClipContent, Track};
+    let root = std::env::temp_dir().join(format!("rawdawg-engine-clip-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let wav = root.join("tone.wav");
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for i in 0..24_000 {
+        w.write_sample(((std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() * 16000.0) as i16).unwrap();
+    }
+    w.finalize().unwrap();
+    let dir = root.join("A.rawdawg");
+    let mut p = Project::new_default("clips", serde_json::json!({}));
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    let asset = rawdawg_project::assets::import_asset(&dir, &wav).unwrap();
+    p.assets.push(asset.clone());
+    let tid = rawdawg_types::TrackId::new();
+    p.tracks.push(Track { id: tid, name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
+    let cid = rawdawg_types::ClipId::new();
+    p.clips.push(Clip {
+        id: cid,
+        track_id: tid,
+        start_tick: Tick(3840),
+        length_ticks: Tick(960),
+        muted: false,
+        content: ClipContent::Audio {
+            asset_id: asset.id.clone(),
+            source_offset_frames: 0,
+            source_length_frames: 24_000,
+            gain_db: rawdawg_types::units::Db(0.0),
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            playback_rate: 1.0,
+        },
+    });
+    // an extra bar of silence keeps the song end past the clip
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    (dir, p, tid, cid)
+}
+
+fn song_opts(dir: &std::path::Path) -> OfflineOptions {
+    // unprotected: the master limiter's 1 ms lookahead would shift every onset by 48 frames
+    OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, end_tick: Some(Tick(3840 * 2)), project_dir: Some(dir.to_path_buf()), unprotected: true, ..Default::default() }
+}
+
+#[test]
+fn audio_clip_plays_at_its_bar_in_song_mode_with_gain_rate_and_fades() {
+    use rawdawg_project::ClipContent;
+    let (dir, mut p, _tid, _cid) = audio_clip_project("basic");
+    let (l, r, stats) = render_project(&p, &song_opts(&dir)).unwrap();
+    assert_eq!(stats.nonfinite_blocks, 0);
+    // bar 2 at 120 BPM = 2.0 s = frame 96 000; 0.5 s long
+    let onset = first_onset(&l);
+    assert!((onset as i64 - 96_000).abs() <= 2, "onset at frame {onset}");
+    assert!(peak(&l[..95_990]) == 0.0, "silence before the clip");
+    assert!((dominant_frequency(&l[96_500..110_000], 48_000.0) - 440.0).abs() < 1.0);
+    assert!(peak(&l[96_000..120_000]) > 0.45 && peak(&l[96_000..120_000]) < 0.5, "16000/32768 ≈ 0.488: {}", peak(&l[96_000..120_000]));
+    let last = l.iter().rposition(|v| v.abs() > 1e-4).unwrap();
+    assert!((last as i64 - 120_000).abs() <= 4, "clip ends after 0.5 s: {last}");
+    assert!(l.iter().zip(&r).skip(96_000).take(20_000).all(|(a, b)| (a - b).abs() < 1e-6), "mono asset feeds both channels");
+    // gain −6 dB, rate 2 (an octave up, half as long), 100 ms fades
+    if let ClipContent::Audio { gain_db, playback_rate, fade_in_frames, fade_out_frames, .. } = &mut p.clips[0].content {
+        *gain_db = rawdawg_types::units::Db(-6.0);
+        *playback_rate = 2.0;
+        *fade_in_frames = 4800;
+        *fade_out_frames = 4800;
+    }
+    let (l2, _, _) = render_project(&p, &song_opts(&dir)).unwrap();
+    assert!((dominant_frequency(&l2[97_000..106_000], 48_000.0) - 880.0).abs() < 2.0, "rate 2 doubles the pitch");
+    let last2 = l2.iter().rposition(|v| v.abs() > 1e-4).unwrap();
+    assert!((last2 as i64 - 108_000).abs() <= 4, "rate 2 halves the length: {last2}");
+    let pk = peak(&l2[100_000..104_000]);
+    assert!((pk / 0.488 - 0.501).abs() < 0.03, "−6 dB: {pk}");
+    // the fades ramp in and out (2 400 output frames each at rate 2)
+    assert!(rms(&l2[96_000..96_400]) < rms(&l2[98_400..98_800]) * 0.35, "fade in");
+    assert!(rms(&l2[107_500..107_900]) < rms(&l2[104_000..104_400]) * 0.35, "fade out");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn audio_clips_follow_track_routing_mute_and_pattern_mode() {
+    use rawdawg_project::{MixerChannel, Send, SendTap};
+    let (dir, mut p, tid, _cid) = audio_clip_project("routing");
+    // pattern mode never plays clips
+    let opts_pattern = OfflineOptions { tail_seconds: 0.0, end_tick: Some(Tick(3840 * 2)), project_dir: Some(dir.clone()), ..Default::default() };
+    let (lp, _, _) = render_project(&p, &opts_pattern).unwrap();
+    assert_eq!(peak(&lp), 0.0, "pattern mode: no audio clips");
+    // muted track: silent
+    p.tracks[0].mute = true;
+    let (lm, _, _) = render_project(&p, &song_opts(&dir)).unwrap();
+    assert_eq!(peak(&lm), 0.0, "muted track");
+    p.tracks[0].mute = false;
+    // routed to a bus: the bus's fader applies; a muted bus silences it
+    let master = p.mixer.master_id;
+    let bus = rawdawg_types::MixerChannelId::new();
+    p.mixer.channels.push(MixerChannel {
+        id: bus,
+        name: "Bus".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db(-12.0),
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![],
+        sends: vec![Send { target_id: master, level_db: rawdawg_types::units::Db(0.0), tap: SendTap::PostFader, sidechain: false }],
+        output_id: None,
+    });
+    let bus_idx = p.mixer.channels.len() - 1;
+    p.tracks.iter_mut().find(|t| t.id == tid).unwrap().mixer_id = Some(bus);
+    rawdawg_project::validate(&p).unwrap();
+    let (lb, _, _) = render_project(&p, &song_opts(&dir)).unwrap();
+    let pk = peak(&lb[96_000..120_000]);
+    assert!((pk / 0.488 - 0.251).abs() < 0.03, "bus fader −12 dB applies: {pk}");
+    p.mixer.channels[bus_idx].mute = true;
+    let (lmb, _, _) = render_project(&p, &song_opts(&dir)).unwrap();
+    assert_eq!(peak(&lmb), 0.0, "muted bus");
+    // a missing asset is silence, not an error
+    p.mixer.channels[bus_idx].mute = false;
+    let (lo, _, _) = render_project(&p, &OfflineOptions { project_dir: None, ..song_opts(&dir) }).unwrap();
+    assert_eq!(peak(&lo), 0.0);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn audio_clips_restart_at_the_loop_wrap_and_render_allocation_free() {
+    use rawdawg_project::LoopRange;
+    let (dir, mut p, _tid, _cid) = audio_clip_project("loop");
+    // loop bars 2–3 (frames 96 000..192 000): the clip at bar 2 restarts at every wrap
+    p.r#loop = Some(LoopRange { start_tick: Tick(3840), end_tick: Tick(7680), enabled: true });
+    let mut cache = rawdawg_audio_engine::ProjectAssetCache::new(Some(dir.clone()));
+    cache.sync(Some(dir.clone()), &p);
+    let limits = EngineLimits::DEFAULT;
+    let plan = compile(&p, 1, 256, &limits, &Default::default(), &cache).unwrap().plan;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    engine.install_plan(plan);
+    assert!(handle.send(EngineCommand::SetMode(TransportMode::Song)).is_ok());
+    assert!(handle.send(EngineCommand::SeekTick(3840)).is_ok());
+    assert!(handle.send(EngineCommand::Play).is_ok());
+    let mut out = Vec::new();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    for _ in 0..(144_000 / 256) {
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    // first pass: 0.5 s of tone, then silence until the wrap at 2 s (96 000 frames played)
+    assert!(rms(&out[1000..20_000]) > 0.2);
+    assert!(peak(&out[30_000..95_000]) == 0.0, "silence after the clip before the wrap");
+    assert!(rms(&out[97_000..110_000]) > 0.2, "the clip restarts after the loop wrap");
+    assert!((dominant_frequency(&out[97_000..110_000], 48_000.0) - 440.0).abs() < 1.0);
+    // steady state is allocation-free
+    let (_, allocs) = measure_rt(|| {
+        for _ in 0..16 {
+            engine.render_block(&mut l, &mut r);
+        }
+    });
+    assert_eq!(allocs, 0, "audio clip playback allocates");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }

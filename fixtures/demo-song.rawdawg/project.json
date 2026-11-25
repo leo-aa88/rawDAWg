@@ -21,7 +21,18 @@
       "denominator": 4
     }
   ],
-  "assets": [],
+  "assets": [
+    {
+      "id": "a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15",
+      "path": "assets/sha256/a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15.wav",
+      "kind": "audio",
+      "source_name": "sine_440_48k.wav",
+      "original_rate_hz": null,
+      "channels": null,
+      "frames": null,
+      "bytes": 384068
+    }
+  ],
   "channels": [
     {
       "id": "00000000-0000-0000-0000-0000c4a00001",
@@ -2477,6 +2488,18 @@
       "mute": false,
       "solo": false,
       "height": null
+    },
+    {
+      "id": "00000000-0000-0000-0000-00007a000004",
+      "name": "Audio",
+      "color": [
+        110,
+        181,
+        230
+      ],
+      "mute": false,
+      "solo": false,
+      "height": null
     }
   ],
   "clips": [
@@ -2523,6 +2546,21 @@
       "curve_id": "00000000-0000-0000-0000-0000a0700001",
       "source_offset_ticks": 0,
       "looped": false
+    },
+    {
+      "id": "00000000-0000-0000-0000-00000c110009",
+      "track_id": "00000000-0000-0000-0000-00007a000004",
+      "start_tick": 0,
+      "length_ticks": 3840,
+      "muted": false,
+      "type": "audio",
+      "asset_id": "a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15",
+      "source_offset_frames": 0,
+      "source_length_frames": 48000,
+      "gain_db": -6.0,
+      "fade_in_frames": 480,
+      "fade_out_frames": 4800,
+      "playback_rate": 1.0
     }
   ],
   "mixer": {

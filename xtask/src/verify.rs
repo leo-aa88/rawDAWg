@@ -242,6 +242,44 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok((format!("centroid {c_early:.0} Hz → {c_late:.0} Hz across the sweep"), Some(dir.display().to_string())))
     }));
+    checks.push(check("HL-12 audio clip plays from the song fixture at its bar with gain and fades", &["CORE-04", "IO-05"], || {
+        let dir = root.join("fixtures/demo-song.rawdawg");
+        let mut p = rawdawg_project::load_project_dir(&dir)?;
+        // mute the instrument tracks: only the audio clip (bar 1, first second of the sine, −6 dB) remains
+        for t in p.tracks.iter_mut().filter(|t| t.name != "Audio") {
+            t.mute = true;
+        }
+        let opts = OfflineOptions {
+            mode: rawdawg_audio_engine::commands::TransportMode::Song,
+            tail_seconds: 0.0,
+            end_tick: Some(rawdawg_types::units::Tick(3840 * 2)),
+            project_dir: Some(dir.clone()),
+            unprotected: true,
+            ..Default::default()
+        };
+        let (l, r, stats) = render_project(&p, &opts)?;
+        if stats.nonfinite_blocks > 0 {
+            bail!("nonfinite blocks");
+        }
+        let f = dominant_frequency(&l[4000..40_000], 48_000.0);
+        if (f - 440.0).abs() > 1.0 {
+            bail!("expected the 440 Hz clip in bar 1, measured {f:.2} Hz");
+        }
+        let pk = rawdawg_dsp::math::peak(&l[8000..40_000]);
+        if (pk - 0.25).abs() > 0.02 {
+            bail!("clip gain −6 dB on a 0.5 peak sine should peak ≈ 0.25, measured {pk:.3}");
+        }
+        if rawdawg_dsp::math::rms(&l[0..200]) > rawdawg_dsp::math::rms(&l[2000..2200]) * 0.5 {
+            bail!("fade-in missing");
+        }
+        if rawdawg_dsp::math::peak(&l[49_000..]) > 0.0 {
+            bail!("the clip must stop after its first second");
+        }
+        if l.iter().zip(&r).any(|(a, b)| (a - b).abs() > 1e-6) {
+            bail!("mono clip should feed both channels equally");
+        }
+        Ok((format!("bar 1 fundamental {f:.2} Hz, peak {pk:.3} (−6 dB), fades and end honoured"), Some(dir.display().to_string())))
+    }));
     checks.push(check(
         "E2E-02 (headless subset) steps, piano-roll edits, count-in recording, arrangement, tempo change, loop, export",
         &["CORE-01", "CORE-02", "CORE-03", "CORE-04", "IO-03"],
@@ -337,8 +375,14 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             // 4. arrange: drums repeat for 4 bars (looped clip), melody twice, make the second unique and trim it
             let t1 = TrackId::new();
             let t2 = TrackId::new();
-            history.apply(&mut project, Command::AddTrack { track: Track { id: t1, name: "Drums".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
-            history.apply(&mut project, Command::AddTrack { track: Track { id: t2, name: "Melody".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
+            history.apply(
+                &mut project,
+                Command::AddTrack { track: Track { id: t1, name: "Drums".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None },
+            )?;
+            history.apply(
+                &mut project,
+                Command::AddTrack { track: Track { id: t2, name: "Melody".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None },
+            )?;
             history.apply(
                 &mut project,
                 Command::AddClip {
@@ -569,7 +613,7 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             history.apply(&mut project, Command::AddInsert { mixer_id: mix_par, instance: flat, index: None })?;
             // 5. song arrangement (two bars) with an automation clip sweeping EQ band 0 gain
             let track = TrackId::new();
-            history.apply(&mut project, Command::AddTrack { track: Track { id: track, name: "Song".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
+            history.apply(&mut project, Command::AddTrack { track: Track { id: track, name: "Song".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None })?;
             history.apply(
                 &mut project,
                 Command::AddClip {

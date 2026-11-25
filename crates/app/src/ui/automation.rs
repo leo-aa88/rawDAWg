@@ -131,7 +131,10 @@ fn place_curve(app: &mut App, target: AutomationTarget, points: Vec<AutomationPo
         Some(t) => t,
         None => {
             let id = TrackId::new();
-            batch.push(Command::AddTrack { track: Track { id, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None }, index: None });
+            batch.push(Command::AddTrack {
+                track: Track { id, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None, mixer_id: None },
+                index: None,
+            });
             id
         }
     };
@@ -304,7 +307,10 @@ pub(crate) fn bake_morph_gesture(app: &mut App, instance: InstanceId, corners: [
         Some(t) => t,
         None => {
             let id = TrackId::new();
-            batch.push(Command::AddTrack { track: Track { id, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None }, index: None });
+            batch.push(Command::AddTrack {
+                track: Track { id, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None, mixer_id: None },
+                index: None,
+            });
             id
         }
     };

@@ -188,7 +188,13 @@ pub struct Engine {
     count_in_left: i64,
     count_in_total: i64,
     count_in_beat_frames: i64,
+    /// Transport spans rendered this block: (project start frame, block offset, length).
+    /// At most one loop wrap per block is expected; more spans are dropped (counted).
+    spans: [(i64, usize, usize); MAX_SPANS],
+    span_count: usize,
 }
+
+const MAX_SPANS: usize = 8;
 
 impl Engine {
     /// Create an engine with an empty plan. Non-RT.
@@ -223,6 +229,8 @@ impl Engine {
             count_in_left: 0,
             count_in_total: 0,
             count_in_beat_frames: 1,
+            spans: [(0, 0, 0); MAX_SPANS],
+            span_count: 0,
         };
         (engine, EngineHandle { commands: cmd_p, plans: plan_p, record: rec_c, status })
     }
@@ -381,6 +389,7 @@ impl Engine {
     /// Schedule transport note events for `[self.position, self.position + frames)`.
     /// Handles loop wrap inside the block (notes crossing the end are truncated).
     fn schedule_block(&mut self, frames: usize) {
+        self.span_count = 0;
         if !self.playing {
             return;
         }
@@ -471,6 +480,14 @@ impl Engine {
                     self.status.dropped_events.incr();
                 }
             }
+            if span_end > 0 {
+                if self.span_count < MAX_SPANS {
+                    self.spans[self.span_count] = (start, block_offset, span_end);
+                    self.span_count += 1;
+                } else {
+                    self.status.dropped_events.incr();
+                }
+            }
             self.position = end;
             block_offset += span_end;
             remaining -= span_end;
@@ -487,6 +504,49 @@ impl Engine {
                 self.reseek_cursor();
                 if span_end == 0 {
                     break;
+                }
+            }
+        }
+    }
+
+    /// Play the plan's audio clips over this block's transport spans: resident decoded
+    /// assets read with Hermite interpolation at the clip's rate, clip gain and linear
+    /// fades, summed into the track's mixer buffer. Bounded by the clips overlapping the
+    /// spans; no allocation.
+    fn render_audio_clips(&mut self) {
+        let plan = &mut self.plan;
+        for si in 0..self.span_count {
+            let (start, offset, len) = self.spans[si];
+            let end = start + len as i64;
+            for clip in &plan.audio_clips {
+                if clip.start_frame >= end {
+                    break; // sorted by start
+                }
+                let clip_end = clip.start_frame + clip.len_frames;
+                if clip_end <= start {
+                    continue;
+                }
+                let from = clip.start_frame.max(start);
+                let to = clip_end.min(end);
+                let node = &mut plan.mixer[clip.mixer_index];
+                let (bl, br) = node.buffer.stereo_mut(offset + len);
+                let stereo = clip.asset.is_stereo();
+                for f in from..to {
+                    let local = (f - clip.start_frame) as f64;
+                    let src = clip.source_offset + local * clip.rate;
+                    let mut g = clip.gain;
+                    if clip.fade_in > 0.0 && local < clip.fade_in {
+                        g *= (local / clip.fade_in) as f32;
+                    }
+                    let remaining = clip.len_frames as f64 - local;
+                    if clip.fade_out > 0.0 && remaining < clip.fade_out {
+                        g *= (remaining / clip.fade_out).max(0.0) as f32;
+                    }
+                    let i = offset + (f - start) as usize;
+                    let l = clip.asset.read(0, src) * g;
+                    let r = if stereo { clip.asset.read(1, src) * g } else { l };
+                    bl[i] += l;
+                    br[i] += r;
                 }
             }
         }
@@ -657,6 +717,10 @@ impl Engine {
             if m.sidechain_fed {
                 m.sidechain.clear(frames);
             }
+        }
+        // 4a. audio clips (song mode) straight into their track's mixer buffer
+        if self.mode == TransportMode::Song {
+            self.render_audio_clips();
         }
         let plan = &mut self.plan;
         let transport = TransportView {

@@ -342,3 +342,58 @@ fn midi_learn_maps_a_cc_to_an_effect_parameter_and_lfo_clips_modulate_it() {
     assert_eq!(h.app.project.automation.len(), curves);
     assert_eq!(h.app.project.clips.len(), clips);
 }
+
+#[test]
+fn armed_sample_places_an_audio_clip_and_edge_drags_trim_its_source_frames() {
+    use rawdawg_project::{ClipContent, Command, Track};
+    let mut h = Harness::new(Some("../../fixtures/demo-sampler.rawdawg"));
+    let asset = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).cloned().expect("the sampler demo has a WAV asset");
+    // import records no frame count; the playlist measures the decoded sample instead
+    let frames = {
+        use rawdawg_audio_engine::AssetResolver;
+        h.app.assets.sample(&asset.id).expect("decodes").frames()
+    };
+    assert_eq!(frames, 96_000, "2 s at 48 kHz");
+    let tid = rawdawg_types::TrackId::new();
+    h.app.apply(Command::AddTrack { track: Track { id: tid, name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None });
+    h.app.playlist.place_asset = Some(asset.id.clone());
+    h.app.editor_view = EditorView::Rack;
+    h.frame(vec![]);
+    let before = h.app.project.clips.len();
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let p = super::playlist::lane_point(&h.app.playlist, surface, 3840 + 100, 0);
+    h.click_at(p, egui::PointerButton::Primary);
+    assert_eq!(h.app.project.clips.len(), before + 1, "click places the armed sample");
+    let clip = h.app.project.clips.last().unwrap().clone();
+    assert_eq!(clip.track_id, tid);
+    assert_eq!(clip.start_tick, Tick(3840), "snapped to the beat grid at bar 2");
+    assert_eq!(clip.length_ticks, Tick(3840), "2 s at 120 BPM = one bar");
+    let ClipContent::Audio { source_length_frames, source_offset_frames, playback_rate, .. } = &clip.content else { panic!("audio clip") };
+    assert_eq!((*source_length_frames, *source_offset_frames, *playback_rate), (96_000, 0, 1.0));
+    // drag the right edge back half a bar: the source is trimmed to one second
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let edge = super::playlist::lane_point(&h.app.playlist, surface, clip.end_tick().0, 0) - egui::vec2(3.0, 0.0);
+    let target = super::playlist::lane_point(&h.app.playlist, surface, clip.end_tick().0 - 1920, 0);
+    h.drag(edge, target, egui::PointerButton::Primary);
+    let trimmed = h.app.project.clips.iter().find(|c| c.id == clip.id).unwrap().clone();
+    assert_eq!(trimmed.length_ticks, Tick(1920), "half a bar long now");
+    let ClipContent::Audio { source_length_frames, .. } = &trimmed.content else { panic!("audio clip") };
+    assert!((*source_length_frames as i64 - 48_000).abs() <= 2, "source trimmed to 1 s: {source_length_frames}");
+    // trim the start by a beat: the source offset moves with it
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let edge = super::playlist::lane_point(&h.app.playlist, surface, trimmed.start_tick.0, 0) + egui::vec2(3.0, 0.0);
+    let target = super::playlist::lane_point(&h.app.playlist, surface, trimmed.start_tick.0 + 960, 0);
+    h.drag(edge, target, egui::PointerButton::Primary);
+    let t2 = h.app.project.clips.iter().find(|c| c.id == clip.id).unwrap().clone();
+    assert_eq!(t2.start_tick, Tick(3840 + 960));
+    let ClipContent::Audio { source_length_frames, source_offset_frames, .. } = &t2.content else { panic!("audio clip") };
+    assert!((*source_offset_frames as i64 - 24_000).abs() <= 2, "offset follows the trimmed start: {source_offset_frames}");
+    assert!((*source_length_frames as i64 - 24_000).abs() <= 2, "length shrinks accordingly: {source_length_frames}");
+    // routing: the track can be sent to a bus and back, one undo each
+    let bus = h.app.project.mixer.channels.iter().find(|m| m.id != h.app.project.mixer.master_id).map(|m| m.id).unwrap();
+    h.app.apply(Command::SetTrackMixer { id: tid, mixer_id: Some(bus) });
+    assert_eq!(h.app.project.tracks.iter().find(|t| t.id == tid).unwrap().mixer_id, Some(bus));
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.tracks.iter().find(|t| t.id == tid).unwrap().mixer_id, None);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}

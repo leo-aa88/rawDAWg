@@ -156,6 +156,10 @@ pub enum Command {
         id: TrackId,
         mute: bool,
     },
+    SetTrackMixer {
+        id: TrackId,
+        mixer_id: Option<MixerChannelId>,
+    },
     SetTrackSolo {
         id: TrackId,
         solo: bool,
@@ -590,6 +594,16 @@ impl Command {
                 let old = std::mem::replace(&mut t.mute, mute);
                 Ok(Command::SetTrackMute { id, mute: old })
             }
+            Command::SetTrackMixer { id, mixer_id } => {
+                if let Some(m) = mixer_id
+                    && !p.mixer.channels.iter().any(|c| c.id == m)
+                {
+                    return Err(unknown("mixer channel", m));
+                }
+                let t = p.tracks.iter_mut().find(|t| t.id == id).ok_or_else(|| unknown("track", id))?;
+                let old = std::mem::replace(&mut t.mixer_id, mixer_id);
+                Ok(Command::SetTrackMixer { id, mixer_id: old })
+            }
             Command::SetTrackSolo { id, solo } => {
                 let t = p.tracks.iter_mut().find(|t| t.id == id).ok_or_else(|| unknown("track", id))?;
                 let old = std::mem::replace(&mut t.solo, solo);
@@ -834,6 +848,7 @@ impl Command {
             Command::AddTrack { .. } => "Add track",
             Command::RemoveTrack { .. } => "Delete track",
             Command::RenameTrack { .. } => "Rename track",
+            Command::SetTrackMixer { .. } => "Route track",
             Command::SetTrackMute { .. } => "Mute track",
             Command::SetTrackSolo { .. } => "Solo track",
             Command::AddClip { .. } => "Add clip",

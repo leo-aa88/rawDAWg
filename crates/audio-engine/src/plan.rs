@@ -7,7 +7,7 @@ use rawdawg_dsp::limiter::PeakLimiter;
 use rawdawg_dsp::processor::{PrepareSpec, Processor};
 use rawdawg_dsp::smooth::Smoother;
 use rawdawg_dsp::{AudioBuffer, BusLayout};
-use rawdawg_project::Project;
+use rawdawg_project::{ClipContent, Project};
 use rawdawg_synthesizer::Synth;
 use rawdawg_synthesizer::TableSender;
 use rawdawg_transport::{MeterMap, TempoMap};
@@ -139,7 +139,29 @@ pub struct Plan {
     pub fx_in: AudioBuffer,
     /// Latency from the master's sources to its output, frames (published for UI/export).
     pub output_latency: u32,
+    /// Audio clips of unmuted tracks (song mode), sorted by start frame.
+    pub audio_clips: Vec<AudioClipNode>,
 }
+
+/// An audio clip resolved for playback (song mode): resident decoded asset, project-frame
+/// bounds and the mixer node it plays into. Rates and fades are in output frames.
+pub struct AudioClipNode {
+    pub clip_id: rawdawg_types::ClipId,
+    pub asset: std::sync::Arc<rawdawg_sampler::SampleAsset>,
+    /// First project frame of the clip and its length in output frames.
+    pub start_frame: i64,
+    pub len_frames: i64,
+    /// Source frame of the clip's first output frame and source frames per output frame.
+    pub source_offset: f64,
+    pub rate: f64,
+    pub gain: f32,
+    pub fade_in: f64,
+    pub fade_out: f64,
+    pub mixer_index: usize,
+}
+
+/// Maximum audio clips a plan plays (bounded per-block work).
+pub const MAX_AUDIO_CLIPS: usize = 4096;
 
 /// Processor slot layout shared by the compiler and the scheduler: channels in project
 /// order, then every insert of every mixer channel in project order.
@@ -242,6 +264,44 @@ pub fn attach_effect_assets(p: &mut dyn Processor, assets: &dyn AssetResolver) {
 /// `live` maps instance ids to the fingerprint of the state the currently running
 /// processor is known to hold; matching nodes are flagged `carry_over` so the
 /// audio thread migrates their voices/tables instead of restarting them.
+/// Resolve the project's audio clips against the asset store. Clips on muted tracks and
+/// clips whose asset is missing are skipped (missing assets are reported by the resolver).
+fn audio_clip_nodes(project: &Project, tempo: &TempoMap, rate: SampleRate, master_index: usize, assets: &dyn AssetResolver) -> Vec<AudioClipNode> {
+    let mut out = Vec::new();
+    for clip in &project.clips {
+        let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &clip.content else { continue };
+        if clip.muted || out.len() >= MAX_AUDIO_CLIPS {
+            continue;
+        }
+        let Some(track) = project.tracks.iter().find(|t| t.id == clip.track_id) else { continue };
+        if track.mute {
+            continue;
+        }
+        let Some(asset) = assets.sample(asset_id) else { continue };
+        if !asset.is_valid() || asset.frames() == 0 {
+            continue;
+        }
+        let mixer_index = track.mixer_id.and_then(|m| project.mixer.channels.iter().position(|c| c.id == m)).unwrap_or(master_index);
+        let eff_rate = (playback_rate * f64::from(asset.sample_rate) / rate.as_f64()).max(1e-6);
+        let src_len = (*source_length_frames).min(asset.frames() as u64 - (*source_offset_frames).min(asset.frames() as u64 - 1)) as f64;
+        let len_frames = (src_len / eff_rate).ceil().max(1.0) as i64;
+        out.push(AudioClipNode {
+            clip_id: clip.id,
+            asset,
+            start_frame: tempo.tick_to_frame(clip.start_tick, rate),
+            len_frames,
+            source_offset: *source_offset_frames as f64,
+            rate: eff_rate,
+            gain: gain_db.to_linear() as f32,
+            fade_in: *fade_in_frames as f64 / eff_rate,
+            fade_out: *fade_out_frames as f64 / eff_rate,
+            mixer_index,
+        });
+    }
+    out.sort_by_key(|c| c.start_frame);
+    out
+}
+
 pub fn compile(
     project: &Project,
     revision: u64,
@@ -492,6 +552,7 @@ pub fn compile(
     let pattern_schedule =
         project.selected_pattern.or_else(|| project.patterns.first().map(|p| p.id)).map(|pid| Schedule::for_pattern(project, pid, &tempo, rate)).unwrap_or_default();
     let song_schedule = Schedule::for_song(project, &tempo, rate);
+    let audio_clips = audio_clip_nodes(project, &tempo, rate, master_index, assets);
     let _ = Db::UNITY;
     let plan = Plan {
         revision,
@@ -511,6 +572,7 @@ pub fn compile(
         any_solo,
         solo_mixer,
         solo_feed,
+        audio_clips,
         slots,
         slot_instances: slot_instances.clone(),
         fx_in: AudioBuffer::new(2, max_frames),
@@ -561,6 +623,7 @@ impl Plan {
             any_solo: false,
             solo_mixer: vec![false],
             solo_feed: vec![false],
+            audio_clips: Vec::new(),
             slots: vec![],
             slot_instances: vec![],
             fx_in: AudioBuffer::new(2, max_frames),

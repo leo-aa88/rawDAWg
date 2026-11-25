@@ -237,6 +237,11 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
     let mut track_ids = HashSet::new();
     for t in &p.tracks {
         dup(&mut track_ids, t.id)?;
+        if let Some(m) = t.mixer_id
+            && !p.mixer.channels.iter().any(|c| c.id == m)
+        {
+            return Err(ValidationError::MissingReference { what: format!("track {}", t.id), target: m.to_string() });
+        }
     }
     let mut curve_ids = HashSet::new();
     let mut point_ids = HashSet::new();

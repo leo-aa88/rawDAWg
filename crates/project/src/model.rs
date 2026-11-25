@@ -240,6 +240,9 @@ pub struct Track {
     pub solo: bool,
     #[serde(default)]
     pub height: Option<f32>,
+    /// Mixer channel that audio clips on this track play into; `None` = master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer_id: Option<MixerChannelId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

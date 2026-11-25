@@ -878,6 +878,27 @@ impl App {
             ui.label(egui::RichText::new("Native effects arrive in M4").color(theme::TEXT_SECONDARY));
         });
         egui::CollapsingHeader::new("Samples & SoundFonts").default_open(true).show(ui, |ui| {
+            // project audio assets: click to arm for the playlist, "+ channel" for a sampler
+            let audio: Vec<(rawdawg_types::AssetId, String)> =
+                self.project.assets.iter().filter(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| (a.id.clone(), a.source_name.clone())).collect();
+            if !audio.is_empty() {
+                ui.label(
+                    egui::RichText::new("Project samples — click one, then click a playlist lane to place it; drop a file on a lane to do both at once")
+                        .color(theme::TEXT_SECONDARY)
+                        .small(),
+                );
+            }
+            for (id, name) in audio {
+                ui.horizontal(|ui| {
+                    let armed = self.playlist.place_asset.as_ref() == Some(&id);
+                    if ui.selectable_label(armed, &name).on_hover_text("Arm for placement in the playlist").clicked() {
+                        self.playlist.place_asset = if armed { None } else { Some(id.clone()) };
+                        if !armed {
+                            self.editor_view = EditorView::Rack;
+                        }
+                    }
+                });
+            }
             ui.label(egui::RichText::new("Drop a .wav/.flac/.mp3 or .sf2 onto the window, or type a path:").color(theme::TEXT_SECONDARY));
             ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/path/to/sound.wav").desired_width(f32::INFINITY));
             if ui.button("Import as new channel").clicked() && !self.import_path.trim().is_empty() {
@@ -1218,8 +1239,26 @@ impl App {
         self.commit_quiet_midi_changes();
         automation::poll_capture(self);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        let drop_target = self.playlist.drop_target.take();
         for p in dropped {
-            self.import_file_as_channel(&p);
+            let is_audio = p.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "wav" | "flac" | "mp3"));
+            if let (Some((track, tick)), true) = (drop_target, is_audio) {
+                // dropped on a playlist lane: an audio clip, not a new channel
+                match self.import_asset_only(&p) {
+                    Ok(id) => {
+                        if let Some(asset_id) = rawdawg_types::AssetId::from_hex(&id)
+                            && playlist::place_audio_clip(self, &asset_id, track, tick).is_some()
+                        {
+                            self.status_line = format!("Placed {} on the playlist", p.display());
+                        } else {
+                            self.status_line = format!("Imported {} but could not place it", p.display());
+                        }
+                    }
+                    Err(e) => self.status_line = e,
+                }
+            } else {
+                self.import_file_as_channel(&p);
+            }
         }
         for sender in self.table_senders.values_mut() {
             sender.collect_retired();

@@ -141,7 +141,10 @@ impl App {
                     Some(t) => t.id,
                     None => {
                         let id = TrackId::new();
-                        batch.push(Command::AddTrack { track: Track { id, name: "Track 1".into(), color: None, mute: false, solo: false, height: None }, index: None });
+                        batch.push(Command::AddTrack {
+                            track: Track { id, name: "Track 1".into(), color: None, mute: false, solo: false, height: None, mixer_id: None },
+                            index: None,
+                        });
                         id
                     }
                 };

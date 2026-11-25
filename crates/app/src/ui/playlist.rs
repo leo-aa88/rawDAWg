@@ -7,10 +7,12 @@ use super::piano_roll::Snap;
 use super::{App, EngineCommand, PointerState, TransportMode};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
+use rawdawg_audio_engine::AssetResolver;
 use rawdawg_project::{Clip, ClipContent, Command, LoopRange, MeterPoint, Pattern, TempoPoint, Track};
 use rawdawg_types::units::{PPQ, Tick, UsPerQuarter};
-use rawdawg_types::{ClipId, PatternId, TrackId};
-use std::collections::HashSet;
+use rawdawg_types::{AssetId, ClipId, PatternId, TrackId};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 const HEADER_W: f32 = 150.0;
 const RULER_H: f32 = 22.0;
@@ -43,6 +45,12 @@ pub(crate) struct PlaylistState {
     marker_edit: Option<MarkerEdit>,
     rename: Option<(TrackId, String)>,
     pub hover: String,
+    /// Audio asset armed in the browser: the next click in a lane places it as a clip.
+    pub place_asset: Option<AssetId>,
+    /// Where a file dragged over the lanes would land (track, tick), refreshed every frame.
+    pub drop_target: Option<(TrackId, i64)>,
+    /// Waveform thumbnails per asset: 512 (min, max) buckets over the whole asset.
+    thumbs: HashMap<AssetId, Arc<Vec<(f32, f32)>>>,
 }
 
 #[derive(Clone)]
@@ -57,7 +65,19 @@ struct MarkerEdit {
 
 impl Default for PlaylistState {
     fn default() -> Self {
-        Self { scroll_tick: 0.0, px_per_tick: 40.0 / PPQ as f32, snap: Snap::Beat, selection: HashSet::new(), gesture: None, marker_edit: None, rename: None, hover: String::new() }
+        Self {
+            scroll_tick: 0.0,
+            px_per_tick: 40.0 / PPQ as f32,
+            snap: Snap::Beat,
+            selection: HashSet::new(),
+            gesture: None,
+            marker_edit: None,
+            rename: None,
+            hover: String::new(),
+            place_asset: None,
+            drop_target: None,
+            thumbs: HashMap::new(),
+        }
     }
 }
 
@@ -98,6 +118,123 @@ pub(crate) fn cancel_gesture(app: &mut App) {
     }
 }
 
+/// Source frames per output frame of an audio clip (its asset's rate against the project's).
+fn audio_rate(app: &App, asset_id: &AssetId, playback_rate: f64) -> f64 {
+    let asset_rate = app.project.assets.iter().find(|a| &a.id == asset_id).and_then(|a| a.original_rate_hz).unwrap_or(app.project.sample_rate_hz.0);
+    (playback_rate * f64::from(asset_rate) / app.project.sample_rate_hz.as_f64()).max(1e-6)
+}
+
+/// Frames of a project asset (from its metadata, else from the decoded sample).
+fn asset_frames(app: &App, asset_id: &AssetId) -> Option<u64> {
+    app.project.assets.iter().find(|a| &a.id == asset_id).and_then(|a| a.frames).filter(|f| *f > 0).or_else(|| app.assets.sample(asset_id).map(|s| s.frames() as u64))
+}
+
+/// Ticks covered by `out_frames` project frames starting at `start_tick` under the tempo map.
+fn frames_to_ticks(app: &App, start_tick: i64, out_frames: f64) -> i64 {
+    let rate = app.project.sample_rate_hz;
+    let Ok(tempo) = app.project.tempo_map() else { return (out_frames / rate.as_f64() * 2.0 * PPQ as f64) as i64 };
+    let start = tempo.tick_to_frame(Tick(start_tick), rate);
+    let end = tempo.frame_to_tick_f64(start + out_frames.round() as i64, rate);
+    ((end - start_tick as f64).round() as i64).max(1)
+}
+
+/// Project frames covered by `ticks` ticks starting at `start_tick`.
+fn ticks_to_frames(app: &App, start_tick: i64, ticks: i64) -> f64 {
+    let rate = app.project.sample_rate_hz;
+    let Ok(tempo) = app.project.tempo_map() else { return ticks as f64 / (2.0 * PPQ as f64) * rate.as_f64() };
+    (tempo.tick_to_frame(Tick(start_tick + ticks), rate) - tempo.tick_to_frame(Tick(start_tick), rate)) as f64
+}
+
+/// Build an audio clip of a whole asset starting at `tick` on `track`; `None` when the
+/// asset cannot be measured.
+pub(crate) fn audio_clip_for(app: &App, asset_id: &AssetId, track: TrackId, tick: i64) -> Option<Clip> {
+    let frames = asset_frames(app, asset_id)?;
+    let rate = audio_rate(app, asset_id, 1.0);
+    let out_frames = frames as f64 / rate;
+    Some(Clip {
+        id: ClipId::new(),
+        track_id: track,
+        start_tick: Tick(tick),
+        length_ticks: Tick(frames_to_ticks(app, tick, out_frames)),
+        muted: false,
+        content: ClipContent::Audio {
+            asset_id: asset_id.clone(),
+            source_offset_frames: 0,
+            source_length_frames: frames,
+            gain_db: rawdawg_types::units::Db::UNITY,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
+            playback_rate: 1.0,
+        },
+    })
+}
+
+/// Place an asset as an audio clip (one undo step) and select it.
+pub(crate) fn place_audio_clip(app: &mut App, asset_id: &AssetId, track: TrackId, tick: i64) -> Option<ClipId> {
+    let clip = audio_clip_for(app, asset_id, track, tick)?;
+    let id = clip.id;
+    app.apply(Command::AddClip { clip });
+    app.playlist.selection.clear();
+    app.playlist.selection.insert(id);
+    Some(id)
+}
+
+/// Re-derive an audio clip's source bounds from its (edited) tick bounds: the end edge sets
+/// the source length, the start edge shifts the source offset. Pattern/automation clips are
+/// returned unchanged.
+fn audio_bounds_from_ticks(app: &App, orig: &Clip, edited: Clip) -> Clip {
+    let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &orig.content else { return edited };
+    let rate = audio_rate(app, asset_id, *playback_rate);
+    let total = asset_frames(app, asset_id).unwrap_or(*source_offset_frames + *source_length_frames);
+    let shift_src = (ticks_to_frames(app, orig.start_tick.0, edited.start_tick.0 - orig.start_tick.0) * rate).round();
+    let offset = ((*source_offset_frames as f64 + shift_src).max(0.0) as u64).min(total.saturating_sub(1));
+    let len_src = (ticks_to_frames(app, edited.start_tick.0, edited.length_ticks.0) * rate).round().max(1.0) as u64;
+    let length = len_src.min(total - offset).max(1);
+    // the displayed length follows the source bounds exactly
+    let length_ticks = frames_to_ticks(app, edited.start_tick.0, length as f64 / rate);
+    Clip {
+        length_ticks: Tick(length_ticks),
+        content: ClipContent::Audio {
+            asset_id: asset_id.clone(),
+            source_offset_frames: offset,
+            source_length_frames: length,
+            gain_db: *gain_db,
+            fade_in_frames: (*fade_in_frames).min(length),
+            fade_out_frames: (*fade_out_frames).min(length),
+            playback_rate: *playback_rate,
+        },
+        ..edited
+    }
+}
+
+/// Waveform thumbnail of an asset (cached; decodes on first use).
+fn thumbnail(app: &mut App, asset_id: &AssetId) -> Option<Arc<Vec<(f32, f32)>>> {
+    if let Some(t) = app.playlist.thumbs.get(asset_id) {
+        return Some(t.clone());
+    }
+    let sample = app.assets.sample(asset_id)?;
+    let n = sample.frames();
+    if n == 0 {
+        return None;
+    }
+    const BUCKETS: usize = 512;
+    let mut out = vec![(0.0f32, 0.0f32); BUCKETS];
+    for (b, slot) in out.iter_mut().enumerate() {
+        let (from, to) = (b * n / BUCKETS, ((b + 1) * n / BUCKETS).max(b * n / BUCKETS + 1).min(n));
+        let (mut lo, mut hi) = (0.0f32, 0.0f32);
+        for ch in &sample.channels {
+            for v in &ch[from..to] {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+        }
+        *slot = (lo, hi);
+    }
+    let t = Arc::new(out);
+    app.playlist.thumbs.insert(asset_id.clone(), t.clone());
+    Some(t)
+}
+
 fn preview_clips(app: &mut App, clips: Vec<Clip>) {
     if !app.history.gesture_active() {
         let _ = app.history.begin_gesture();
@@ -127,7 +264,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         ui.heading("Playlist");
         if ui.button("+ Track").clicked() {
             let n = app.project.tracks.len() + 1;
-            cmds.push(Command::AddTrack { track: Track { id: TrackId::new(), name: format!("Track {n}"), color: None, mute: false, solo: false, height: None }, index: None });
+            cmds.push(Command::AddTrack {
+                track: Track { id: TrackId::new(), name: format!("Track {n}"), color: None, mute: false, solo: false, height: None, mixer_id: None },
+                index: None,
+            });
         }
         ui.separator();
         ui.label("Snap");
@@ -372,6 +512,20 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             all.push(Command::RemoveTrack { id: t.id });
             cmds.push(Command::Batch { commands: all });
         }
+        {
+            let mixers = app.project.mixer.channels.clone();
+            let master = app.project.mixer.master_id;
+            let current = t.mixer_id.unwrap_or(master);
+            let cur_name = mixers.iter().find(|m| m.id == current).map(|m| m.name.clone()).unwrap_or_else(|| "Master".into());
+            let short: String = cur_name.chars().take(6).collect();
+            egui::ComboBox::from_id_salt(("track-mixer", t.id)).selected_text(short).width(52.0).show_ui(&mut child, |ui| {
+                for m in &mixers {
+                    if ui.selectable_label(m.id == current, &m.name).on_hover_text("Audio clips on this track play into this mixer channel").clicked() {
+                        cmds.push(Command::SetTrackMixer { id: t.id, mixer_id: if m.id == master { None } else { Some(m.id) } });
+                    }
+                }
+            });
+        }
         // grid lines
         let mut b = (scroll_tick as i64) / bar_t;
         while b * bar_t <= last_tick {
@@ -417,17 +571,48 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             Stroke::new(if selection.contains(&c.id) { 2.0 } else { 1.0 }, if selection.contains(&c.id) { theme::TEXT } else { col }),
             egui::StrokeKind::Inside,
         );
+        let th = if let ClipContent::Audio { asset_id, .. } = &c.content { thumbnail(app, asset_id) } else { None };
         let (name, mini): (String, Option<&Pattern>) = match &c.content {
             ClipContent::Pattern { pattern_id, looped, .. } => {
                 let p = app.project.pattern(*pattern_id);
                 (format!("{}{}", p.map(|p| p.name.clone()).unwrap_or_else(|| "?".into()), if *looped { " (loop)" } else { "" }), p)
             }
-            ClipContent::Audio { .. } => ("audio (plays in M5)".into(), None),
+            ClipContent::Audio { asset_id, .. } => {
+                (app.project.assets.iter().find(|a| &a.id == asset_id).map(|a| a.source_name.clone()).unwrap_or_else(|| "audio (missing asset)".into()), None)
+            }
             ClipContent::Automation { curve_id, .. } => {
                 (app.project.automation.iter().find(|a| a.id == *curve_id).map(|a| format!("~ {}", a.name)).unwrap_or_else(|| "automation".into()), None)
             }
         };
         painter.text(cr_vis.left_top() + vec2(4.0, 2.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(10.0), theme::TEXT);
+        // waveform thumbnail (source frames mapped onto the clip's ticks)
+        if let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, playback_rate, gain_db, .. } = &c.content
+            && let Some(th) = th
+        {
+            let total = asset_frames(app, asset_id).unwrap_or(*source_offset_frames + *source_length_frames).max(1) as f32;
+            let area = Rect::from_min_max(pos2(cr_vis.min.x, cr.min.y + 14.0), pos2(cr_vis.max.x, cr.max.y - 2.0));
+            let mid = area.center().y;
+            let half = area.height() * 0.5;
+            let rate = audio_rate(app, asset_id, *playback_rate) as f32;
+            let out_frames = *source_length_frames as f32 / rate;
+            let g = gain_db.to_linear() as f32;
+            let mut x = area.min.x;
+            while x < area.max.x {
+                let t0 = (tick_at(x) - c.start_tick.0) as f32 / c.length_ticks.0.max(1) as f32;
+                let t1 = (tick_at(x + 2.0) - c.start_tick.0) as f32 / c.length_ticks.0.max(1) as f32;
+                let s0 = (*source_offset_frames as f32 + t0.clamp(0.0, 1.0) * out_frames * rate) / total;
+                let s1 = (*source_offset_frames as f32 + t1.clamp(0.0, 1.0) * out_frames * rate) / total;
+                let (b0, b1) = ((s0 * th.len() as f32) as usize, ((s1 * th.len() as f32) as usize).max((s0 * th.len() as f32) as usize + 1));
+                let (mut lo, mut hi) = (0.0f32, 0.0f32);
+                for b in b0.min(th.len() - 1)..b1.min(th.len()) {
+                    lo = lo.min(th[b].0);
+                    hi = hi.max(th[b].1);
+                }
+                let (lo, hi) = ((lo * g).clamp(-1.0, 1.0), (hi * g).clamp(-1.0, 1.0));
+                painter.line_segment([pos2(x, mid - hi * half), pos2(x, mid - lo * half)], Stroke::new(2.0, theme::TEXT.linear_multiply(0.75)));
+                x += 2.0;
+            }
+        }
         // automation curve preview
         if let ClipContent::Automation { curve_id, source_offset_ticks, .. } = &c.content
             && let Some(curve) = app.project.automation.iter().find(|a| a.id == *curve_id)
@@ -498,6 +683,24 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let pointer = ptr.pos;
     let egrid = if mods.alt { None } else { grid };
     let hit = |p: Pos2| clips.iter().rev().find(|c| clip_rect(c).contains(p)).cloned();
+    // a file dragged over a lane lands as an audio clip there (see App::step)
+    app.playlist.drop_target = None;
+    let dragging_files = ui.input(|i| !i.raw.hovered_files.is_empty());
+    if dragging_files
+        && let Some(p) = ui.input(|i| i.pointer.hover_pos())
+        && lanes_rect.contains(p)
+        && let Some(track) = tracks.get(row_of(p.y).max(0) as usize)
+    {
+        app.playlist.drop_target = Some((track.id, snap_tick(tick_at(p.x), egrid).max(0)));
+        let r = row_rect(row_of(p.y).max(0) as usize);
+        painter.rect_stroke(r, 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+        let x = x_of(snap_tick(tick_at(p.x), egrid).max(0));
+        painter.line_segment([pos2(x, r.min.y), pos2(x, r.max.y)], Stroke::new(2.0, theme::ACCENT));
+    }
+    if let Some(asset) = app.playlist.place_asset.clone() {
+        let name = app.project.assets.iter().find(|a| a.id == asset).map(|a| a.source_name.clone()).unwrap_or_default();
+        app.playlist.hover = format!("Click in a track to place “{name}” as an audio clip (Esc cancels)");
+    }
     let selected_pattern = app.project.selected_pattern.or_else(|| app.project.patterns.first().map(|p| p.id));
     app.playlist.hover = String::new();
     if let Some(p) = resp.hover_pos()
@@ -533,6 +736,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     {
         app.key_target = super::KeyTarget::Playlist;
         let st = &mut app.playlist;
+        let armed = st.place_asset.clone();
         match hit(p) {
             Some(c) => {
                 if mods.shift {
@@ -558,6 +762,13 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 let row = row_of(p.y);
                 if mods.command || tracks.is_empty() {
                     st.gesture = Some(Gesture::Box { start: p });
+                } else if let (Some(track), Some(asset)) = (tracks.get(row.max(0) as usize), armed) {
+                    // place the armed audio asset as a clip
+                    let t = snap_tick(tick_at(p.x), egrid).max(0);
+                    let track_id = track.id;
+                    if place_audio_clip(app, &asset, track_id, t).is_none() {
+                        app.status_line = "That sample cannot be read; re-import it".into();
+                    }
                 } else if let (Some(track), Some(pid)) = (tracks.get(row.max(0) as usize), selected_pattern) {
                     // paint the selected pattern as a clip
                     let plen = app.project.pattern(pid).map(|p| p.length_ticks.0).unwrap_or(PPQ * 4).max(1);
@@ -622,18 +833,20 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
             Some(Gesture::ResizeEnd { orig, anchor_tick }) => {
-                let dt = tick_at(p.x) - *anchor_tick;
+                let (orig, anchor_tick) = (orig.clone(), *anchor_tick);
+                let dt = tick_at(p.x) - anchor_tick;
                 let updated: Vec<Clip> = orig
                     .iter()
                     .map(|c| {
                         let end = snap_round(c.end_tick().0 + dt, egrid).max(c.start_tick.0 + egrid.unwrap_or(PPQ / 4).max(1));
-                        Clip { length_ticks: Tick(end - c.start_tick.0), ..c.clone() }
+                        audio_bounds_from_ticks(app, c, Clip { length_ticks: Tick(end - c.start_tick.0), ..c.clone() })
                     })
                     .collect();
                 preview_clips(app, updated);
             }
             Some(Gesture::TrimStart { orig, anchor_tick }) => {
-                let dt = tick_at(p.x) - *anchor_tick;
+                let (orig, anchor_tick) = (orig.clone(), *anchor_tick);
+                let dt = tick_at(p.x) - anchor_tick;
                 let updated: Vec<Clip> = orig
                     .iter()
                     .map(|c| {
@@ -645,7 +858,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                             }
                             other => other.clone(),
                         };
-                        Clip { start_tick: Tick(start), length_ticks: Tick(c.end_tick().0 - start), content, ..c.clone() }
+                        audio_bounds_from_ticks(app, c, Clip { start_tick: Tick(start), length_ticks: Tick(c.end_tick().0 - start), content, ..c.clone() })
                     })
                     .collect();
                 preview_clips(app, updated);
@@ -777,6 +990,42 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     ui.close();
                 }
             }
+            if let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &c.content {
+                let rate = audio_rate(app, asset_id, *playback_rate);
+                let (mut gain, mut fi, mut fo) = (
+                    gain_db.0,
+                    *fade_in_frames as f64 / rate / app.project.sample_rate_hz.as_f64() * 1000.0,
+                    *fade_out_frames as f64 / rate / app.project.sample_rate_hz.as_f64() * 1000.0,
+                );
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Gain");
+                    changed |= ui.add(egui::DragValue::new(&mut gain).range(-48.0..=24.0).speed(0.5).suffix(" dB")).changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Fade in");
+                    changed |= ui.add(egui::DragValue::new(&mut fi).range(0.0..=5000.0).speed(5.0).suffix(" ms")).changed();
+                    ui.label("out");
+                    changed |= ui.add(egui::DragValue::new(&mut fo).range(0.0..=5000.0).speed(5.0).suffix(" ms")).changed();
+                });
+                if changed {
+                    let to_src = |ms: f64| ((ms / 1000.0 * app.project.sample_rate_hz.as_f64() * rate).round() as u64).min(*source_length_frames);
+                    cmds.push(Command::UpdateClip {
+                        clip: Clip {
+                            content: ClipContent::Audio {
+                                asset_id: asset_id.clone(),
+                                source_offset_frames: *source_offset_frames,
+                                source_length_frames: *source_length_frames,
+                                gain_db: rawdawg_types::units::Db(gain),
+                                fade_in_frames: to_src(fi),
+                                fade_out_frames: to_src(fo),
+                                playback_rate: *playback_rate,
+                            },
+                            ..c.clone()
+                        },
+                    });
+                }
+            }
             if ui.button("Split at playhead").clicked() {
                 app.playlist.selection.clear();
                 app.playlist.selection.insert(c.id);
@@ -804,6 +1053,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         if esc {
             cancel_gesture(app);
             app.playlist.selection.clear();
+            app.playlist.place_asset = None;
         }
         if all {
             app.playlist.selection = clips.iter().map(|c| c.id).collect();
