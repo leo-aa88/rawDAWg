@@ -296,7 +296,7 @@ pub fn mime_xml() -> String {
 /// Debian control file.
 pub fn deb_control(installed_kib: u64) -> String {
     format!(
-        "Package: {PACKAGE}\nVersion: {ver}\nSection: sound\nPriority: optional\nArchitecture: amd64\nMaintainer: {MAINTAINER}\nInstalled-Size: {installed_kib}\nDepends: libc6 (>= 2.34), libgcc-s1, libasound2t64 (>= 1.2) | libasound2 (>= 1.2)\nRecommends: pipewire-alsa | pulseaudio\nSuggests: jackd2\nHomepage: {HOMEPAGE}\nDescription: {DISPLAY_NAME} — native experimental DAW\n {TAGLINE} A native Rust digital audio workstation with its own\n synthesizer and effect suite, CLAP/VST3 hosting and CLAP/VST3 exports\n of its instruments and effects. Offline, dark only.\n",
+        "Package: {PACKAGE}\nVersion: {ver}\nSection: sound\nPriority: optional\nArchitecture: amd64\nMaintainer: {MAINTAINER}\nInstalled-Size: {installed_kib}\nDepends: libc6 (>= 2.34), libgcc-s1, libasound2t64 (>= 1.2) | libasound2 (>= 1.2)\nRecommends: pipewire-alsa | pulseaudio\nSuggests: jackd2\nHomepage: {HOMEPAGE}\nDescription: native experimental digital audio workstation\n {DISPLAY_NAME}: {TAGLINE}\n A native Rust digital audio workstation with its own synthesizer and\n effect suite, CLAP/VST3 hosting and CLAP/VST3 exports of its\n instruments and effects. Offline, dark only.\n",
         ver = version()
     )
 }
@@ -357,25 +357,28 @@ pub fn package_deb(root: &Path) -> anyhow::Result<Produced> {
     }
     let docs = usr.join("share").join("doc").join(PACKAGE);
     write_common_docs(root, &docs)?;
-    std::fs::write(
-        docs.join("copyright"),
-        format!(
-            "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: {DISPLAY_NAME}\nSource: {HOMEPAGE}\n\nFiles: *\nCopyright: rawDAWg contributors\nLicense: AGPL-3.0-only\n See /usr/share/doc/{PACKAGE}/LICENSE (as placed by the repository owner; legal publisher identity is an owner decision).\n"
-        ),
-    )?;
-    // the pinned fixtures double as demo projects
+    // Debian keeps the license text in `copyright` (AGPL-3 is not in /usr/share/common-licenses)
+    std::fs::remove_file(docs.join("LICENSE"))?;
+    std::fs::write(docs.join("copyright"), deb_copyright(root)?)?;
+    gzip_to(&deb_changelog(root), &docs.join("changelog.gz"))?;
+    let man = usr.join("share").join("man").join("man1");
+    std::fs::create_dir_all(&man)?;
+    gzip_to(&man_page(&release.join(PACKAGE))?, &man.join(format!("{PACKAGE}.1.gz")))?;
+    // the pinned fixtures double as demo projects (empty working folders are recreated on save)
     let demos = usr.join("share").join(PACKAGE).join("demos");
     copy_tree(&root.join("fixtures").join("demo-song.rawdawg"), &demos.join("demo-song.rawdawg"))?;
+    remove_empty_dirs(&demos)?;
     let elf = vec![
         usr.join("bin").join(PACKAGE),
         usr.join("lib").join("clap").join("rawDAWg.clap"),
         usr.join("lib").join("vst3").join("rawDAWg.vst3").join("Contents").join("x86_64-linux").join("rawDAWg.so"),
     ];
-    let stripped = strip_debug(&elf)?;
+    let stripped = strip_binaries(&elf)?;
     let debian = staging.join("DEBIAN");
     std::fs::create_dir_all(&debian)?;
     let installed_kib = dir_size(&usr)?.div_ceil(1024);
     std::fs::write(debian.join("control"), deb_control(installed_kib))?;
+    std::fs::write(debian.join("md5sums"), md5sums(&staging)?)?;
     // executables and directories get conventional modes
     #[cfg(unix)]
     {
@@ -387,7 +390,7 @@ pub fn package_deb(root: &Path) -> anyhow::Result<Produced> {
     run(Command::new(&dpkg).args(["--build", "--root-owner-group"]).arg(&staging).arg(&deb))?;
     let mut produced = Produced { artifacts: vec![deb.clone()], staging: staging.clone(), warnings: Vec::new() };
     if !stripped {
-        produced.warnings.push("strip not found: binaries ship with debug line tables".into());
+        produced.warnings.push("strip not found: binaries ship unstripped".into());
     }
     if let Some(v) = which("desktop-file-validate") {
         let st = Command::new(v).arg(apps.join(format!("{PACKAGE}.desktop"))).status()?;
@@ -399,18 +402,23 @@ pub fn package_deb(root: &Path) -> anyhow::Result<Produced> {
     }
     match which("lintian") {
         Some(l) => {
-            let out = Command::new(l)
-                .args(["--no-tag-display-limit", "--suppress-tags", "no-manual-page,changelog-file-missing,extended-description-is-probably-too-short"])
-                .arg(&deb)
-                .output()?;
+            let out = Command::new(l).args(["--no-tag-display-limit", "--display-info"]).arg(&deb).output()?;
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr).into_owned();
             std::fs::write(out_dir.join("lintian.txt"), &text)?;
-            if text.lines().any(|l| l.starts_with("E:")) {
-                bail!("lintian reported errors:\n{text}");
+            // lintian exits 0 (or 1 when tags hit its fail-on level); anything else means it did not run
+            if !matches!(out.status.code(), Some(0) | Some(1)) {
+                bail!("lintian did not run ({}): {}", out.status, err.trim());
             }
-            if !text.trim().is_empty() {
-                produced.warnings.push(format!("lintian warnings recorded in {}", out_dir.join("lintian.txt").display()));
+            let tags = |level: &str| text.lines().filter(|l| l.starts_with(level)).map(str::to_owned).collect::<Vec<_>>();
+            let errors = tags("E:");
+            if !errors.is_empty() {
+                bail!("lintian reported errors:\n{}", errors.join("\n"));
             }
+            let warnings = tags("W:");
+            let infos = tags("I:");
+            produced.warnings.push(format!("lintian: 0 errors, {} warnings, {} info tags (report {})", warnings.len(), infos.len(), out_dir.join("lintian.txt").display()));
+            produced.warnings.extend(warnings);
         }
         None => produced.warnings.push("lintian not installed: package not linted".into()),
     }
@@ -418,17 +426,150 @@ pub fn package_deb(root: &Path) -> anyhow::Result<Produced> {
     Ok(produced)
 }
 
-/// Strip debug sections from staged ELF files (the release profile keeps line tables for
-/// profiling; packages ship without them). Returns false when no `strip` is available.
-fn strip_debug(files: &[PathBuf]) -> anyhow::Result<bool> {
+/// Strip staged ELF files the way Debian's `dh_strip` does (`--strip-unneeded` plus the
+/// `.comment`/`.note` sections). Exported entry points (`clap_entry`, `GetPluginFactory`,
+/// `ModuleEntry`) live in `.dynsym` and survive. The release profile keeps line tables for
+/// profiling; packaged builds ship without them, so panic backtraces lose symbol names.
+/// Returns false when no `strip` is available.
+fn strip_binaries(files: &[PathBuf]) -> anyhow::Result<bool> {
     if !cfg!(target_os = "linux") {
         return Ok(true); // Windows debug info lives in separate PDBs, not in the binaries
     }
     let Some(strip) = which("strip") else { return Ok(false) };
     for f in files {
-        run(Command::new(&strip).arg("--strip-debug").arg(f))?;
+        run(Command::new(&strip).args(["--strip-unneeded", "--remove-section=.comment", "--remove-section=.note"]).arg(f))?;
     }
     Ok(true)
+}
+
+/// Copyright years from the first and last commit (falls back to the build year).
+fn copyright_years(root: &Path) -> String {
+    let year = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").current_dir(root).args(args).output().ok()?;
+        let y = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_owned();
+        (y.len() == 4).then_some(y)
+    };
+    let first = year(&["log", "--reverse", "--format=%cd", "--date=format:%Y"]);
+    let last = year(&["log", "-1", "--format=%cd", "--date=format:%Y"]);
+    match (first, last) {
+        (Some(a), Some(b)) if a != b => format!("{a}-{b}"),
+        (Some(a), _) | (_, Some(a)) => a,
+        _ => "2026".into(),
+    }
+}
+
+/// Machine-readable Debian copyright file with the full AGPL text from `LICENSE`.
+/// The holder line names the project's contributors generically: the legal publisher
+/// identity is an owner decision (CLAUDE.md) and is not invented here.
+pub fn deb_copyright(root: &Path) -> anyhow::Result<String> {
+    let license = std::fs::read_to_string(root.join("LICENSE")).context("reading LICENSE")?;
+    let mut body = String::new();
+    for line in license.lines() {
+        let t = line.trim_end();
+        body.push_str(if t.is_empty() { " ." } else { " " });
+        if !t.is_empty() {
+            body.push_str(t);
+        }
+        body.push('\n');
+    }
+    Ok(format!(
+        "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\nUpstream-Name: {DISPLAY_NAME}\nSource: {HOMEPAGE}\n\nFiles: *\nCopyright: {} {DISPLAY_NAME} contributors\nLicense: AGPL-3.0-only\n\nLicense: AGPL-3.0-only\n{body}",
+        copyright_years(root)
+    ))
+}
+
+/// Debian changelog for the native package (one entry per packaged version).
+pub fn deb_changelog(root: &Path) -> String {
+    let date = Command::new("git")
+        .current_dir(root)
+        .args(["log", "-1", "--format=%cD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "Wed, 25 Nov 2026 00:00:00 +0000".into());
+    format!(
+        "{PACKAGE} ({ver}) unstable; urgency=medium\n\n  * {DISPLAY_NAME} {ver} built from source. See /usr/share/doc/{PACKAGE}/README.md\n    and the project's PROGRESS.md for what this version contains and which\n    release gates remain open.\n\n -- {MAINTAINER}  {date}\n",
+        ver = version()
+    )
+}
+
+/// `rawdawg(1)`: generated from the binary's own `--help`, so it never drifts from the CLI.
+pub fn man_page(binary: &Path) -> anyhow::Result<String> {
+    let out = Command::new(binary).arg("--help").output().with_context(|| format!("running {} --help", binary.display()))?;
+    if !out.status.success() {
+        bail!("{} --help failed", binary.display());
+    }
+    let help = String::from_utf8_lossy(&out.stdout);
+    let mut roff = format!(
+        ".TH RAWDAWG 1 \"\" \"{DISPLAY_NAME} {ver}\" \"User Commands\"\n.SH NAME\nrawdawg \\- {DISPLAY_NAME}, a native experimental digital audio workstation\n.SH SYNOPSIS\n.B rawdawg\n[\\fIOPTIONS\\fR]\n.SH DESCRIPTION\n{TAGLINE} Without options, opens the graphical editor. The options below render\nprojects headlessly, scan plug-ins and test audio devices.\n.SH OPTIONS\n.nf\n",
+        ver = version()
+    );
+    for line in help.lines() {
+        // escape roff: backslashes, and control characters at the start of a line
+        let mut l = line.replace('\\', "\\e");
+        if l.starts_with('.') || l.starts_with('\'') {
+            l.insert_str(0, "\\&");
+        }
+        roff.push_str(&l);
+        roff.push('\n');
+    }
+    roff.push_str(".fi\n.SH FILES\n.TP\n.I ~/.config/rawdawg/\nPreferences, plug-in catalog and recovery data.\n.TP\n.I /usr/share/doc/rawdawg/USER_GUIDE.md\nThe user guide.\n.SH SEE ALSO\nThe user guide and https://github.com/leonardo-aa/rawDAWg\n");
+    Ok(roff)
+}
+
+/// `gzip -9n` (no name, no timestamp: reproducible).
+fn gzip_to(text: &str, path: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let gzip = which("gzip").ok_or_else(|| anyhow::anyhow!("gzip not found"))?;
+    let mut child = Command::new(gzip).args(["-9n", "-c"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
+    child.stdin.take().context("gzip stdin")?.write_all(text.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("gzip failed");
+    }
+    std::fs::write(path, out.stdout)?;
+    Ok(())
+}
+
+/// `DEBIAN/md5sums` for every regular file under the staging root (paths relative, no `./`).
+fn md5sums(staging: &Path) -> anyhow::Result<String> {
+    let md5 = which("md5sum").ok_or_else(|| anyhow::anyhow!("md5sum not found"))?;
+    let mut files = Vec::new();
+    let mut stack = vec![staging.join("usr")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let p = entry?.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push(p.strip_prefix(staging)?.to_path_buf());
+            }
+        }
+    }
+    files.sort();
+    let out = Command::new(md5).current_dir(staging).args(&files).output()?;
+    if !out.status.success() {
+        bail!("md5sum failed");
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+fn remove_empty_dirs(dir: &Path) -> anyhow::Result<bool> {
+    let mut empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            if remove_empty_dirs(&p)? {
+                std::fs::remove_dir(&p)?;
+            } else {
+                empty = false;
+            }
+        } else {
+            empty = false;
+        }
+    }
+    Ok(empty)
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
@@ -615,6 +756,10 @@ mod tests {
         assert!(m.contains("project.rawdawg") && m.contains("*.rawdawgpreset"));
         let c = deb_control(1234);
         assert!(c.starts_with("Package: rawdawg\n") && c.contains("Architecture: amd64") && c.contains("Installed-Size: 1234"));
+        let description: Vec<&str> = c.lines().skip_while(|l| !l.starts_with("Description: ")).skip(1).collect();
+        assert!(!description.is_empty() && description.iter().all(|l| l.starts_with(' ') && l.chars().count() <= 80), "Debian: extended description lines fit 80 columns");
+        let synopsis = c.lines().find(|l| l.starts_with("Description: ")).unwrap();
+        assert!(!synopsis.to_lowercase().starts_with("description: rawdawg"), "Debian: the synopsis must not start with the package name");
         assert!(!m.contains("project.json"), "never claim generic project.json files");
         let icon = icon_rgba(32);
         assert_eq!(icon.get_pixel(0, 0).0[3], 0, "corners are transparent");

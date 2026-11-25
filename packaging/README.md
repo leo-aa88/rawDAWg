@@ -4,7 +4,7 @@
 
 | Format | OS | Tool | Output |
 |---|---|---|---|
-| `deb` | Ubuntu 24.04 | `dpkg-deb` (+ `desktop-file-validate`, `lintian` when installed) | `target/package/rawdawg-<version>-x86_64.deb` |
+| `deb` | Ubuntu 24.04 | `dpkg-deb`, `strip`, `gzip`, `md5sum` (+ `desktop-file-validate`; `lintian` when installed, which must report no errors) | `target/package/rawdawg-<version>-x86_64.deb` |
 | `msi` | Windows 11 | WiX v5 CLI (`dotnet tool install --global wix --version 5.0.2`), manifest `windows/rawdawg.wxs` | `target/package/rawdawg-<version>-x86_64.msi` |
 | `portable` | Windows 11 | PowerShell `Compress-Archive` | `target/package/rawdawg-<version>-x86_64.zip` |
 
@@ -14,7 +14,9 @@ license report and a CycloneDX SBOM generated from `Cargo.lock`; `SHA256SUMS` li
 The deb installs the plugins into `/usr/lib/clap` and `/usr/lib/vst3`, a desktop entry
 (`rawdawg --open %f`), MIME types `application/x-rawdawg-project` (the `project.rawdawg` marker
 file every saved project folder carries, since folders cannot be associated by suffix) and
-`application/x-rawdawg-preset` (`*.rawdawgpreset`), and hicolor icons rendered at package time. The
+`application/x-rawdawg-preset` (`*.rawdawgpreset`), and hicolor icons rendered at package time,
+a `rawdawg(1)` man page generated from `rawdawg --help`, a Debian changelog, a machine-readable
+`copyright` carrying the full AGPL text, and `md5sums`. Binaries are stripped like `dh_strip`. The
 MSI installs the plugins into the common CLAP/VST3 folders and registers `.rawdawg` (the marker)
 and `.rawdawgpreset`. Artifacts follow the `rawdawg-<version>-<arch>` basename. Uninstall never touches user projects or preferences.
 

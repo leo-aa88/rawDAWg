@@ -362,7 +362,14 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - xtask verify **E2E-08 (headless subset)**: builds the deb, checks required paths and control fields, extracts it, renders the packaged demo with the packaged binary without a display, checks `SHA256SUMS` and that no AppImage/Snap/Flatpak was produced. CI gains package steps (deb on Ubuntu; WiX 5.0.2 + msi + portable on Windows) and uploads unsigned artifacts as CI evidence only.
 - Tests: `xtask` unit tests (SHA-256 vectors, desktop/MIME/control content, ICO layout), `crates/project/tests/persist.rs` marker test, UI test `open_accepts_preset_files_and_the_project_marker`. Fixed a test race: the VST3 host tests copied the module into one temp path from parallel threads (an intermittent crash in full workspace runs); the bundle is now built once per process with an atomic rename.
 - Commands: `cargo test --workspace` (362 passed, twice), clippy clean, `cargo xtask package --format deb` (OK; lintian not installed → not linted), `cargo xtask verify --suite all` (20 PASS incl. E2E-08 subset; PL-03/04/05, HW-01, GUI-01 BLOCKED).
-- Not run: lintian, `dpkg -i`/removal on a clean Ubuntu (needs root), anything on Windows (MSI/portable build, install, association), signing.
+- Not run: `dpkg -i`/removal on a clean Ubuntu (needs root), anything on Windows (MSI/portable build, install, association), signing. (lintian: see slice 1b.)
+
+### Slice 1b — lintian clean (2026-11-25)
+
+- With lintian 2.114.0ubuntu1.9 installed by the owner, the first lint found 4 errors and 2 warnings, and showed that the packaging hook had been passing falsely: it suppressed a tag name this lintian does not know (`changelog-file-missing`), lintian aborted with exit 25 and no output, and the hook never checked the exit status. The hook now runs without suppressions, fails when lintian does not run (exit other than 0/1), fails on any `E:` tag, and lists warnings.
+- Fixes: synopsis no longer starts with the package name and the extended description fits 80 columns; Debian changelog (`changelog.gz`, `gzip -9n`); `rawdawg(1)` generated from the binary's `--help`; machine-readable `copyright` with a `Copyright:` line (years from git, holder "rawDAWg contributors"; legal publisher identity still an owner decision) and the full AGPL text, replacing the separate LICENSE file in the deb; `DEBIAN/md5sums`; empty demo folders removed; binaries stripped like `dh_strip` (`--strip-unneeded`, `.comment`/`.note` removed: 34 MB installed, 9.5 MB download). Full stripping drops symbol names from panic backtraces of packaged builds.
+- Result: 0 errors, 0 warnings, also under `--pedantic`; 8 info tags remain (`hardening-no-fortify-functions` on the Rust binaries, `spelling-error-in-binary` for dependency strings). E2E-08 now also scans the 34 packaged plugins with the packaged binary to prove stripping kept their entry points.
+- Commands: `cargo xtask package --format deb`, `lintian --pedantic --display-info target/package/rawdawg-0.1.0-x86_64.deb`, `cargo xtask verify --suite all` (20 PASS).
 
 ### Slice 2 — reference benchmarks (QUAL-04)
 

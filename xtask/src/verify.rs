@@ -1094,7 +1094,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
                 let deb = produced.artifacts.iter().find(|a| a.extension().is_some_and(|e| e == "deb")).ok_or_else(|| anyhow::anyhow!("no .deb produced"))?.clone();
                 let listing = Command::new("dpkg-deb").arg("-c").arg(&deb).output()?;
                 let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
-                for required in ["./usr/bin/rawdawg", "./usr/lib/clap/rawDAWg.clap", "./usr/lib/vst3/rawDAWg.vst3/Contents/x86_64-linux/rawDAWg.so", "./usr/lib/vst3/rawDAWg.vst3/Contents/Resources/moduleinfo.json", "./usr/share/applications/rawdawg.desktop", "./usr/share/mime/packages/rawdawg.xml", "./usr/share/icons/hicolor/256x256/apps/rawdawg.png", "./usr/share/doc/rawdawg/THIRD-PARTY-LICENSES.txt", "./usr/share/doc/rawdawg/sbom.cdx.json", "./usr/share/doc/rawdawg/copyright", "./usr/share/doc/rawdawg/USER_GUIDE.md", "./usr/share/rawdawg/demos/demo-song.rawdawg/project.json"] {
+                for required in ["./usr/bin/rawdawg", "./usr/lib/clap/rawDAWg.clap", "./usr/lib/vst3/rawDAWg.vst3/Contents/x86_64-linux/rawDAWg.so", "./usr/lib/vst3/rawDAWg.vst3/Contents/Resources/moduleinfo.json", "./usr/share/applications/rawdawg.desktop", "./usr/share/mime/packages/rawdawg.xml", "./usr/share/icons/hicolor/256x256/apps/rawdawg.png", "./usr/share/doc/rawdawg/THIRD-PARTY-LICENSES.txt", "./usr/share/doc/rawdawg/sbom.cdx.json", "./usr/share/doc/rawdawg/copyright", "./usr/share/doc/rawdawg/USER_GUIDE.md", "./usr/share/doc/rawdawg/changelog.gz", "./usr/share/man/man1/rawdawg.1.gz", "./usr/share/rawdawg/demos/demo-song.rawdawg/project.json"] {
                     if !listing.contains(required) {
                         bail!("{required} missing from the deb");
                     }
@@ -1123,6 +1123,19 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
                 if frames == 0 {
                     bail!("packaged render is empty");
                 }
+                // the stripped plugin modules still load: the packaged binary scans them in its child process
+                let catalog = base.join("plugins.json");
+                std::fs::write(&catalog, serde_json::to_vec(&serde_json::json!({ "version": 1, "user_paths": [base.join("usr/lib/vst3")] }))?)?;
+                let scan = Command::new(&exe).arg("--scan-plugins").arg("--catalog").arg(&catalog).env("CLAP_PATH", base.join("usr/lib/clap")).env("HOME", base.join("home")).output()?;
+                if !scan.status.success() {
+                    bail!("packaged binary failed to scan the packaged plugins: {}", String::from_utf8_lossy(&scan.stderr));
+                }
+                let report: serde_json::Value = serde_json::from_slice(&scan.stdout)?;
+                let found = report["plugins"].as_array().map(|a| a.len()).unwrap_or(0);
+                let quarantined = report["quarantine"].as_array().map(|a| a.len()).unwrap_or(0);
+                if found != 34 || quarantined != 0 {
+                    bail!("packaged plugins: expected 17 CLAP + 17 VST3 and none quarantined, got {found} and {quarantined} quarantined: {}", report["quarantine"]);
+                }
                 let sums = std::fs::read_to_string(root.join("target/package/SHA256SUMS"))?;
                 if !sums.contains(deb.file_name().unwrap().to_str().unwrap()) {
                     bail!("SHA256SUMS does not list the deb");
@@ -1132,7 +1145,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
                     bail!("forbidden distribution formats produced: {forbidden:?}");
                 }
                 let warn = if produced.warnings.is_empty() { String::new() } else { format!("; {}", produced.warnings.join("; ")) };
-                Ok((format!("{} ({} bytes): layout, control, desktop entry validated, packaged binary rendered {frames} frames offline{warn}; install/uninstall in a clean machine: BLOCKED (needs root)", deb.file_name().unwrap().to_string_lossy(), deb.metadata()?.len()), Some(base.display().to_string())))
+                Ok((format!("{} ({} bytes): layout, control, desktop entry validated, packaged binary rendered {frames} frames offline and loaded all 34 packaged (stripped) plugins{warn}; install/uninstall in a clean machine: BLOCKED (needs root)", deb.file_name().unwrap().to_string_lossy(), deb.metadata()?.len()), Some(base.display().to_string())))
             },
         )
     } else {
