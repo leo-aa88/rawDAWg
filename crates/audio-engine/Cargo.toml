@@ -13,6 +13,7 @@ rawdawg-transport = { path = "../transport" }
 rawdawg-rt = { path = "../rt" }
 rawdawg-dsp = { path = "../dsp" }
 rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-sampler = { path = "../sampler" }
 rawdawg-project = { path = "../project" }
 hound = { workspace = true }
 log = { workspace = true }

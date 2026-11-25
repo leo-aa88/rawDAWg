@@ -18,6 +18,7 @@ rawdawg-transport = { path = "../transport" }
 rawdawg-rt = { path = "../rt" }
 rawdawg-dsp = { path = "../dsp" }
 rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-sampler = { path = "../sampler" }
 rawdawg-project = { path = "../project" }
 rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-audio-io = { path = "../audio-io" }

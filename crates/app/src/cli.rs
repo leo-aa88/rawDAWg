@@ -131,6 +131,7 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
             sample_rate,
             unprotected: args.unprotected,
             metronome: false,
+            project_dir: rawdawg_project::persist::resolve_project_dir(project_path).ok(),
         };
         let format = match args.format {
             WavFormatArg::Pcm16 => WavFormat::Pcm16,

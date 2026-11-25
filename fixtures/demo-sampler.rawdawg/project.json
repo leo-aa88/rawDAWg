@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "project_id": "00000000-0000-0000-0000-0000da000002",
+  "name": "rawDAWg Sampler Demo",
+  "ppq": 960,
+  "sample_rate_hz": 48000,
+  "tempo": [
+    {
+      "tick": 0,
+      "us_per_quarter": 500000
+    }
+  ],
+  "meter": [
+    {
+      "tick": 0,
+      "numerator": 4,
+      "denominator": 4
+    }
+  ],
+  "assets": [
+    {
+      "id": "a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15",
+      "path": "assets/sha256/a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15.wav",
+      "kind": "audio",
+      "source_name": "sine_440_48k.wav",
+      "original_rate_hz": null,
+      "channels": null,
+      "frames": null,
+      "bytes": 384068
+    },
+    {
+      "id": "594767450285f0c2ed9bc52abf5d5a46eb8fb1bbc4d8928a9e24da99e63e4059",
+      "path": "assets/sha256/594767450285f0c2ed9bc52abf5d5a46eb8fb1bbc4d8928a9e24da99e63e4059.sf2",
+      "kind": "sf2",
+      "source_name": "fixture.sf2",
+      "original_rate_hz": null,
+      "channels": null,
+      "frames": null,
+      "bytes": 133004
+    }
+  ],
+  "channels": [
+    {
+      "id": "00000000-0000-0000-0000-0000c4a00001",
+      "name": "Sine sample",
+      "color": [
+        135,
+        200,
+        162
+      ],
+      "instrument": {
+        "id": "00000000-0000-0000-0000-000014570002",
+        "format": "native",
+        "type_id": "native.sampler",
+        "display_name": "",
+        "vendor": "",
+        "version": "",
+        "state_version": 1,
+        "state": {
+          "asset_id": "a6bb55fd15b5061e9e966676282ac8d43e7befc65f227e9e68c8f1b3712e8d15",
+          "end": 1.0,
+          "env": {
+            "attack_s": 0.0020000000949949026,
+            "decay_s": 0.10000000149011612,
+            "release_s": 0.07999999821186066,
+            "sustain": 1.0
+          },
+          "fine_cents": 0.0,
+          "gain_db": 0.0,
+          "loop_crossfade_ms": 5.0,
+          "loop_end": 1.0,
+          "loop_mode": "off",
+          "loop_start": 0.0,
+          "max_voices": 16,
+          "name": "Sine",
+          "one_shot": false,
+          "pan": 0.0,
+          "root_pitch": 69,
+          "start": 0.0,
+          "velocity_sensitivity": 0.800000011920929,
+          "version": 1
+        },
+        "bypass": false,
+        "mix": 1.0
+      },
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "mute": false,
+      "solo": false,
+      "mixer_id": "00000000-0000-0000-0000-000031000002"
+    },
+    {
+      "id": "00000000-0000-0000-0000-0000c4a00002",
+      "name": "SoundFont",
+      "color": null,
+      "instrument": {
+        "id": "00000000-0000-0000-0000-000014570003",
+        "format": "native",
+        "type_id": "native.sf2",
+        "display_name": "",
+        "vendor": "",
+        "version": "",
+        "state_version": 1,
+        "state": {
+          "asset_id": "594767450285f0c2ed9bc52abf5d5a46eb8fb1bbc4d8928a9e24da99e63e4059",
+          "bank": 0,
+          "bend_range": 2.0,
+          "gain_db": 0.0,
+          "max_voices": 32,
+          "preset": 0,
+          "version": 1
+        },
+        "bypass": false,
+        "mix": 1.0
+      },
+      "gain_db": 0.0,
+      "pan": 0.0,
+      "mute": false,
+      "solo": false,
+      "mixer_id": "00000000-0000-0000-0000-000031000003"
+    }
+  ],
+  "patterns": [
+    {
+      "id": "00000000-0000-0000-0000-00009a770001",
+      "name": "Motif",
+      "color": null,
+      "length_ticks": 3840,
+      "steps": 16,
+      "step_ticks": 240,
+      "lanes": [
+        {
+          "channel_id": "00000000-0000-0000-0000-0000c4a00001",
+          "notes": [
+            {
+              "id": "00000000-0000-0000-0000-000000000001",
+              "tick": 0,
+              "duration_ticks": 480,
+              "pitch": 60,
+              "velocity": 0.9,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000002",
+              "tick": 480,
+              "duration_ticks": 480,
+              "pitch": 64,
+              "velocity": 0.8,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000003",
+              "tick": 960,
+              "duration_ticks": 480,
+              "pitch": 67,
+              "velocity": 0.8,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000004",
+              "tick": 1440,
+              "duration_ticks": 480,
+              "pitch": 72,
+              "velocity": 0.9,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000005",
+              "tick": 1920,
+              "duration_ticks": 960,
+              "pitch": 67,
+              "velocity": 0.7,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000006",
+              "tick": 1920,
+              "duration_ticks": 960,
+              "pitch": 60,
+              "velocity": 0.7,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-000000000007",
+              "tick": 2880,
+              "duration_ticks": 960,
+              "pitch": 64,
+              "velocity": 0.8,
+              "channel": 0
+            }
+          ],
+          "controllers": []
+        },
+        {
+          "channel_id": "00000000-0000-0000-0000-0000c4a00002",
+          "notes": [
+            {
+              "id": "00000000-0000-0000-0000-00000000000a",
+              "tick": 0,
+              "duration_ticks": 1920,
+              "pitch": 69,
+              "velocity": 0.8,
+              "channel": 0
+            },
+            {
+              "id": "00000000-0000-0000-0000-00000000000b",
+              "tick": 1920,
+              "duration_ticks": 1920,
+              "pitch": 84,
+              "velocity": 0.8,
+              "channel": 0
+            }
+          ],
+          "controllers": []
+        }
+      ]
+    }
+  ],
+  "tracks": [],
+  "clips": [],
+  "mixer": {
+    "master_id": "00000000-0000-0000-0000-000031000001",
+    "channels": [
+      {
+        "id": "00000000-0000-0000-0000-000031000001",
+        "name": "Master",
+        "color": null,
+        "gain_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false,
+        "inserts": [],
+        "sends": [],
+        "output_id": null
+      },
+      {
+        "id": "00000000-0000-0000-0000-000031000002",
+        "name": "Insert 1",
+        "color": null,
+        "gain_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false,
+        "inserts": [],
+        "sends": [],
+        "output_id": "00000000-0000-0000-0000-000031000001"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000031000003",
+        "name": "SoundFont",
+        "color": null,
+        "gain_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false,
+        "inserts": [],
+        "sends": [],
+        "output_id": "00000000-0000-0000-0000-000031000001"
+      }
+    ],
+    "master_protection": true
+  },
+  "automation": [],
+  "midi_mappings": [],
+  "loop": null,
+  "selected_pattern": "00000000-0000-0000-0000-00009a770001"
+}

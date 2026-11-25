@@ -25,3 +25,5 @@ rustc-ice-*.txt
 
 # Generated fixtures (regenerate with `cargo xtask fixtures`); the demo project is committed.
 fixtures/*.wav
+fixtures/*.sf2
+fixtures/demo-sampler.rawdawg/assets/

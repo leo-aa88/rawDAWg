@@ -151,6 +151,23 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok(("identical model and render after reload".into(), Some(dir.display().to_string())))
     }));
+    checks.push(check("HL-08 sampler + SoundFont demo renders from imported assets", &["SYN-09", "IO-05", "DATA-01"], || {
+        let dir = root.join("fixtures/demo-sampler.rawdawg");
+        let p = rawdawg_project::load_project_dir(&dir)?;
+        let opts = OfflineOptions { tail_seconds: 0.0, project_dir: Some(dir.clone()), ..Default::default() };
+        let (l, _, stats) = render_project(&p, &opts)?;
+        if stats.nonfinite_blocks > 0 {
+            bail!("nonfinite blocks");
+        }
+        let f = dominant_frequency(&l[2000..20_000], 48_000.0);
+        if (f - 440.0).abs() > 1.5 {
+            bail!("expected the sample and SF2 zone at 440 Hz on beat 1, measured {f:.2} Hz");
+        }
+        if rawdawg_dsp::math::rms(&l[2000..20_000]) < 0.05 {
+            bail!("render too quiet");
+        }
+        Ok((format!("{} frames, beat 1 fundamental {f:.2} Hz, peak {:.3}", stats.frames, stats.peak), Some(dir.display().to_string())))
+    }));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");
@@ -298,7 +315,7 @@ pub fn bench_audio(root: &Path, seconds: f64) -> anyhow::Result<()> {
         .collect();
     let limits = rawdawg_types::limits::EngineLimits::DEFAULT;
     let block = 256usize;
-    let plan = rawdawg_audio_engine::plan::compile(&p, 1, block, &limits, &std::collections::HashMap::new())?.plan;
+    let plan = rawdawg_audio_engine::plan::compile(&p, 1, block, &limits, &std::collections::HashMap::new(), &rawdawg_audio_engine::NoAssets)?.plan;
     let (mut engine, mut handle) = Engine::new(rawdawg_types::SampleRate::DEFAULT, block, &limits);
     engine.install_plan(plan);
     handle.send(EngineCommand::Play).ok();

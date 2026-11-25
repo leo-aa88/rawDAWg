@@ -81,7 +81,7 @@ fn pattern_loop_retriggers_and_truncates_at_boundary() {
     let mut p = project_with_notes(&[(0, 960, 60), (960, 960, 72)]);
     p.patterns[0].length_ticks = Tick(1920);
     let limits = EngineLimits::DEFAULT;
-    let plan = compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan;
+    let plan = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
     engine.install_plan(plan);
     handle.send(EngineCommand::Play).unwrap();
@@ -119,7 +119,7 @@ fn stop_releases_notes_and_seek_has_no_retroactive_attack() {
     let p = project_with_notes(&[(0, 3840, 60)]);
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 512, &limits);
-    engine.install_plan(compile(&p, 1, 512, &limits, &Default::default()).unwrap().plan);
+    engine.install_plan(compile(&p, 1, 512, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     let mut l = vec![0.0f32; 512];
     let mut r = vec![0.0f32; 512];
@@ -153,7 +153,7 @@ fn live_events_reach_the_instrument_and_panic_releases() {
     let channel = p.channels[0].id;
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
-    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan);
+    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
     handle.send(EngineCommand::Live { channel, event: TimedEvent::note_on(0, EventSource::TypingKeyboard, 0, 1, 69, 0.8) }).unwrap();
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
@@ -187,7 +187,7 @@ fn plan_swap_at_block_boundary_keeps_audio_running_and_retires_off_rt() {
     let p = project_with_notes(&[(0, 3840, 60)]);
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
-    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan);
+    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
@@ -196,7 +196,7 @@ fn plan_swap_at_block_boundary_keeps_audio_running_and_retires_off_rt() {
     }
     let mut p2 = p.clone();
     p2.channels[0].gain_db = rawdawg_types::units::Db(-20.0);
-    assert!(handle.publish_plan(compile(&p2, 2, 256, &limits, &Default::default()).unwrap().plan).is_ok());
+    assert!(handle.publish_plan(compile(&p2, 2, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan).is_ok());
     engine.render_block(&mut l, &mut r);
     assert_eq!(engine.status().plan_revision.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert_eq!(handle.collect_retired(), 1);
@@ -209,7 +209,7 @@ fn render_block_is_allocation_free_under_traffic() {
     let channel = p.channels[0].id;
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 2048, &limits);
-    engine.install_plan(compile(&p, 1, 2048, &limits, &Default::default()).unwrap().plan);
+    engine.install_plan(compile(&p, 1, 2048, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     handle.send(EngineCommand::SetMetronome(true)).unwrap();
     let mut l = vec![0.0f32; 2048];
@@ -317,7 +317,7 @@ fn plan_swap_carries_live_voices_when_state_fingerprint_matches() {
     let p = project_with_notes(&[(0, 3840, 60)]);
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
-    let first = compile(&p, 1, 256, &limits, &HashMap::new()).unwrap();
+    let first = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
     let live = first.fingerprints.clone();
     engine.install_plan(first.plan);
     handle.send(EngineCommand::Play).unwrap();
@@ -334,7 +334,7 @@ fn plan_swap_carries_live_voices_when_state_fingerprint_matches() {
     // same instrument state, different mixer gain → carry over, no retrigger
     let mut p2 = p.clone();
     p2.mixer.channels[0].gain_db = rawdawg_types::units::Db(-3.0);
-    let second = compile(&p2, 2, 256, &limits, &live).unwrap();
+    let second = compile(&p2, 2, 256, &limits, &live, &rawdawg_audio_engine::NoAssets).unwrap();
     assert!(second.plan.channels[0].carry_over);
     assert!(second.table_senders.is_empty(), "carried-over instance keeps its live table channel");
     assert!(handle.publish_plan(second.plan).is_ok());
@@ -355,10 +355,48 @@ fn plan_swap_carries_live_voices_when_state_fingerprint_matches() {
     // changed instrument state → not carried over: fresh processor, old voice gone
     let mut p3 = p2.clone();
     p3.channels[0].instrument.state = serde_json::to_value(rawdawg_synthesizer::Patch { name: "other".into(), ..rawdawg_synthesizer::Patch::default() }).unwrap();
-    let third = compile(&p3, 3, 256, &limits, &second.fingerprints).unwrap();
+    let third = compile(&p3, 3, 256, &limits, &second.fingerprints, &rawdawg_audio_engine::NoAssets).unwrap();
     assert!(!third.plan.channels[0].carry_over);
     assert_eq!(third.table_senders.len(), 1);
     assert!(handle.publish_plan(third.plan).is_ok());
     engine.render_block(&mut l, &mut r);
     assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn sampler_channel_renders_imported_asset_from_project_folder() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    let root = std::env::temp_dir().join(format!("rawdawg-engine-sampler-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // 0.5 s 440 Hz tone, 48 kHz mono 16-bit
+    let wav = root.join("tone.wav");
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for i in 0..24_000 {
+        w.write_sample(((std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() * 16000.0) as i16).unwrap();
+    }
+    w.finalize().unwrap();
+    let dir = root.join("S.rawdawg");
+    let mut p = project_with_notes(&[(0, 960, 69)]);
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    let asset = rawdawg_project::assets::import_asset(&dir, &wav).unwrap();
+    p.assets.push(asset.clone());
+    let patch = rawdawg_sampler::SamplerPatch {
+        asset_id: Some(asset.id.clone()),
+        root_pitch: 69,
+        env: rawdawg_dsp::envelope::AdsrParams { attack_s: 0.0, decay_s: 0.0, sustain: 1.0, release_s: 0.01 },
+        ..rawdawg_sampler::SamplerPatch::default()
+    };
+    p.channels[0].instrument = rawdawg_project::Instance::native(rawdawg_types::ids::native_types::SAMPLER, serde_json::to_value(&patch).unwrap());
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    let reloaded = rawdawg_project::load_project_dir(&dir).unwrap();
+    let opts = OfflineOptions { tail_seconds: 0.0, project_dir: Some(dir.clone()), ..Default::default() };
+    let (l, _, _) = render_project(&reloaded, &opts).unwrap();
+    assert!(rms(&l[2000..20_000]) > 0.1, "sampler channel sounds");
+    assert!((dominant_frequency(&l[2000..20_000], 48_000.0) - 440.0).abs() < 1.0);
+    // without the project folder the asset cannot be resolved: silent, not an error
+    let (l2, _, _) = render_project(&reloaded, &OfflineOptions { tail_seconds: 0.0, project_dir: None, ..Default::default() }).unwrap();
+    assert_eq!(peak(&l2), 0.0);
+    let _ = std::fs::remove_dir_all(&root);
 }

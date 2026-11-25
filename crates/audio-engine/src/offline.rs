@@ -23,11 +23,23 @@ pub struct OfflineOptions {
     /// Bypass master protection (unprotected float export, explicit choice).
     pub unprotected: bool,
     pub metronome: bool,
+    /// Project folder for resolving assets (samples, SoundFonts); `None` = no assets.
+    pub project_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for OfflineOptions {
     fn default() -> Self {
-        Self { mode: TransportMode::Pattern, start_tick: Tick::ZERO, end_tick: None, tail_seconds: 1.0, block_frames: 256, sample_rate: None, unprotected: false, metronome: false }
+        Self {
+            mode: TransportMode::Pattern,
+            start_tick: Tick::ZERO,
+            end_tick: None,
+            tail_seconds: 1.0,
+            block_frames: 256,
+            sample_rate: None,
+            unprotected: false,
+            metronome: false,
+            project_dir: None,
+        }
     }
 }
 
@@ -68,7 +80,9 @@ pub fn render_project(project: &Project, opts: &OfflineOptions) -> Result<(Vec<f
     let rate = project.sample_rate_hz;
     let limits = EngineLimits::DEFAULT;
     let block = opts.block_frames.clamp(1, limits.max_block_frames as usize);
-    let plan = compile(&project, 1, block, &limits, &std::collections::HashMap::new())?.plan;
+    let mut cache = crate::assets::ProjectAssetCache::new(opts.project_dir.clone());
+    cache.sync(opts.project_dir.clone(), &project);
+    let plan = compile(&project, 1, block, &limits, &std::collections::HashMap::new(), &cache)?.plan;
     let sched = match opts.mode {
         TransportMode::Pattern => &plan.pattern_schedule,
         TransportMode::Song => &plan.song_schedule,

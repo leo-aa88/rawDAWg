@@ -1,6 +1,7 @@
 //! Editable project model (PROJECT_FORMAT.md). Pure data: no DSP objects,
 //! no runtime pointers, no device or GUI dependencies.
 
+pub mod assets;
 pub mod commands;
 pub mod model;
 pub mod persist;

@@ -11,6 +11,7 @@ publish.workspace = true
 rawdawg-types = { path = "../crates/types" }
 rawdawg-dsp = { path = "../crates/dsp" }
 rawdawg-synthesizer = { path = "../crates/synthesizer" }
+rawdawg-sampler = { path = "../crates/sampler" }
 rawdawg-project = { path = "../crates/project" }
 rawdawg-audio-engine = { path = "../crates/audio-engine" }
 rawdawg-audio-io = { path = "../crates/audio-io" }

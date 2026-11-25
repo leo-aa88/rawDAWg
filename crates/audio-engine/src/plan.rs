@@ -1,5 +1,6 @@
 //! Compile a project into a prepared render plan (off the RT thread).
 
+use crate::assets::AssetResolver;
 use crate::schedule::Schedule;
 use rawdawg_dsp::limiter::PeakLimiter;
 use rawdawg_dsp::processor::{PrepareSpec, Processor};
@@ -93,18 +94,41 @@ pub fn fingerprint_state(type_id: &str, state: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-/// Build a processor for a native instrument instance, plus its live table channel.
-fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str) -> Result<(Box<dyn Processor>, Option<TableSender>), CompileError> {
+fn state_bytes(inst: &rawdawg_project::Instance, channel_name: &str) -> Result<Option<Vec<u8>>, CompileError> {
+    if inst.state.is_null() || !inst.state.as_object().is_some_and(|o| !o.is_empty()) {
+        return Ok(None);
+    }
+    serde_json::to_vec(&inst.state).map(Some).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e.to_string()))
+}
+
+/// Build an (unprepared) processor for a native instrument instance, plus its
+/// live table channel for synths. Also used by the app for main-thread mirrors.
+pub fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str, assets: &dyn AssetResolver) -> Result<(Box<dyn Processor>, Option<TableSender>), CompileError> {
     match inst.type_id.as_str() {
         rawdawg_types::ids::native_types::SYNTH => {
             let mut synth = Synth::default();
-            if !inst.state.is_null() && inst.state.as_object().is_some_and(|o| !o.is_empty()) {
-                let bytes = serde_json::to_vec(&inst.state).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e.to_string()))?;
+            if let Some(bytes) = state_bytes(inst, channel_name)? {
                 synth.load_state(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e))?;
             }
             let (sender, inbox) = rawdawg_synthesizer::table_channel();
             synth.set_table_inbox(inbox);
             Ok((Box::new(synth), Some(sender)))
+        }
+        rawdawg_types::ids::native_types::SAMPLER => {
+            let patch = match state_bytes(inst, channel_name)? {
+                Some(bytes) => rawdawg_sampler::SamplerPatch::from_json(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e))?,
+                None => rawdawg_sampler::SamplerPatch::default(),
+            };
+            let asset = patch.asset_id.as_ref().and_then(|id| assets.sample(id));
+            Ok((Box::new(rawdawg_sampler::Sampler::new(patch, asset)), None))
+        }
+        rawdawg_types::ids::native_types::SF2 => {
+            let patch = match state_bytes(inst, channel_name)? {
+                Some(bytes) => serde_json::from_slice::<rawdawg_sampler::Sf2Patch>(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e.to_string()))?,
+                None => rawdawg_sampler::Sf2Patch::default(),
+            };
+            let font = patch.asset_id.as_ref().and_then(|id| assets.soundfont(id));
+            Ok((Box::new(rawdawg_sampler::Sf2Player::new(patch, font)), None))
         }
         other => Err(CompileError::UnsupportedInstrument(other.to_owned())),
     }
@@ -124,7 +148,14 @@ pub struct CompileOutput {
 /// `live` maps instance ids to the fingerprint of the state the currently running
 /// processor is known to hold; matching nodes are flagged `carry_over` so the
 /// audio thread migrates their voices/tables instead of restarting them.
-pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &EngineLimits, live: &HashMap<InstanceId, u64>) -> Result<CompileOutput, CompileError> {
+pub fn compile(
+    project: &Project,
+    revision: u64,
+    max_frames: usize,
+    limits: &EngineLimits,
+    live: &HashMap<InstanceId, u64>,
+    assets: &dyn AssetResolver,
+) -> Result<CompileOutput, CompileError> {
     rawdawg_project::validate(project).map_err(|e| CompileError::Invalid(e.to_string()))?;
     if project.channels.len() + project.mixer.channels.len() > limits.max_processing_nodes as usize {
         return Err(CompileError::Limit(format!("{} processing nodes (max {})", project.channels.len() + project.mixer.channels.len(), limits.max_processing_nodes)));
@@ -177,7 +208,7 @@ pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &Eng
     let mut table_senders = Vec::new();
     let mut fingerprints = HashMap::new();
     for c in &project.channels {
-        let (mut processor, sender) = make_instrument(&c.instrument, &c.name)?;
+        let (mut processor, sender) = make_instrument(&c.instrument, &c.name, assets)?;
         processor.prepare(&spec).map_err(|e| CompileError::Prepare(c.name.clone(), e.to_string()))?;
         let fingerprint = fingerprint_state(c.instrument.type_id.as_str(), &c.instrument.state);
         let carry_over = live.get(&c.instrument.id) == Some(&fingerprint);

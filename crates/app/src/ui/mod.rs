@@ -2,6 +2,7 @@
 //! keyboards, synth parameter panel, settings, status.
 
 mod evolve;
+mod instrument_panel;
 mod keyboard;
 mod presets;
 mod settings;
@@ -81,6 +82,12 @@ pub(crate) struct App {
     pub live_fingerprints: HashMap<rawdawg_types::InstanceId, u64>,
     /// Live wavetable channels into running synth instances.
     pub table_senders: HashMap<rawdawg_types::InstanceId, rawdawg_synthesizer::TableSender>,
+    /// Decoded project assets (samples, SoundFonts), synced to the open project.
+    pub assets: rawdawg_audio_engine::ProjectAssetCache,
+    /// Main-thread mirrors for non-synth native instruments.
+    pub other_mirrors: HashMap<rawdawg_types::InstanceId, Box<dyn rawdawg_dsp::processor::Processor>>,
+    pub instrument_panel: instrument_panel::InstrumentPanelState,
+    pub import_path: String,
     pub synth_panel: synth_panel::SynthPanelState,
     pub keyboard: keyboard::KeyboardState,
     pub settings: settings::SettingsState,
@@ -158,6 +165,10 @@ impl App {
             synth_mirrors: HashMap::new(),
             live_fingerprints: HashMap::new(),
             table_senders: HashMap::new(),
+            assets: rawdawg_audio_engine::ProjectAssetCache::new(None),
+            other_mirrors: HashMap::new(),
+            instrument_panel: Default::default(),
+            import_path: String::new(),
             synth_panel: Default::default(),
             keyboard: Default::default(),
             settings: settings::SettingsState::from_request(&req),
@@ -176,6 +187,7 @@ impl App {
     /// Recreate main-thread synth mirrors from the project's instrument states.
     pub(crate) fn rebuild_mirrors(&mut self) {
         self.synth_mirrors.clear();
+        self.other_mirrors.clear();
         for c in &self.project.channels {
             if c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH {
                 let mut s = Synth::default();
@@ -197,7 +209,8 @@ impl App {
         let mut project = self.project.clone();
         project.sample_rate_hz = sys.sample_rate;
         self.plan_revision += 1;
-        match compile(&project, self.plan_revision, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &self.limits, &self.live_fingerprints) {
+        self.assets.sync(self.project_path.clone(), &self.project);
+        match compile(&project, self.plan_revision, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &self.limits, &self.live_fingerprints, &self.assets) {
             Ok(out) => {
                 sys.handle.collect_retired();
                 match sys.handle.publish_plan(out.plan) {
@@ -240,10 +253,89 @@ impl App {
     }
 
     fn rebuild_mirrors_if_needed(&mut self) {
-        let ids: Vec<_> = self.project.channels.iter().map(|c| c.instrument.id).collect();
-        if ids.len() != self.synth_mirrors.len() || ids.iter().any(|i| !self.synth_mirrors.contains_key(i)) {
+        let synth_ids: Vec<_> =
+            self.project.channels.iter().filter(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH).map(|c| c.instrument.id).collect();
+        if synth_ids.len() != self.synth_mirrors.len() || synth_ids.iter().any(|i| !self.synth_mirrors.contains_key(i)) {
             self.rebuild_mirrors();
         }
+    }
+
+    /// Folder that holds this project's managed assets; unsaved projects get a
+    /// per-user working folder so imports never depend on naming the project first.
+    pub(crate) fn working_dir(&mut self) -> Option<PathBuf> {
+        if let Some(p) = &self.project_path {
+            return Some(p.clone());
+        }
+        let dir = directories::ProjectDirs::from("", "", rawdawg_types::PACKAGE_NAME)?.data_dir().join("unsaved").join(format!("{}.rawdawg", self.project.project_id));
+        if rawdawg_project::save_project_dir(&dir, &self.project).is_err() {
+            return None;
+        }
+        self.project_path = Some(dir.clone());
+        self.status_line = format!("Working folder {}", dir.display());
+        Some(dir)
+    }
+
+    /// Import a WAV/FLAC/MP3 as a sampler channel or an .sf2 as a SoundFont channel.
+    pub(crate) fn import_file_as_channel(&mut self, path: &std::path::Path) {
+        let Some(dir) = self.working_dir() else {
+            self.status_line = "No writable folder for assets".into();
+            return;
+        };
+        let asset = match rawdawg_project::assets::import_asset(&dir, path) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status_line = format!("Import failed: {e}");
+                return;
+            }
+        };
+        let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Sample".into());
+        let (type_id, state) = match asset.kind {
+            rawdawg_project::AssetKind::Sf2 => (
+                rawdawg_types::ids::native_types::SF2,
+                serde_json::to_value(rawdawg_sampler::Sf2Patch { asset_id: Some(asset.id.clone()), ..Default::default() }).unwrap_or(serde_json::Value::Null),
+            ),
+            rawdawg_project::AssetKind::Audio => (
+                rawdawg_types::ids::native_types::SAMPLER,
+                serde_json::to_value(rawdawg_sampler::SamplerPatch { asset_id: Some(asset.id.clone()), name: name.clone(), ..Default::default() })
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            _ => {
+                self.status_line = format!("{} is not an instrument file (MIDI import arrives in M5)", path.display());
+                return;
+            }
+        };
+        let master = self.project.mixer.master_id;
+        let mixer = rawdawg_project::MixerChannel {
+            id: rawdawg_types::MixerChannelId::new(),
+            name: name.clone(),
+            color: None,
+            gain_db: rawdawg_types::units::Db::UNITY,
+            pan: rawdawg_types::units::Pan::CENTER,
+            mute: false,
+            solo: false,
+            inserts: vec![],
+            sends: vec![],
+            output_id: Some(master),
+        };
+        let channel = rawdawg_project::Channel {
+            id: rawdawg_types::ChannelId::new(),
+            name,
+            color: None,
+            instrument: rawdawg_project::Instance::native(type_id, state),
+            gain_db: rawdawg_types::units::Db::UNITY,
+            pan: rawdawg_types::units::Pan::CENTER,
+            mute: false,
+            solo: false,
+            mixer_id: mixer.id,
+        };
+        let new_id = channel.id;
+        self.apply(Command::Batch {
+            commands: vec![Command::AddAsset { asset }, Command::AddMixerChannel { channel: mixer, index: None }, Command::AddChannel { channel, index: None }],
+        });
+        self.selected_channel = Some(new_id);
+        self.editor_view = EditorView::Synth;
+        let problems = rawdawg_audio_engine::AssetResolver::problems(&self.assets);
+        self.status_line = if problems.is_empty() { format!("Imported {}", path.display()) } else { problems.join("; ") };
     }
 
     pub(crate) fn undo(&mut self) {
@@ -546,8 +638,13 @@ impl App {
         egui::CollapsingHeader::new("Effects").show(ui, |ui| {
             ui.label(egui::RichText::new("Native effects arrive in M4").color(theme::TEXT_SECONDARY));
         });
-        egui::CollapsingHeader::new("Samples").show(ui, |ui| {
-            ui.label(egui::RichText::new("Sampler and SF2 arrive in M2").color(theme::TEXT_SECONDARY));
+        egui::CollapsingHeader::new("Samples & SoundFonts").default_open(true).show(ui, |ui| {
+            ui.label(egui::RichText::new("Drop a .wav/.flac/.mp3 or .sf2 onto the window, or type a path:").color(theme::TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/path/to/sound.wav").desired_width(f32::INFINITY));
+            if ui.button("Import as new channel").clicked() && !self.import_path.trim().is_empty() {
+                let p = PathBuf::from(self.import_path.trim());
+                self.import_file_as_channel(&p);
+            }
         });
     }
 
@@ -604,9 +701,25 @@ impl App {
                 if ui.toggle_value(&mut solo, "S").on_hover_text("Solo").changed() {
                     cmds.push(Command::SetChannelSolo { id: ch.id, solo });
                 }
-                if ui.button(egui::RichText::new(&ch.name).strong()).on_hover_text("Open instrument editor").clicked() {
+                if ui.button(egui::RichText::new(&ch.name).strong()).on_hover_text("Open instrument editor (right-click: rename/delete)").clicked() {
                     select = Some(ch.id);
                     self.editor_view = EditorView::Synth;
+                }
+                let r = ui.small_button("…").on_hover_text("Rename / delete");
+                r.context_menu(|ui| {
+                    ui.label("Rename");
+                    let mut name = ch.name.clone();
+                    if ui.text_edit_singleline(&mut name).lost_focus() && name != ch.name && !name.trim().is_empty() {
+                        cmds.push(Command::RenameChannel { id: ch.id, name: name.trim().to_owned() });
+                        ui.close();
+                    }
+                    if ui.button("Delete channel (undoable)").clicked() {
+                        cmds.push(Command::RemoveChannel { id: ch.id });
+                        ui.close();
+                    }
+                });
+                if r.clicked() {
+                    // the context menu opens on secondary click; a primary click opens it too
                 }
                 let mut gain = ch.gain_db.0;
                 let r = ui.add(egui::Slider::new(&mut gain, -60.0..=12.0).suffix(" dB").fixed_decimals(1).show_value(true));
@@ -638,7 +751,13 @@ impl App {
                     let _ = self.history.commit_gesture();
                     self.recompile();
                 }
-                ui.label(egui::RichText::new(ch.instrument.type_id.as_str()).color(theme::TEXT_SECONDARY));
+                let kind = match ch.instrument.type_id.as_str() {
+                    rawdawg_types::ids::native_types::SYNTH => "synth",
+                    rawdawg_types::ids::native_types::SAMPLER => "sample",
+                    rawdawg_types::ids::native_types::SF2 => "soundfont",
+                    other => other,
+                };
+                ui.label(egui::RichText::new(kind).color(theme::TEXT_SECONDARY));
             });
         }
         if let Some(id) = select {
@@ -826,6 +945,10 @@ impl eframe::App for App {
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        for p in dropped {
+            self.import_file_as_channel(&p);
+        }
         for sender in self.table_senders.values_mut() {
             sender.collect_retired();
         }
@@ -867,7 +990,17 @@ impl eframe::App for App {
         egui::Panel::bottom("editor").resizable(true).default_size(380.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.editor_view {
                 EditorView::Rack => self.rack(ui),
-                EditorView::Synth => synth_panel::show(self, ui),
+                EditorView::Synth => {
+                    let is_synth =
+                        self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);
+                    match (is_synth, self.selected_channel.and_then(|id| self.project.channel(id)).map(|c| c.instrument.id)) {
+                        (true, _) => synth_panel::show(self, ui),
+                        (false, Some(inst)) => instrument_panel::show(self, ui, inst),
+                        _ => {
+                            ui.label("Select a channel in the rack.");
+                        }
+                    }
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |ui| {

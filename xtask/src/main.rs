@@ -95,7 +95,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(parent) = output.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let opts = rawdawg_audio_engine::OfflineOptions { mode, ..Default::default() };
+            let opts = rawdawg_audio_engine::OfflineOptions { mode, project_dir: rawdawg_project::persist::resolve_project_dir(&project).ok(), ..Default::default() };
             let t = Instant::now();
             let stats = rawdawg_audio_engine::offline::render_project_to_wav(&p, &opts, rawdawg_audio_engine::offline::WavFormat::Float32, &output)?;
             println!(
