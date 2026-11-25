@@ -68,7 +68,7 @@ pub fn render_project(project: &Project, opts: &OfflineOptions) -> Result<(Vec<f
     let rate = project.sample_rate_hz;
     let limits = EngineLimits::DEFAULT;
     let block = opts.block_frames.clamp(1, limits.max_block_frames as usize);
-    let plan = compile(&project, 1, block, &limits)?;
+    let plan = compile(&project, 1, block, &limits, &std::collections::HashMap::new())?.plan;
     let sched = match opts.mode {
         TransportMode::Pattern => &plan.pattern_schedule,
         TransportMode::Song => &plan.song_schedule,

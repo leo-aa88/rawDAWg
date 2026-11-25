@@ -298,7 +298,7 @@ pub fn bench_audio(root: &Path, seconds: f64) -> anyhow::Result<()> {
         .collect();
     let limits = rawdawg_types::limits::EngineLimits::DEFAULT;
     let block = 256usize;
-    let plan = rawdawg_audio_engine::plan::compile(&p, 1, block, &limits)?;
+    let plan = rawdawg_audio_engine::plan::compile(&p, 1, block, &limits, &std::collections::HashMap::new())?.plan;
     let (mut engine, mut handle) = Engine::new(rawdawg_types::SampleRate::DEFAULT, block, &limits);
     engine.install_plan(plan);
     handle.send(EngineCommand::Play).ok();

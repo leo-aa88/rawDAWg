@@ -81,7 +81,7 @@ fn pattern_loop_retriggers_and_truncates_at_boundary() {
     let mut p = project_with_notes(&[(0, 960, 60), (960, 960, 72)]);
     p.patterns[0].length_ticks = Tick(1920);
     let limits = EngineLimits::DEFAULT;
-    let plan = compile(&p, 1, 256, &limits).unwrap();
+    let plan = compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
     engine.install_plan(plan);
     handle.send(EngineCommand::Play).unwrap();
@@ -119,7 +119,7 @@ fn stop_releases_notes_and_seek_has_no_retroactive_attack() {
     let p = project_with_notes(&[(0, 3840, 60)]);
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 512, &limits);
-    engine.install_plan(compile(&p, 1, 512, &limits).unwrap());
+    engine.install_plan(compile(&p, 1, 512, &limits, &Default::default()).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     let mut l = vec![0.0f32; 512];
     let mut r = vec![0.0f32; 512];
@@ -153,7 +153,7 @@ fn live_events_reach_the_instrument_and_panic_releases() {
     let channel = p.channels[0].id;
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
-    engine.install_plan(compile(&p, 1, 256, &limits).unwrap());
+    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan);
     handle.send(EngineCommand::Live { channel, event: TimedEvent::note_on(0, EventSource::TypingKeyboard, 0, 1, 69, 0.8) }).unwrap();
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
@@ -187,7 +187,7 @@ fn plan_swap_at_block_boundary_keeps_audio_running_and_retires_off_rt() {
     let p = project_with_notes(&[(0, 3840, 60)]);
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
-    engine.install_plan(compile(&p, 1, 256, &limits).unwrap());
+    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default()).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     let mut l = vec![0.0f32; 256];
     let mut r = vec![0.0f32; 256];
@@ -196,7 +196,7 @@ fn plan_swap_at_block_boundary_keeps_audio_running_and_retires_off_rt() {
     }
     let mut p2 = p.clone();
     p2.channels[0].gain_db = rawdawg_types::units::Db(-20.0);
-    assert!(handle.publish_plan(compile(&p2, 2, 256, &limits).unwrap()).is_ok());
+    assert!(handle.publish_plan(compile(&p2, 2, 256, &limits, &Default::default()).unwrap().plan).is_ok());
     engine.render_block(&mut l, &mut r);
     assert_eq!(engine.status().plan_revision.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert_eq!(handle.collect_retired(), 1);
@@ -209,7 +209,7 @@ fn render_block_is_allocation_free_under_traffic() {
     let channel = p.channels[0].id;
     let limits = EngineLimits::DEFAULT;
     let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 2048, &limits);
-    engine.install_plan(compile(&p, 1, 2048, &limits).unwrap());
+    engine.install_plan(compile(&p, 1, 2048, &limits, &Default::default()).unwrap().plan);
     handle.send(EngineCommand::Play).unwrap();
     handle.send(EngineCommand::SetMetronome(true)).unwrap();
     let mut l = vec![0.0f32; 2048];
@@ -309,4 +309,56 @@ fn song_mode_renders_clips_with_tempo_map() {
     assert_eq!(peak(&l[..95_900]), 0.0);
     assert!(rms(&l[100_000..140_000]) > 0.02, "note at bar 2 sounds for a whole 60 BPM beat");
     assert!(rms(&l[150_000..180_000]) < 0.01, "note released after one beat");
+}
+
+#[test]
+fn plan_swap_carries_live_voices_when_state_fingerprint_matches() {
+    use std::collections::HashMap;
+    let p = project_with_notes(&[(0, 3840, 60)]);
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let first = compile(&p, 1, 256, &limits, &HashMap::new()).unwrap();
+    let live = first.fingerprints.clone();
+    engine.install_plan(first.plan);
+    handle.send(EngineCommand::Play).unwrap();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // same instrument state, different mixer gain → carry over, no retrigger
+    let mut p2 = p.clone();
+    p2.mixer.channels[0].gain_db = rawdawg_types::units::Db(-3.0);
+    let second = compile(&p2, 2, 256, &limits, &live).unwrap();
+    assert!(second.plan.channels[0].carry_over);
+    assert!(second.table_senders.is_empty(), "carried-over instance keeps its live table channel");
+    assert!(handle.publish_plan(second.plan).is_ok());
+    for _ in 0..40 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    assert_eq!(engine.status().plan_revision.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1, "voice survived the swap");
+    // continuity across the swap boundary (block 40): no gap, no re-attack dip
+    let boundary = 40 * 256;
+    assert!(rms(&out[boundary - 2048..boundary]) > 0.02 && rms(&out[boundary..boundary + 2048]) > 0.02);
+    let max_jump = out[boundary - 256..boundary + 256].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+    assert!(max_jump < 0.2, "discontinuity at swap: {max_jump}");
+    assert_eq!(handle.collect_retired(), 1);
+    // changed instrument state → not carried over: fresh processor, old voice gone
+    let mut p3 = p2.clone();
+    p3.channels[0].instrument.state = serde_json::to_value(rawdawg_synthesizer::Patch { name: "other".into(), ..rawdawg_synthesizer::Patch::default() }).unwrap();
+    let third = compile(&p3, 3, 256, &limits, &second.fingerprints).unwrap();
+    assert!(!third.plan.channels[0].carry_over);
+    assert_eq!(third.table_senders.len(), 1);
+    assert!(handle.publish_plan(third.plan).is_ok());
+    engine.render_block(&mut l, &mut r);
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

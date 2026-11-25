@@ -342,3 +342,72 @@ fn multi_layer_patch_mixes_layers_with_pan() {
     assert!((fl - 220.0).abs() < 1.0, "{fl}");
     assert!((fr - 440.0).abs() < 1.0, "{fr}");
 }
+
+#[test]
+fn live_table_update_changes_sound_without_retrigger_and_retires_old_table() {
+    use rawdawg_dsp::wavetable::{TableBuilder, cycles};
+    use rawdawg_synthesizer::table_channel;
+    let (mut sender, inbox) = table_channel();
+    let mut synth = Synth::new(Patch::default());
+    synth.set_table_inbox(inbox);
+    synth.prepare(&PrepareSpec::new(SR, 256, BusLayout::Stereo)).unwrap();
+    let mut h = Harness { synth, l: vec![0.0; 256], r: vec![0.0; 256], transport: TransportView::stopped(SR) };
+    let before = h.render(24_000, 256, &[(0, on(1, 48, 1.0))]);
+    let (_, c_before, _) = features(&before[12_000..], SR);
+    // send a square table while the note is held
+    let mut b = TableBuilder::new();
+    let table = Box::new(b.build(&cycles::square(), true));
+    assert!(sender.send(0, table).is_ok(), "queued");
+    let during = h.render(2048, 256, &[]);
+    assert!(during.iter().all(|s| s.is_finite()));
+    // crossfade completes within ~8 ms (384 samples): no discontinuity larger than the
+    // signal's own slew (soft saw→square at C3 with 0.3 peak)
+    let max_jump = during.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+    assert!(max_jump < 0.25, "click during table swap: {max_jump}");
+    assert_eq!(h.synth.layer_xfade(0), 1.0);
+    let after = h.render(24_000, 256, &[]);
+    let (_, c_after, _) = features(&after[12_000..], SR);
+    assert!(rms(&after[12_000..]) > 0.02, "note still sounding (no retrigger/cut)");
+    assert!((c_after - c_before).abs() > c_before * 0.15, "spectrum changed: {c_before} -> {c_after}");
+    assert_eq!(h.synth.stats().active_voices, 1);
+    // the previous table came back for deallocation off the audio thread
+    assert_eq!(sender.collect_retired(), 1);
+    // stale generations are ignored: queue two, only the newest applies
+    let t1 = Box::new(b.build(&cycles::sine(), true));
+    let t2 = Box::new(b.build(&cycles::saw(), true));
+    assert!(sender.send(0, t1).is_ok());
+    assert!(sender.send(0, t2).is_ok());
+    h.render(4096, 256, &[]);
+    let (_, c_final, _) = features(&h.render(24_000, 256, &[])[12_000..], SR);
+    assert!(c_final > c_before * 0.8, "saw (newest) should be bright, got centroid {c_final}");
+    assert!(sender.collect_retired() >= 2);
+}
+
+#[test]
+fn migrate_from_carries_voices_and_tables_into_a_new_instance() {
+    use rawdawg_synthesizer::table_channel;
+    let (mut sender, inbox) = table_channel();
+    let mut old = Synth::new(Patch::default());
+    old.set_table_inbox(inbox);
+    old.prepare(&PrepareSpec::new(SR, 256, BusLayout::Stereo)).unwrap();
+    let mut h = Harness { synth: old, l: vec![0.0; 256], r: vec![0.0; 256], transport: TransportView::stopped(SR) };
+    h.render(12_000, 256, &[(0, on(1, 60, 1.0)), (0, on(2, 64, 0.8))]);
+    assert_eq!(h.synth.stats().active_voices, 2);
+    let mut new = Synth::new(Patch::default());
+    new.prepare(&PrepareSpec::new(SR, 256, BusLayout::Stereo)).unwrap();
+    new.migrate_from(&mut h.synth);
+    assert_eq!(h.synth.stats().active_voices, 0, "old instance is now silent");
+    let mut h2 = Harness { synth: new, l: vec![0.0; 256], r: vec![0.0; 256], transport: TransportView::stopped(SR) };
+    assert_eq!(h2.synth.stats().active_voices, 2);
+    let cont = h2.render(2048, 256, &[]);
+    assert!(rms(&cont) > 0.02, "voices keep sounding after migration");
+    assert!(cont.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max) < 0.25);
+    // the table inbox moved with the voices: a live table update still reaches them
+    let mut b = rawdawg_dsp::wavetable::TableBuilder::new();
+    assert!(sender.send(0, Box::new(b.build(&rawdawg_dsp::wavetable::cycles::square(), true))).is_ok());
+    h2.render(4096, 256, &[]);
+    assert_eq!(sender.collect_retired(), 1);
+    // releasing through the new instance works (note ids survived)
+    h2.render(48_000, 256, &[(0, off(1, 60)), (0, off(2, 64))]);
+    assert_eq!(h2.synth.stats().active_voices, 0);
+}

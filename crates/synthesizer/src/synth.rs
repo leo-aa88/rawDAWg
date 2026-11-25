@@ -3,6 +3,7 @@
 use crate::params::{self, DESCRIPTORS};
 use crate::patch::{Generator, Layer, MAX_LAYERS, Patch, VoiceMode};
 use crate::registry::{HeldNotes, NoteKey, SustainTable, source_slot};
+use crate::tables::TableInbox;
 use crate::voice::{LayerEngine, Voice};
 use rawdawg_dsp::math::sanitize;
 use rawdawg_dsp::oscillator::{BasicTables, BasicWave};
@@ -29,6 +30,10 @@ pub struct SynthStats {
 pub struct Synth {
     patch: Patch,
     layers: [LayerEngine; MAX_LAYERS],
+    inbox: Option<TableInbox>,
+    /// Boxed on purpose: unboxing would free the `Box` allocation on the audio thread.
+    #[allow(clippy::vec_box)]
+    pending_retire: Vec<Box<rawdawg_dsp::wavetable::MipTable>>,
     tables: Option<BasicTables>,
     voices: Vec<Voice>,
     sustain: SustainTable,
@@ -55,6 +60,8 @@ impl Synth {
         Self {
             patch,
             layers,
+            inbox: None,
+            pending_retire: Vec::with_capacity(crate::tables::TABLE_QUEUE_DEPTH * 2),
             tables: None,
             voices: Vec::new(),
             sustain: SustainTable::new(),
@@ -71,6 +78,67 @@ impl Synth {
 
     pub fn patch(&self) -> &Patch {
         &self.patch
+    }
+
+    /// Attach the RT side of a live wavetable channel (non-RT, before/after prepare).
+    pub fn set_table_inbox(&mut self, inbox: TableInbox) {
+        self.inbox = Some(inbox);
+    }
+
+    /// Per-layer crossfade progress (1.0 = settled), for tests/UI.
+    pub fn layer_xfade(&self, layer: usize) -> f32 {
+        self.layers.get(layer).map(|l| l.xfade).unwrap_or(1.0)
+    }
+
+    /// RT: apply queued table updates and retire finished crossfades.
+    fn poll_tables(&mut self) {
+        // retire anything parked earlier when the retire queue was full
+        if let Some(inbox) = self.inbox.as_mut() {
+            while let Some(t) = self.pending_retire.pop() {
+                if let Err(t) = inbox.retire(t) {
+                    self.pending_retire.push(t);
+                    break;
+                }
+            }
+        }
+        let sr = self.sample_rate as f32;
+        for _ in 0..crate::tables::TABLE_QUEUE_DEPTH {
+            let Some(inbox) = self.inbox.as_mut() else { return };
+            if !inbox.can_retire() {
+                return; // never swap without room to retire the old table
+            }
+            let Some(update) = inbox.pop() else { return };
+            if update.layer >= self.layers.len() {
+                let _ = inbox.retire(update.table);
+                continue;
+            }
+            if let Some(leftover) = self.layers[update.layer].install_table(update.table, sr)
+                && let Err(t) = inbox.retire(leftover)
+            {
+                self.pending_retire.push(t);
+            }
+            // a table arriving for a layer that was basic/disabled becomes playable
+            if self.patch.layers.get(update.layer).is_some_and(|l| !l.enabled) {
+                // keep patch semantics: table only sounds if the layer is enabled
+            }
+        }
+    }
+
+    /// RT: advance crossfades one sample for every layer, parking finished tables.
+    #[inline]
+    fn tick_xfades(&mut self) {
+        for l in self.layers.iter_mut() {
+            if let Some(done) = l.tick_xfade() {
+                match self.inbox.as_mut() {
+                    Some(inbox) => {
+                        if let Err(t) = inbox.retire(done) {
+                            self.pending_retire.push(t);
+                        }
+                    }
+                    None => self.pending_retire.push(done),
+                }
+            }
+        }
     }
 
     pub fn stats(&self) -> SynthStats {
@@ -447,11 +515,37 @@ impl Synth {
     }
 
     fn render_span(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
-        let Some(tables) = self.tables.as_ref() else { return };
-        for v in self.voices.iter_mut() {
-            if v.is_active() {
-                v.render_add(out_l, out_r, &self.patch, &self.layers, tables);
+        if self.tables.is_none() {
+            return;
+        }
+        let fading = self.layers.iter().any(|l| l.prev_table.is_some());
+        if !fading {
+            let tables = self.tables.as_ref().expect("checked above");
+            for v in self.voices.iter_mut() {
+                if v.is_active() {
+                    v.render_add(out_l, out_r, &self.patch, &self.layers, tables);
+                }
             }
+            return;
+        }
+        // During a table crossfade render in short sub-spans so the fade position
+        // advances smoothly for all voices (bounded: 16-sample steps).
+        let mut pos = 0;
+        let n = out_l.len();
+        while pos < n {
+            let end = (pos + 16).min(n);
+            {
+                let tables = self.tables.as_ref().expect("checked above");
+                for v in self.voices.iter_mut() {
+                    if v.is_active() {
+                        v.render_add(&mut out_l[pos..end], &mut out_r[pos..end], &self.patch, &self.layers, tables);
+                    }
+                }
+            }
+            for _ in pos..end {
+                self.tick_xfades();
+            }
+            pos = end;
         }
     }
 }
@@ -459,6 +553,40 @@ impl Synth {
 impl Processor for Synth {
     fn type_id(&self) -> &'static str {
         crate::TYPE_ID
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    /// Take over the live voices, note bookkeeping, tables and the table inbox from
+    /// the previously running instance. Bounded moves only; `old` ends up with this
+    /// instance's fresh (silent) state and is retired by the worker.
+    fn migrate_from(&mut self, old: &mut dyn Processor) {
+        let Some(old) = old.as_any_mut().downcast_mut::<Synth>() else { return };
+        if !old.prepared || !self.prepared || old.sample_rate != self.sample_rate || old.voices.len() != self.voices.len() {
+            return;
+        }
+        std::mem::swap(&mut self.voices, &mut old.voices);
+        std::mem::swap(&mut self.sustain, &mut old.sustain);
+        std::mem::swap(&mut self.held, &mut old.held);
+        std::mem::swap(&mut self.bend, &mut old.bend);
+        std::mem::swap(&mut self.age, &mut old.age);
+        std::mem::swap(&mut self.mono_active, &mut old.mono_active);
+        std::mem::swap(&mut self.layers, &mut old.layers);
+        std::mem::swap(&mut self.inbox, &mut old.inbox);
+        std::mem::swap(&mut self.pending_retire, &mut old.pending_retire);
+        self.master.snap(old.master.current());
+        // voices keep their envelope params from the old patch; refresh to ours (same state)
+        let (a, f) = (self.patch.amp_env, self.patch.filter_env);
+        for v in &mut self.voices {
+            v.set_envelopes(a, f);
+        }
+        for (i, le) in self.layers.iter_mut().enumerate() {
+            if let Some(layer) = self.patch.layers.get(i) {
+                le.update_mix(layer);
+            }
+        }
     }
 
     fn descriptors(&self) -> &'static [rawdawg_types::ParamDescriptor] {
@@ -486,6 +614,7 @@ impl Processor for Synth {
         if !self.prepared || ctx.audio.outputs.len() < 2 {
             return;
         }
+        self.poll_tables();
         let (first, rest) = ctx.audio.outputs.split_at_mut(1);
         let out_l: &mut [f32] = &mut first[0][..frames];
         let out_r: &mut [f32] = &mut rest[0][..frames];

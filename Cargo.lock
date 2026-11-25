@@ -3493,6 +3493,7 @@ dependencies = [
  "rawdawg-dsp",
  "rawdawg-rt",
  "rawdawg-types",
+ "realfft",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

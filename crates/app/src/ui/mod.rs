@@ -4,6 +4,7 @@
 mod keyboard;
 mod settings;
 mod synth_panel;
+mod waveform;
 
 use crate::audio::AudioSystem;
 use crate::prefs::Preferences;
@@ -74,6 +75,10 @@ pub(crate) struct App {
     pub editor_view: EditorView,
     /// Main-thread mirrors of native synth state per instance (param edits, commits).
     pub synth_mirrors: HashMap<rawdawg_types::InstanceId, Synth>,
+    /// Fingerprint of the state each live processor is known to hold (carry-over decisions).
+    pub live_fingerprints: HashMap<rawdawg_types::InstanceId, u64>,
+    /// Live wavetable channels into running synth instances.
+    pub table_senders: HashMap<rawdawg_types::InstanceId, rawdawg_synthesizer::TableSender>,
     pub synth_panel: synth_panel::SynthPanelState,
     pub keyboard: keyboard::KeyboardState,
     pub settings: settings::SettingsState,
@@ -149,6 +154,8 @@ impl App {
             show_settings: false,
             editor_view: EditorView::Synth,
             synth_mirrors: HashMap::new(),
+            live_fingerprints: HashMap::new(),
+            table_senders: HashMap::new(),
             synth_panel: Default::default(),
             keyboard: Default::default(),
             settings: settings::SettingsState::from_request(&req),
@@ -188,16 +195,29 @@ impl App {
         let mut project = self.project.clone();
         project.sample_rate_hz = sys.sample_rate;
         self.plan_revision += 1;
-        match compile(&project, self.plan_revision, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &self.limits) {
-            Ok(plan) => {
+        match compile(&project, self.plan_revision, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &self.limits, &self.live_fingerprints) {
+            Ok(out) => {
                 sys.handle.collect_retired();
-                match sys.handle.publish_plan(plan) {
-                    Ok(_) => self.plan_error = None,
+                match sys.handle.publish_plan(out.plan) {
+                    Ok(_) => {
+                        self.plan_error = None;
+                        self.live_fingerprints = out.fingerprints;
+                        for (id, sender) in out.table_senders {
+                            self.table_senders.insert(id, sender);
+                        }
+                        self.table_senders.retain(|id, _| self.live_fingerprints.contains_key(id));
+                    }
                     Err(_) => self.plan_error = Some("engine busy; change not applied yet".to_owned()),
                 }
             }
             Err(e) => self.plan_error = Some(e.to_string()),
         }
+    }
+
+    /// Record that the live processor already holds `state` (applied through live
+    /// events or table handoff), so the next recompile carries it over.
+    pub(crate) fn mark_live_state(&mut self, instance_id: rawdawg_types::InstanceId, type_id: &str, state: &serde_json::Value) {
+        self.live_fingerprints.insert(instance_id, rawdawg_audio_engine::fingerprint_state(type_id, state));
     }
 
     pub(crate) fn send(&mut self, cmd: EngineCommand) {
@@ -804,6 +824,10 @@ impl eframe::App for App {
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();
+        for sender in self.table_senders.values_mut() {
+            sender.collect_retired();
+        }
+        waveform::flush_pending(self);
         if let AudioState::Running(sys) = &mut self.audio {
             sys.handle.collect_retired();
             if sys.stream.is_failed() {

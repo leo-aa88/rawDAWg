@@ -39,6 +39,8 @@ pub struct EngineStatus {
     pub max_block_ns: AtomicU64,
     pub tempo_bpm: AtomicF64,
     pub metronome: AtomicBool,
+    /// Master output (mono sum) for the live scope.
+    pub scope: rawdawg_rt::ScopeBuffer,
 }
 
 impl Default for EngineStatus {
@@ -63,6 +65,7 @@ impl Default for EngineStatus {
             max_block_ns: AtomicU64::new(0),
             tempo_bpm: AtomicF64::new(120.0),
             metronome: AtomicBool::new(false),
+            scope: rawdawg_rt::ScopeBuffer::new(4096),
         }
     }
 }
@@ -203,9 +206,9 @@ impl Engine {
     fn on_plan_changed(&mut self) {
         self.status.plan_revision.store(self.plan.revision, Ordering::Relaxed);
         self.status.tempo_bpm.store(self.plan.tempo.tempo_at(rawdawg_types::units::Tick(self.current_tick())).bpm().0);
-        // Keep playing but re-seek the schedule cursor to the current position; release
-        // scheduled notes (the new plan's processors have fresh state anyway).
-        self.active.clear();
+        // Keep playing and keep the list of sounding scheduled notes: carried-over
+        // processors still hold those voices and need their note-offs. Channels that
+        // were rebuilt start silent and simply ignore the eventual note-off.
         self.reseek_cursor();
     }
 
@@ -432,7 +435,7 @@ impl Engine {
         let t0 = std::time::Instant::now();
         let frames = out_l.len().min(out_r.len()).min(self.max_frames);
         // 1. plan swap at block boundary (refused when retirement is full)
-        if self.plans.try_swap(&mut self.plan) {
+        if self.plans.try_swap_with(&mut self.plan, |new, old| new.migrate_from(old)) {
             self.stage.ensure_channels(self.plan.channels.len());
             self.on_plan_changed();
         }
@@ -564,6 +567,19 @@ impl Engine {
         let bad = sanitize(&mut out_l[..frames]) + sanitize(&mut out_r[..frames]);
         if bad > 0 {
             self.status.nonfinite_blocks.incr();
+        }
+        {
+            // scope: mono sum in 64-sample chunks through a stack buffer (no allocation)
+            let mut tmp = [0.0f32; 64];
+            let mut i = 0;
+            while i < frames {
+                let n = (frames - i).min(64);
+                for k in 0..n {
+                    tmp[k] = 0.5 * (out_l[i + k] + out_r[i + k]);
+                }
+                self.status.scope.push(&tmp[..n]);
+                i += n;
+            }
         }
         self.status.master_peak_l.fetch_max(rawdawg_dsp::math::peak(&out_l[..frames]));
         self.status.master_peak_r.fetch_max(rawdawg_dsp::math::peak(&out_r[..frames]));

@@ -73,6 +73,12 @@ impl<T> HandoffConsumer<T> {
     /// be retired without blocking or dropping, swap and return `true`.
     /// Never deallocates on this thread.
     pub fn try_swap(&mut self, current: &mut T) -> bool {
+        self.try_swap_with(current, |_, _| {})
+    }
+
+    /// Like [`Self::try_swap`], but calls `migrate(new, old)` before the old
+    /// value is retired, so bounded live state can be moved across (RT-safe).
+    pub fn try_swap_with(&mut self, current: &mut T, migrate: impl FnOnce(&mut T, &mut T)) -> bool {
         if self.publish.is_empty() {
             return false;
         }
@@ -81,6 +87,7 @@ impl<T> HandoffConsumer<T> {
             return false;
         }
         let Some(mut incoming) = self.publish.pop() else { return false };
+        migrate(&mut incoming, current);
         std::mem::swap(current, &mut incoming);
         // Capacity was checked above; a failure here would mean a logic error,
         // but we still must not drop on the RT thread: swap back instead.

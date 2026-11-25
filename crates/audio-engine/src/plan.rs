@@ -7,10 +7,13 @@ use rawdawg_dsp::smooth::Smoother;
 use rawdawg_dsp::{AudioBuffer, BusLayout};
 use rawdawg_project::Project;
 use rawdawg_synthesizer::Synth;
+use rawdawg_synthesizer::TableSender;
 use rawdawg_transport::{MeterMap, TempoMap};
 use rawdawg_types::limits::EngineLimits;
 use rawdawg_types::units::{Db, SampleRate};
-use rawdawg_types::{ChannelId, MixerChannelId};
+use rawdawg_types::{ChannelId, InstanceId, MixerChannelId};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
@@ -28,8 +31,13 @@ pub enum CompileError {
 
 pub struct ChannelNode {
     pub id: ChannelId,
+    pub instance_id: InstanceId,
     pub name: String,
     pub processor: Box<dyn Processor>,
+    /// Hash of (type id, serialized state) this processor was built from.
+    pub fingerprint: u64,
+    /// The live instance with this id matches `fingerprint`: migrate its state on swap.
+    pub carry_over: bool,
     pub gain: Smoother,
     pub pan_l: f32,
     pub pan_r: f32,
@@ -77,8 +85,16 @@ fn pan_gains(pan: rawdawg_types::units::Pan) -> (f32, f32) {
     pan.equal_power_gains()
 }
 
-/// Build a processor for a native instrument instance.
-fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str) -> Result<Box<dyn Processor>, CompileError> {
+/// Stable in-process fingerprint of an instance's committed state.
+pub fn fingerprint_state(type_id: &str, state: &serde_json::Value) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    type_id.hash(&mut h);
+    serde_json::to_vec(state).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// Build a processor for a native instrument instance, plus its live table channel.
+fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str) -> Result<(Box<dyn Processor>, Option<TableSender>), CompileError> {
     match inst.type_id.as_str() {
         rawdawg_types::ids::native_types::SYNTH => {
             let mut synth = Synth::default();
@@ -86,14 +102,29 @@ fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str) -> Resu
                 let bytes = serde_json::to_vec(&inst.state).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e.to_string()))?;
                 synth.load_state(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e))?;
             }
-            Ok(Box::new(synth))
+            let (sender, inbox) = rawdawg_synthesizer::table_channel();
+            synth.set_table_inbox(inbox);
+            Ok((Box::new(synth), Some(sender)))
         }
         other => Err(CompileError::UnsupportedInstrument(other.to_owned())),
     }
 }
 
+/// Result of a compile: the plan plus coordinator-side handles.
+pub struct CompileOutput {
+    pub plan: Plan,
+    /// Live table senders for instances that were (re)created; absent for carried-over ones.
+    pub table_senders: Vec<(InstanceId, TableSender)>,
+    /// Fingerprints of every instrument instance in the plan.
+    pub fingerprints: HashMap<InstanceId, u64>,
+}
+
 /// Compile and prepare. Allocates; never called on the RT thread.
-pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &EngineLimits) -> Result<Plan, CompileError> {
+///
+/// `live` maps instance ids to the fingerprint of the state the currently running
+/// processor is known to hold; matching nodes are flagged `carry_over` so the
+/// audio thread migrates their voices/tables instead of restarting them.
+pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &EngineLimits, live: &HashMap<InstanceId, u64>) -> Result<CompileOutput, CompileError> {
     rawdawg_project::validate(project).map_err(|e| CompileError::Invalid(e.to_string()))?;
     if project.channels.len() + project.mixer.channels.len() > limits.max_processing_nodes as usize {
         return Err(CompileError::Limit(format!("{} processing nodes (max {})", project.channels.len() + project.mixer.channels.len(), limits.max_processing_nodes)));
@@ -143,15 +174,26 @@ pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &Eng
     }
 
     let mut channels = Vec::with_capacity(project.channels.len());
+    let mut table_senders = Vec::new();
+    let mut fingerprints = HashMap::new();
     for c in &project.channels {
-        let mut processor = make_instrument(&c.instrument, &c.name)?;
+        let (mut processor, sender) = make_instrument(&c.instrument, &c.name)?;
         processor.prepare(&spec).map_err(|e| CompileError::Prepare(c.name.clone(), e.to_string()))?;
+        let fingerprint = fingerprint_state(c.instrument.type_id.as_str(), &c.instrument.state);
+        let carry_over = live.get(&c.instrument.id) == Some(&fingerprint);
+        fingerprints.insert(c.instrument.id, fingerprint);
+        if !carry_over && let Some(s) = sender {
+            table_senders.push((c.instrument.id, s));
+        }
         let (pl, pr) = pan_gains(c.pan);
         let mixer_index = project.mixer.channels.iter().position(|m| m.id == c.mixer_id).ok_or_else(|| CompileError::Invalid("channel routed to missing mixer channel".into()))?;
         channels.push(ChannelNode {
             id: c.id,
+            instance_id: c.instrument.id,
             name: c.name.clone(),
             processor,
+            fingerprint,
+            carry_over,
             gain: Smoother::new(c.gain_db.to_linear() as f32, 0.01, sr as f32),
             pan_l: pl,
             pan_r: pr,
@@ -189,7 +231,7 @@ pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &Eng
         project.selected_pattern.or_else(|| project.patterns.first().map(|p| p.id)).map(|pid| Schedule::for_pattern(project, pid, &tempo, rate)).unwrap_or_default();
     let song_schedule = Schedule::for_song(project, &tempo, rate);
     let _ = Db::UNITY;
-    Ok(Plan {
+    let plan = Plan {
         revision,
         sample_rate: rate,
         max_frames,
@@ -206,7 +248,8 @@ pub fn compile(project: &Project, revision: u64, max_frames: usize, limits: &Eng
         meter,
         any_solo,
         solo_mixer,
-    })
+    };
+    Ok(CompileOutput { plan, table_senders, fingerprints })
 }
 
 impl Plan {
@@ -246,5 +289,23 @@ impl Plan {
 
     pub fn channel_index(&self, id: ChannelId) -> Option<usize> {
         self.channels.iter().position(|c| c.id == id)
+    }
+
+    /// RT-safe, bounded: move live state from `old` into this plan's carried-over channels.
+    pub fn migrate_from(&mut self, old: &mut Plan) {
+        if old.sample_rate != self.sample_rate || old.max_frames != self.max_frames {
+            return;
+        }
+        for node in self.channels.iter_mut().filter(|n| n.carry_over) {
+            if let Some(prev) = old.channels.iter_mut().find(|o| o.instance_id == node.instance_id) {
+                node.processor.migrate_from(prev.processor.as_mut());
+                node.gain.snap(prev.gain.current());
+            }
+        }
+        for node in self.mixer.iter_mut() {
+            if let Some(prev) = old.mixer.iter().find(|o| o.id == node.id) {
+                node.gain.snap(prev.gain.current());
+            }
+        }
     }
 }

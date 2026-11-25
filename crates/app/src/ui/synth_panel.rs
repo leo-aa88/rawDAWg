@@ -17,6 +17,7 @@ pub(crate) struct SynthPanelState {
     /// Instance whose parameter gesture is in progress, with the pre-gesture state.
     gesture: Option<(InstanceId, Vec<u8>)>,
     pub advanced: bool,
+    pub waveform: super::waveform::WaveformState,
 }
 
 const SIMPLE: &[u32] = &[params::AMP_ATTACK, params::AMP_RELEASE, params::FILTER_CUTOFF, params::FILTER_RESONANCE, params::MASTER_GAIN, params::VOICE_MODE];
@@ -41,7 +42,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             commit_state(app, instance_id, state);
         }
     });
-    ui.label(egui::RichText::new("Waveform sculpting, Randomize, Evolve and XY Morph arrive in M2.").color(theme::TEXT_SECONDARY));
+    super::waveform::show(app, ui, instance_id);
+    ui.label(egui::RichText::new("Randomize, Evolve and XY Morph arrive later in M2.").color(theme::TEXT_SECONDARY));
     ui.separator();
     let descriptors: Vec<rawdawg_types::ParamDescriptor> = rawdawg_synthesizer::params::DESCRIPTORS.iter().filter(|d| !d.flags.hidden).copied().collect();
     let advanced = app.synth_panel.advanced;
@@ -157,6 +159,9 @@ fn finish_gesture(app: &mut App, instance_id: InstanceId) {
         return;
     }
     let state: serde_json::Value = serde_json::from_slice(&after).unwrap_or(serde_json::Value::Null);
+    // the engine already holds these values (live Param events): mark before committing so
+    // any recompile carries the instance over instead of restarting it
+    app.mark_live_state(instance_id, rawdawg_synthesizer::TYPE_ID, &state);
     if let Err(e) = app.history.apply(&mut app.project, Command::SetInstanceState { instance_id, state_version: 1, state }) {
         app.status_line = format!("Edit rejected: {e}");
     }

@@ -12,7 +12,7 @@ use rawdawg_dsp::wavetable::MipTable;
 pub const CONTROL_INTERVAL: usize = 16;
 
 /// Prepared per-layer engine data shared by all voices (owned by the synth).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LayerEngine {
     pub enabled: bool,
     pub kind: LayerKind,
@@ -21,21 +21,40 @@ pub struct LayerEngine {
     pub pan_r: f32,
     pub semitone_offset: f64,
     pub reset_phase: bool,
+    /// Previous table during a crossfade (retired when the fade completes).
+    pub prev_table: Option<Box<MipTable>>,
+    /// Crossfade position 0..1 (1 = fully on the new table) and per-sample step.
+    pub xfade: f32,
+    pub xfade_step: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum LayerKind {
     Basic {
         wave: BasicWave,
         pulse_width: f64,
     },
     /// Prepared table built from the layer's editable cycle.
-    Table(MipTable),
+    Table(Box<MipTable>),
 }
+
+/// Table swap crossfade length (DSP.md: 5–10 ms).
+pub const TABLE_XFADE_S: f32 = 0.008;
 
 impl LayerEngine {
     pub fn disabled() -> Self {
-        Self { enabled: false, kind: LayerKind::Basic { wave: BasicWave::Sine, pulse_width: 0.5 }, gain: 0.0, pan_l: 0.0, pan_r: 0.0, semitone_offset: 0.0, reset_phase: true }
+        Self {
+            enabled: false,
+            kind: LayerKind::Basic { wave: BasicWave::Sine, pulse_width: 0.5 },
+            gain: 0.0,
+            pan_l: 0.0,
+            pan_r: 0.0,
+            semitone_offset: 0.0,
+            reset_phase: true,
+            prev_table: None,
+            xfade: 1.0,
+            xfade_step: 0.0,
+        }
     }
 
     /// Non-RT: build engine data for a patch layer (allocates for tables).
@@ -44,12 +63,66 @@ impl LayerEngine {
             Generator::Basic { wave, pulse_width } => LayerKind::Basic { wave: *wave, pulse_width: f64::from(*pulse_width) },
             Generator::Wavetable { cycle, remove_dc } => {
                 let mut b = rawdawg_dsp::wavetable::TableBuilder::new();
-                LayerKind::Table(b.build(cycle, *remove_dc))
+                LayerKind::Table(Box::new(b.build(cycle, *remove_dc)))
             }
         };
-        let mut e = Self { enabled: layer.enabled, kind, gain: 0.0, pan_l: 0.0, pan_r: 0.0, semitone_offset: 0.0, reset_phase: layer.reset_phase };
+        let mut e = Self {
+            enabled: layer.enabled,
+            kind,
+            gain: 0.0,
+            pan_l: 0.0,
+            pan_r: 0.0,
+            semitone_offset: 0.0,
+            reset_phase: layer.reset_phase,
+            prev_table: None,
+            xfade: 1.0,
+            xfade_step: 0.0,
+        };
         e.update_mix(layer);
         e
+    }
+
+    /// RT: install a new table, starting a crossfade from the current one. Returns a
+    /// table that must be retired now (a previous crossfade that was still running).
+    pub fn install_table(&mut self, table: Box<MipTable>, sample_rate: f32) -> Option<Box<MipTable>> {
+        let leftover = self.prev_table.take();
+        let old = std::mem::replace(&mut self.kind, LayerKind::Table(table));
+        if let LayerKind::Table(t) = old {
+            self.prev_table = Some(t);
+            self.xfade = 0.0;
+            self.xfade_step = 1.0 / (TABLE_XFADE_S * sample_rate).max(1.0);
+        } else {
+            self.xfade = 1.0;
+            self.xfade_step = 0.0;
+        }
+        leftover
+    }
+
+    /// RT: advance the crossfade by one sample; returns a finished previous table.
+    #[inline]
+    pub fn tick_xfade(&mut self) -> Option<Box<MipTable>> {
+        if self.prev_table.is_some() {
+            self.xfade += self.xfade_step;
+            if self.xfade >= 1.0 {
+                self.xfade = 1.0;
+                return self.prev_table.take();
+            }
+        }
+        None
+    }
+
+    /// RT: read the layer's table(s) at phase, honoring a running crossfade.
+    #[inline]
+    pub fn read_table(&self, level: usize, phase: f64) -> f32 {
+        match (&self.kind, &self.prev_table) {
+            (LayerKind::Table(t), Some(p)) if self.xfade < 1.0 => {
+                let a = p.read(level, phase);
+                let b = t.read(level, phase);
+                a + (b - a) * self.xfade
+            }
+            (LayerKind::Table(t), _) => t.read(level, phase),
+            _ => 0.0,
+        }
     }
 
     /// RT-safe: refresh gain/pan/tuning from the layer settings.
@@ -267,8 +340,8 @@ impl Voice {
                 }
                 let s = match &le.kind {
                     LayerKind::Basic { .. } => lv.osc.next(tables),
-                    LayerKind::Table(t) => {
-                        let v = t.read(lv.level, lv.osc.phase());
+                    LayerKind::Table(_) => {
+                        let v = le.read_table(lv.level, lv.osc.phase());
                         lv.osc.advance();
                         v
                     }

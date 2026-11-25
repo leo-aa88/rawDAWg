@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
+rawdawg-rt = { path = "../rt" }
+realfft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

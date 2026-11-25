@@ -84,9 +84,14 @@ pub enum Tail {
 /// `prepare` is non-RT and may allocate. `process`, `reset`, `latency_frames`
 /// and `tail` are RT-safe: bounded, allocation-free, never panicking on valid
 /// input. State save/load and descriptors are non-RT.
-pub trait Processor: Send {
+pub trait Processor: Send + std::any::Any {
     /// Stable type identifier (`native.synth`, `native.fx.reverb`, ...).
     fn type_id(&self) -> &'static str;
+    /// Downcast support for state migration between instances of the same type.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    /// RT-safe, bounded: take over live state (voices, queues, tables) from `old`,
+    /// an instance of the same type prepared with the same spec. Default: nothing.
+    fn migrate_from(&mut self, _old: &mut dyn Processor) {}
     /// Parameter catalog (static, no allocation).
     fn descriptors(&self) -> &'static [ParamDescriptor];
     fn prepare(&mut self, spec: &PrepareSpec) -> Result<(), PrepareError>;

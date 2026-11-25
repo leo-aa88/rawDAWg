@@ -81,7 +81,7 @@ pub fn smoke_test(device: Option<String>, buffer: Option<u32>) -> anyhow::Result
     );
     let mut project = rawdawg_project::Project::new_default("smoke", serde_json::json!({}));
     project.sample_rate_hz = sys.sample_rate;
-    let plan = rawdawg_audio_engine::plan::compile(&project, 1, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &limits).context("compile")?;
+    let plan = rawdawg_audio_engine::plan::compile(&project, 1, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &limits, &std::collections::HashMap::new()).context("compile")?.plan;
     let channel = project.channels[0].id;
     sys.handle.publish_plan(plan).map_err(|_| anyhow::anyhow!("plan handoff full"))?;
     sys.handle.send(EngineCommand::Live { channel, event: TimedEvent::note_on(0, EventSource::Preview, 0, 1, 69, 0.8) }).ok();

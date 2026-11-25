@@ -14,9 +14,11 @@
 pub mod alloc_guard;
 pub mod handoff;
 pub mod queue;
+pub mod scope;
 pub mod shared;
 
 pub use alloc_guard::{RtScope, allocations_in_scope, enter_rt, exit_rt, is_rt_thread};
 pub use handoff::{Handoff, HandoffConsumer, HandoffProducer, PublishError, RetiredItem};
 pub use queue::{ControlQueue, QueueConsumer, QueueProducer};
+pub use scope::ScopeBuffer;
 pub use shared::{AtomicF32, AtomicF64, Counter};

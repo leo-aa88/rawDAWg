@@ -9,11 +9,14 @@
 pub mod params;
 pub mod patch;
 pub mod registry;
+pub mod sculpt;
 pub mod synth;
+pub mod tables;
 pub mod voice;
 
 pub use patch::{Generator, Layer, Patch, VoiceMode};
 pub use synth::Synth;
+pub use tables::{TableInbox, TableSender, TableUpdate, table_channel};
 
 /// Stable native type identifier.
 pub const TYPE_ID: &str = rawdawg_types::ids::native_types::SYNTH;
