@@ -17,6 +17,7 @@ rawdawg-sampler = { path = "../sampler" }
 rawdawg-effects = { path = "../effects" }
 rawdawg-project = { path = "../project" }
 hound = { workspace = true }
+flacenc = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+midly = { workspace = true }
 rawdawg-types = { path = "../types" }
 rawdawg-transport = { path = "../transport" }
 serde = { workspace = true }

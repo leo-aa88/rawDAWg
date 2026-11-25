@@ -65,6 +65,49 @@ pub enum RenderError {
     TooLong { seconds: f64, limit: f64 },
     #[error("could not write {path}: {source}")]
     Write { path: String, source: hound::Error },
+    #[error("could not write {path}: {reason}")]
+    WriteOther { path: String, reason: String },
+    #[error("export cancelled")]
+    Cancelled,
+}
+
+/// Audio export formats (IO-06). MP3 is import-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Wav(WavFormat),
+    Flac16,
+    Flac24,
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Wav(_) => "wav",
+            ExportFormat::Flac16 | ExportFormat::Flac24 => "flac",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Wav(WavFormat::Pcm16) => "WAV 16-bit PCM",
+            ExportFormat::Wav(WavFormat::Pcm24) => "WAV 24-bit PCM",
+            ExportFormat::Wav(WavFormat::Float32) => "WAV 32-bit float",
+            ExportFormat::Flac16 => "FLAC 16-bit",
+            ExportFormat::Flac24 => "FLAC 24-bit",
+        }
+    }
+    pub const ALL: [ExportFormat; 5] =
+        [ExportFormat::Wav(WavFormat::Float32), ExportFormat::Wav(WavFormat::Pcm24), ExportFormat::Wav(WavFormat::Pcm16), ExportFormat::Flac24, ExportFormat::Flac16];
+}
+
+/// Per-channel stem buffers: (mixer channel, left, right) in plan order.
+pub type StemBuffers = Vec<(rawdawg_types::MixerChannelId, Vec<f32>, Vec<f32>)>;
+
+/// One exported stem file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StemFile {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub mixer_id: rawdawg_types::MixerChannelId,
 }
 
 /// Maximum offline duration (24 h) to guard against runaway ranges.
@@ -72,6 +115,19 @@ const MAX_SECONDS: f64 = 24.0 * 3600.0;
 
 /// Render to planar stereo buffers. Deterministic for the same inputs.
 pub fn render_project(project: &Project, opts: &OfflineOptions) -> Result<(Vec<f32>, Vec<f32>, RenderStats), RenderError> {
+    render_project_with(project, opts, &mut |_, _| true, None)
+}
+
+/// Render with progress (`done_frames, total_frames` after every block; return `false`
+/// to cancel → `RenderError::Cancelled`) and optional per-channel stems: when `stems` is
+/// given it receives, in plan order, the post-fader signal of every mixer channel (master
+/// included) with exactly the main render's length.
+pub fn render_project_with(
+    project: &Project,
+    opts: &OfflineOptions,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+    mut stems: Option<&mut StemBuffers>,
+) -> Result<(Vec<f32>, Vec<f32>, RenderStats), RenderError> {
     let started = std::time::Instant::now();
     let mut project = project.clone();
     if let Some(sr) = opts.sample_rate {
@@ -104,6 +160,13 @@ pub fn render_project(project: &Project, opts: &OfflineOptions) -> Result<(Vec<f
     let (mut engine, mut handle) = Engine::new(rate, block, &limits);
     let old = engine.install_plan(plan);
     drop(old);
+    if let Some(stems) = stems.as_deref_mut() {
+        engine.enable_stems();
+        stems.clear();
+        for id in engine.mixer_ids() {
+            stems.push((id, vec![0.0f32; total], vec![0.0f32; total]));
+        }
+    }
     handle.send(EngineCommand::SetMode(opts.mode)).ok();
     handle.send(EngineCommand::SetLoopEnabled(false)).ok();
     handle.send(EngineCommand::SetMasterProtection(!opts.unprotected)).ok();
@@ -123,7 +186,18 @@ pub fn render_project(project: &Project, opts: &OfflineOptions) -> Result<(Vec<f
         }
         let (l, r) = (&mut left[pos..pos + n], &mut right[pos..pos + n]);
         engine.render_block(l, r);
+        if let Some(stems) = stems.as_deref_mut() {
+            for (i, (_, sl, sr)) in stems.iter_mut().enumerate() {
+                if let Some((bl, br)) = engine.stem(i, n) {
+                    sl[pos..pos + n].copy_from_slice(bl);
+                    sr[pos..pos + n].copy_from_slice(br);
+                }
+            }
+        }
         pos += n;
+        if !progress(pos, total) {
+            return Err(RenderError::Cancelled);
+        }
     }
     let st = engine.status();
     let peak = rawdawg_dsp::math::peak(&left).max(rawdawg_dsp::math::peak(&right));
@@ -155,6 +229,104 @@ pub fn render_project_to_wav(project: &Project, opts: &OfflineOptions, format: W
     let (l, r, stats) = render_project(project, opts)?;
     write_wav(&l, &r, stats.sample_rate, format, path).map_err(|e| RenderError::Write { path: path.display().to_string(), source: e })?;
     Ok(stats)
+}
+
+/// Render and write an audio file in `format` (WAV or FLAC), reporting progress.
+pub fn export_project(
+    project: &Project,
+    opts: &OfflineOptions,
+    format: ExportFormat,
+    path: &Path,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<RenderStats, RenderError> {
+    let (l, r, stats) = render_project_with(project, opts, progress, None)?;
+    write_audio(&l, &r, stats.sample_rate, format, path)?;
+    Ok(stats)
+}
+
+/// Render once and write one file per mixer channel (post-fader, before its output; the
+/// master's own stem is the mix) into `dir`, named `<index>-<channel name>.<ext>` with
+/// sanitized unique names. Every stem has the main render's exact length. Stems of
+/// channels that share sends or sidechains need not sum to the master (documented).
+pub fn export_stems(
+    project: &Project,
+    opts: &OfflineOptions,
+    format: ExportFormat,
+    dir: &Path,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(Vec<StemFile>, RenderStats), RenderError> {
+    let mut stems: StemBuffers = Vec::new();
+    let (_, _, stats) = render_project_with(project, opts, progress, Some(&mut stems))?;
+    std::fs::create_dir_all(dir).map_err(|e| RenderError::WriteOther { path: dir.display().to_string(), reason: e.to_string() })?;
+    let mut used = std::collections::HashSet::new();
+    let mut files = Vec::with_capacity(stems.len());
+    for (i, (id, l, r)) in stems.iter().enumerate() {
+        let raw = project.mixer.channels.iter().find(|m| m.id == *id).map(|m| m.name.clone()).unwrap_or_else(|| "channel".into());
+        let mut base: String = raw.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' }).collect::<String>().trim().to_owned();
+        if base.is_empty() {
+            base = "channel".into();
+        }
+        let mut name = format!("{:02}-{}", i + 1, base);
+        let mut k = 2;
+        while !used.insert(name.to_lowercase()) {
+            name = format!("{:02}-{}-{k}", i + 1, base);
+            k += 1;
+        }
+        let path = dir.join(format!("{name}.{}", format.extension()));
+        write_audio(l, r, stats.sample_rate, format, &path)?;
+        files.push(StemFile { name, path, mixer_id: *id });
+    }
+    Ok((files, stats))
+}
+
+/// Write planar stereo in any export format.
+pub fn write_audio(l: &[f32], r: &[f32], sample_rate: u32, format: ExportFormat, path: &Path) -> Result<(), RenderError> {
+    match format {
+        ExportFormat::Wav(f) => write_wav(l, r, sample_rate, f, path).map_err(|e| RenderError::Write { path: path.display().to_string(), source: e }),
+        ExportFormat::Flac16 => write_flac(l, r, sample_rate, 16, path),
+        ExportFormat::Flac24 => write_flac(l, r, sample_rate, 24, path),
+    }
+}
+
+/// Write planar stereo to FLAC (16-bit with TPDF dither, 24-bit rounded), lossless after
+/// quantisation, no normalization.
+pub fn write_flac(l: &[f32], r: &[f32], sample_rate: u32, bits: usize, path: &Path) -> Result<(), RenderError> {
+    use flacenc::component::BitRepr;
+    use flacenc::error::Verify;
+    let n = l.len().min(r.len());
+    let full = ((1i64 << (bits - 1)) - 1) as f64;
+    let mut rng = rawdawg_dsp::rng::DeterministicRng::new(0x5EED_D17E, bits as u64);
+    let mut interleaved = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        for s in [l[i], r[i]] {
+            let v = if bits == 16 {
+                let dither = (rng.unit_f32() + rng.unit_f32() - 1.0) / 32768.0;
+                ((f64::from((s + dither).clamp(-1.0, 1.0))) * full).round()
+            } else {
+                (f64::from(s.clamp(-1.0, 1.0)) * full).round()
+            };
+            interleaved.push(v.clamp(-full - 1.0, full) as i32);
+        }
+    }
+    let err = |reason: String| RenderError::WriteOther { path: path.display().to_string(), reason };
+    let config = flacenc::config::Encoder::default().into_verified().map_err(|e| err(format!("{e:?}")))?;
+    let source = flacenc::source::MemSource::from_samples(&interleaved, 2, bits, sample_rate as usize);
+    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size).map_err(|e| err(format!("{e:?}")))?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream.write(&mut sink).map_err(|e| err(format!("{e:?}")))?;
+    let mut bytes = sink.into_inner();
+    // flacenc 0.5 records the (shorter) last block as STREAMINFO min_block_size although it
+    // numbers frames by index, which the FLAC spec reserves for fixed-blocksize streams
+    // (min == max); decoders such as symphonia reject every frame of such a file. Mark the
+    // stream fixed-size: bytes 8..10 (min) := bytes 10..12 (max) of the STREAMINFO block.
+    if bytes.len() > 12 && &bytes[..4] == b"fLaC" && bytes[4] & 0x7f == 0 {
+        let (min, max) = ((u16::from(bytes[8]) << 8) | u16::from(bytes[9]), (u16::from(bytes[10]) << 8) | u16::from(bytes[11]));
+        if min != max {
+            bytes[8] = bytes[10];
+            bytes[9] = bytes[11];
+        }
+    }
+    std::fs::write(path, &bytes).map_err(|e| err(e.to_string()))
 }
 
 /// Write planar stereo to WAV. Float is written as-is; PCM uses TPDF dither for 16-bit

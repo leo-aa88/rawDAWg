@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use rawdawg_audio_engine::commands::TransportMode;
-use rawdawg_audio_engine::offline::{OfflineOptions, WavFormat, render_project_to_wav};
+use rawdawg_audio_engine::offline::{ExportFormat, OfflineOptions, WavFormat, export_project, export_stems};
 use rawdawg_types::units::Tick;
 use std::path::PathBuf;
 
@@ -18,15 +18,19 @@ pub struct Args {
     #[arg(long, value_name = "PROJECT", requires = "output")]
     pub headless_render: Option<PathBuf>,
 
-    /// Output file for --headless-render (.wav).
+    /// Output file for --headless-render (.wav or .flac; the format option picks the depth).
     #[arg(long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+
+    /// Also write one stem per mixer channel (post-fader) into this folder.
+    #[arg(long, value_name = "DIR")]
+    pub stems: Option<PathBuf>,
 
     /// Render mode: pattern (selected pattern, one pass) or song.
     #[arg(long, value_enum, default_value = "pattern")]
     pub mode: RenderMode,
 
-    /// Output sample format for WAV.
+    /// Output sample format: WAV (pcm16/pcm24/float32) or FLAC (flac16/flac24).
     #[arg(long, value_enum, default_value = "float32")]
     pub format: WavFormatArg,
 
@@ -101,6 +105,8 @@ pub enum WavFormatArg {
     Pcm16,
     Pcm24,
     Float32,
+    Flac16,
+    Flac24,
 }
 
 pub fn run(args: Args) -> anyhow::Result<i32> {
@@ -114,9 +120,15 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
     }
     if let Some(project_path) = &args.headless_render {
         let output = args.output.clone().context("--output is required")?;
-        if output.extension().and_then(|e| e.to_str()).is_none_or(|e| !e.eq_ignore_ascii_case("wav")) {
-            bail!("only .wav output is supported by --headless-render at this milestone (got {})", output.display());
-        }
+        let ext = output.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+        let format = match (args.format, ext.as_str()) {
+            (WavFormatArg::Pcm16, "wav") => ExportFormat::Wav(WavFormat::Pcm16),
+            (WavFormatArg::Pcm24, "wav") => ExportFormat::Wav(WavFormat::Pcm24),
+            (WavFormatArg::Float32, "wav") => ExportFormat::Wav(WavFormat::Float32),
+            (WavFormatArg::Flac16, "flac") | (WavFormatArg::Float32, "flac") => ExportFormat::Flac16,
+            (WavFormatArg::Flac24, "flac") => ExportFormat::Flac24,
+            (f, e) => bail!("--format {f:?} does not match the .{e} output (use .wav with pcm16/pcm24/float32, .flac with flac16/flac24)"),
+        };
         let project = rawdawg_project::load_project_dir(project_path).with_context(|| format!("loading project {}", project_path.display()))?;
         let sample_rate = match args.sample_rate {
             Some(hz) => Some(rawdawg_types::SampleRate::supported(hz).with_context(|| format!("{hz} Hz is not a supported rate (44100, 48000, 88200, 96000, 176400, 192000)"))?),
@@ -139,17 +151,18 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
             metronome: false,
             project_dir: rawdawg_project::persist::resolve_project_dir(project_path).ok(),
         };
-        let format = match args.format {
-            WavFormatArg::Pcm16 => WavFormat::Pcm16,
-            WavFormatArg::Pcm24 => WavFormat::Pcm24,
-            WavFormatArg::Float32 => WavFormat::Float32,
-        };
         if let Some(parent) = output.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let stats = render_project_to_wav(&project, &opts, format, &output).context("render failed")?;
+        let stats = export_project(&project, &opts, format, &output, &mut |_, _| true).context("render failed")?;
+        if let Some(dir) = &args.stems {
+            let (files, _) = export_stems(&project, &opts, format, dir, &mut |_, _| true).context("stem export failed")?;
+            for f in &files {
+                println!("stem {} → {}", f.name, f.path.display());
+            }
+        }
         println!(
             "rendered {} frames at {} Hz to {} (peak {:.3}, clipped {}, nonfinite blocks {}, dropped events {}, {:.1}x realtime)",
             stats.frames,

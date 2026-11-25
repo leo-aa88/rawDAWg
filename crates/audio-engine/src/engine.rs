@@ -5,6 +5,7 @@ use crate::commands::{EngineCommand, RecordedEvent, TransportMode};
 use crate::plan::Plan;
 use crate::schedule::{Schedule, ScheduledNote};
 use rawdawg_dsp::AudioBlock;
+use rawdawg_dsp::AudioBuffer;
 use rawdawg_dsp::math::sanitize;
 use rawdawg_dsp::processor::{ProcessContext, TransportView};
 use rawdawg_rt::handoff::{Handoff, HandoffConsumer, HandoffProducer};
@@ -192,6 +193,8 @@ pub struct Engine {
     /// At most one loop wrap per block is expected; more spans are dropped (counted).
     spans: [(i64, usize, usize); MAX_SPANS],
     span_count: usize,
+    /// Post-fader copies of every mixer channel's block (offline stem export only; `None` live).
+    stems: Option<Vec<AudioBuffer>>,
 }
 
 const MAX_SPANS: usize = 8;
@@ -231,6 +234,7 @@ impl Engine {
             count_in_beat_frames: 1,
             spans: [(0, 0, 0); MAX_SPANS],
             span_count: 0,
+            stems: None,
         };
         (engine, EngineHandle { commands: cmd_p, plans: plan_p, record: rec_c, status })
     }
@@ -507,6 +511,25 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Capture post-fader stems of every mixer channel from the next block on (non-RT:
+    /// allocates one buffer per channel of the current plan; offline export only).
+    pub fn enable_stems(&mut self) {
+        let n = self.plan.mixer.len();
+        self.stems = Some((0..n).map(|_| AudioBuffer::new(2, self.max_frames)).collect());
+    }
+    /// Post-fader stem of mixer node `index` for the last rendered block (`frames` long).
+    pub fn stem(&self, index: usize, frames: usize) -> Option<(&[f32], &[f32])> {
+        let st = self.stems.as_ref()?.get(index)?;
+        Some((&st.channel(0)[..frames], &st.channel(1)[..frames]))
+    }
+    /// Mixer channel ids in plan order (stems are addressed by this index).
+    pub fn mixer_ids(&self) -> Vec<rawdawg_types::MixerChannelId> {
+        self.plan.mixer.iter().map(|m| m.id).collect()
+    }
+    pub fn master_index(&self) -> usize {
+        self.plan.master_index
     }
 
     /// Play the plan's audio clips over this block's transport spans: resident decoded
@@ -868,6 +891,14 @@ impl Engine {
                 }
                 m.peak_l = pk_l;
                 m.peak_r = pk_r;
+                // stems: the post-fader signal of every channel (offline export)
+                if let Some(stems) = self.stems.as_mut()
+                    && let Some(st) = stems.get_mut(mi)
+                {
+                    let (sl, sr) = st.stereo_mut(frames);
+                    sl.copy_from_slice(bl);
+                    sr.copy_from_slice(br);
+                }
             }
             if let (Some(a), Some(b)) = (self.status.mixer_peak_l.get(mi), self.status.mixer_peak_r.get(mi)) {
                 a.fetch_max(pk_l);

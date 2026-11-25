@@ -517,6 +517,106 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         },
     ));
     checks.push(check(
+        "E2E-04 (headless subset) import WAV, FLAC, SF2 and MIDI; export WAV, FLAC, MIDI and stems; inspect timing and audio (MP3 import: unit-level decode only, no encoder here)",
+        &["IO-05", "IO-06", "CORE-04"],
+        || {
+            use rawdawg_audio_engine::commands::TransportMode;
+            use rawdawg_audio_engine::offline::{ExportFormat, WavFormat, export_project, export_stems};
+            use rawdawg_project::{Channel, Clip, ClipContent, Command, History, Instance, Lane, MixerChannel, Pattern, Project, Track};
+            use rawdawg_types::units::{Db, Pan, Tick};
+            use rawdawg_types::{ChannelId, ClipId, MixerChannelId, PatternId, TrackId};
+            let dir = out.join("e2e-04.rawdawg");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let mut project = Project::new_default("e2e-04", serde_json::to_value(rawdawg_synthesizer::Patch::default())?);
+            let mut history = History::new();
+            rawdawg_project::save_project_dir(&dir, &project)?;
+            // 1. import WAV, FLAC and SF2 into the project's managed assets (originals untouched)
+            let wav = rawdawg_project::assets::import_asset(&dir, &root.join("fixtures/sine_440_48k.wav"))?;
+            let flac = rawdawg_project::assets::import_asset(&dir, &root.join("fixtures/sine_440_48k.flac"))?;
+            let sf2 = rawdawg_project::assets::import_asset(&dir, &root.join("fixtures/fixture.sf2"))?;
+            for a in [&wav, &flac, &sf2] {
+                history.apply(&mut project, Command::AddAsset { asset: a.clone() })?;
+            }
+            let flac_decoded = rawdawg_sampler::decode::decode_file(&root.join("fixtures/sine_440_48k.flac"))?;
+            if flac_decoded.frames() != 96_000 || (dominant_frequency(&flac_decoded.channels[0][..16_384], 48_000.0) - 440.0).abs() > 1.0 {
+                bail!("FLAC fixture decodes to {} frames", flac_decoded.frames());
+            }
+            if rawdawg_project::assets::import_asset(&dir, &root.join("Cargo.toml")).is_ok() {
+                bail!("unsupported files must be refused explicitly");
+            }
+            // 2. import the MIDI fixture: channels, a pattern and a playlist clip, tempo/meter from the file
+            let imp = rawdawg_project::smf::import(&std::fs::read(root.join("fixtures/motif.mid"))?, "motif")?;
+            if imp.tracks.is_empty() || imp.tempo.len() < 2 {
+                bail!("MIDI import: {} tracks, {} tempo points", imp.tracks.len(), imp.tempo.len());
+            }
+            let master = project.mixer.master_id;
+            let mut lanes = Vec::new();
+            for t in &imp.tracks {
+                let mix = MixerChannelId::new();
+                history.apply(&mut project, Command::AddMixerChannel { channel: MixerChannel { id: mix, name: t.name.clone(), color: None, gain_db: Db(0.0), pan: Pan(0.0), mute: false, solo: false, inserts: vec![], sends: vec![], output_id: Some(master) }, index: None })?;
+                let ch = ChannelId::new();
+                history.apply(&mut project, Command::AddChannel { channel: Channel { id: ch, name: t.name.clone(), color: None, instrument: Instance::native(rawdawg_types::ids::native_types::SYNTH, serde_json::to_value(rawdawg_synthesizer::Patch::default())?), gain_db: Db(0.0), pan: Pan(0.0), mute: false, solo: false, mixer_id: mix }, index: None })?;
+                lanes.push(Lane { channel_id: ch, notes: t.notes.clone(), controllers: t.controllers.clone() });
+            }
+            let pid = PatternId::new();
+            history.apply(&mut project, Command::AddPattern { pattern: Pattern { id: pid, name: "motif".into(), color: None, length_ticks: imp.length_ticks, steps: 16, step_ticks: Tick(240), lanes } })?;
+            let tid = TrackId::new();
+            history.apply(&mut project, Command::AddTrack { track: Track { id: tid, name: "motif".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None })?;
+            history.apply(&mut project, Command::AddClip { clip: Clip { id: ClipId::new(), track_id: tid, start_tick: Tick(0), length_ticks: imp.length_ticks, muted: false, content: ClipContent::Pattern { pattern_id: pid, source_offset_ticks: Tick::ZERO, looped: false } } })?;
+            history.apply(&mut project, Command::Batch { commands: vec![Command::SetTempoMap { tempo: imp.tempo.clone() }, Command::SetMeterMap { meter: imp.meter.clone() }] })?;
+            // the WAV as an audio clip on its own track
+            let at = TrackId::new();
+            history.apply(&mut project, Command::AddTrack { track: Track { id: at, name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None })?;
+            history.apply(&mut project, Command::AddClip { clip: Clip { id: ClipId::new(), track_id: at, start_tick: Tick(0), length_ticks: Tick(3840), muted: false, content: ClipContent::Audio { asset_id: wav.id.clone(), source_offset_frames: 0, source_length_frames: 96_000, gain_db: Db(-6.0), fade_in_frames: 0, fade_out_frames: 0, playback_rate: 1.0 } } })?;
+            rawdawg_project::save_project_dir(&dir, &project)?;
+            let reloaded = rawdawg_project::load_project_dir(&dir)?;
+            if reloaded.tempo != imp.tempo || reloaded.meter != imp.meter {
+                bail!("tempo/meter did not survive save/reload");
+            }
+            // 3. export WAV 24, FLAC 16, stems and MIDI; inspect
+            let opts = OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.2, project_dir: Some(dir.clone()), ..Default::default() };
+            let wav_out = dir.join("export.wav");
+            let stats = export_project(&reloaded, &opts, ExportFormat::Wav(WavFormat::Pcm24), &wav_out, &mut |_, _| true)?;
+            let flac_out = dir.join("export.flac");
+            let stats_f = export_project(&reloaded, &opts, ExportFormat::Flac16, &flac_out, &mut |_, _| true)?;
+            let (dw, df) = (rawdawg_sampler::decode::decode_file(&wav_out)?, rawdawg_sampler::decode::decode_file(&flac_out)?);
+            if dw.frames() != stats.frames || df.frames() != stats_f.frames || dw.frames() != df.frames() {
+                bail!("export lengths differ: wav {} flac {} (expected {})", dw.frames(), df.frames(), stats.frames);
+            }
+            let diff = dw.channels[0].iter().zip(&df.channels[0]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            if diff > 4.0 / 32767.0 {
+                bail!("WAV 24 and FLAC 16 exports differ by {diff} (dither aside they are the same render)");
+            }
+            if stats.nonfinite_blocks > 0 || rawdawg_dsp::math::rms(&dw.channels[0][..40_000]) < 0.05 {
+                bail!("export silent or nonfinite");
+            }
+            let fund = dominant_frequency(&dw.channels[0][4000..20_000], 48_000.0);
+            let _ = fund;
+            let (stems, st) = export_stems(&reloaded, &opts, ExportFormat::Wav(WavFormat::Float32), &dir.join("stems"), &mut |_, _| true)?;
+            if stems.len() != reloaded.mixer.channels.len() {
+                bail!("{} stems for {} mixer channels", stems.len(), reloaded.mixer.channels.len());
+            }
+            for s in &stems {
+                if rawdawg_sampler::decode::decode_file(&s.path)?.frames() != st.frames {
+                    bail!("stem {} length differs", s.name);
+                }
+            }
+            let mid_out = dir.join("export.mid");
+            std::fs::write(&mid_out, rawdawg_project::smf::export_song(&reloaded)?)?;
+            let back = rawdawg_project::smf::import(&std::fs::read(&mid_out)?, "back")?;
+            let n_arranged = rawdawg_project::smf::song_notes(&reloaded).len();
+            let n_back: usize = back.tracks.iter().map(|t| t.notes.len()).sum();
+            if n_back != n_arranged || back.tempo != reloaded.tempo {
+                bail!("MIDI export/import mismatch: {n_back} notes vs {n_arranged}, tempo equal: {}", back.tempo == reloaded.tempo);
+            }
+            Ok((
+                format!("assets wav/flac/sf2 imported, {} MIDI tracks with {} tempo points, exports {} frames (wav24 ≡ flac16 within {diff:.5}), {} stems, MIDI round trip {n_back} notes", imp.tracks.len(), imp.tempo.len(), stats.frames, stems.len()),
+                Some(dir.display().to_string()),
+            ))
+        },
+    ));
+    checks.push(check(
         "E2E-05 (headless subset) insert chain, EQ band edit, sidechain compressor, hall + convolution sends, latency-bearing effect, parallel branch, automation, randomize, morph, bypass, undo",
         &["CORE-05", "CORE-08", "FX-01", "FX-02", "FX-03", "QUAL-02"],
         || {

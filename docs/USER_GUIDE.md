@@ -64,6 +64,10 @@ Tick **Advanced** in the synth panel and open **Modular graph**. The **voice gra
 
 **Rack tools** (mixer, below the strips): **Randomize rack** changes every effect on the selected channel at once, as far as the **Chaos** slider allows; the **Locks** menu protects categories (wet/dry and output levels are locked by default), and one Undo takes the whole change back. **Morph**: store the rack's settings in corners A–D, then drag on the pad to blend between them (a drag is one undo step). **+ Parallel branch** makes a bus that receives a copy of the channel and sums back into the same output, so you can build a parallel effect path; the mixer keeps both paths aligned even when one of them adds latency. To move an effect parameter rhythmically, right-click it and pick **Modulate with an LFO clip**: a sine, triangle, square or saw automation clip appears, which you can edit like any other automation. Soloing a channel keeps the channels that feed its sidechain running (they stay out of the mix but still key the compressor).
 
+## Export and MIDI files
+
+**File › Export…** renders the song (or the selected pattern) with the same engine you hear: pick WAV (16/24-bit or float) or FLAC (16/24-bit), the sample rate, a tail, and tick **Stems** for one file per mixer channel next to the mix. The export runs in the background with a progress bar and a Cancel button; when it is done you see the length, the peak and how many samples clipped (lower the master or export float if that number is not zero). Nothing is normalized. **Export MIDI (type 1)** writes the arrangement as a Standard MIDI File. Dropping a `.mid` file on the window imports it: every MIDI track becomes a synth channel, the notes become a pattern placed on a new playlist track, and an empty project also takes the file's tempo and meter.
+
 ## Projects
 
 A project is a folder ending in `.rawdawg` containing `project.json`, `assets/`, `plugin-state/`, `recovery/` and `cache/`. Saving is atomic: the previous `project.json` is kept in `recovery/project.previous.json`. The fixture project `fixtures/demo.rawdawg` renders a one-bar motif:

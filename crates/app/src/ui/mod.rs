@@ -4,6 +4,7 @@
 mod automation;
 mod effect_panel;
 mod evolve;
+mod export;
 mod graph_editor;
 mod instrument_panel;
 mod keyboard;
@@ -150,6 +151,7 @@ pub(crate) struct App {
     pub midi_activity: u64,
     pub selected_channel: Option<ChannelId>,
     pub show_settings: bool,
+    pub(crate) export: export::ExportState,
     pub editor_view: EditorView,
     /// Main-thread mirrors of native synth state per instance (param edits, commits).
     pub synth_mirrors: HashMap<rawdawg_types::InstanceId, Synth>,
@@ -241,6 +243,7 @@ impl App {
             midi_activity: 0,
             selected_channel,
             show_settings: false,
+            export: export::ExportState::default(),
             editor_view: EditorView::Synth,
             synth_mirrors: HashMap::new(),
             live_fingerprints: HashMap::new(),
@@ -309,6 +312,11 @@ impl App {
                 } else {
                     app.status_line = format!("Unknown effect {type_id}");
                 }
+            }
+            Some("export") => {
+                app.export.open = true;
+                app.export.stems = true;
+                app.transport_mode = TransportMode::Song;
             }
             Some("automation") => {
                 app.editor_view = EditorView::Automation;
@@ -430,6 +438,107 @@ impl App {
         }
     }
 
+    /// Import a Standard MIDI File: one synth channel (and mixer channel) per imported
+    /// track, one pattern holding every track's notes/controllers, a playlist track with
+    /// the pattern as a clip, and — when the project has no notes yet — its tempo and
+    /// meter maps. One undo step. Warnings go to the status line.
+    pub(crate) fn import_midi_file(&mut self, path: &std::path::Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_line = format!("Could not read {}: {e}", path.display());
+                return;
+            }
+        };
+        let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "MIDI".into());
+        let imp = match rawdawg_project::smf::import(&bytes, &name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status_line = format!("MIDI import failed: {e}");
+                return;
+            }
+        };
+        let master = self.project.mixer.master_id;
+        let patch = serde_json::to_value(rawdawg_synthesizer::Patch::default()).unwrap_or(serde_json::Value::Null);
+        let mut commands = Vec::new();
+        let mut lanes = Vec::new();
+        for t in &imp.tracks {
+            let mixer = rawdawg_project::MixerChannel {
+                id: rawdawg_types::MixerChannelId::new(),
+                name: t.name.clone(),
+                color: None,
+                gain_db: rawdawg_types::units::Db::UNITY,
+                pan: rawdawg_types::units::Pan::CENTER,
+                mute: false,
+                solo: false,
+                inserts: vec![],
+                sends: vec![],
+                output_id: Some(master),
+            };
+            let label = match t.program {
+                Some(pg) => format!("{} (program {})", t.name, pg + 1),
+                None => t.name.clone(),
+            };
+            let channel = rawdawg_project::Channel {
+                id: rawdawg_types::ChannelId::new(),
+                name: label,
+                color: None,
+                instrument: rawdawg_project::Instance::native(rawdawg_types::ids::native_types::SYNTH, patch.clone()),
+                gain_db: rawdawg_types::units::Db::UNITY,
+                pan: rawdawg_types::units::Pan::CENTER,
+                mute: false,
+                solo: false,
+                mixer_id: mixer.id,
+            };
+            lanes.push(rawdawg_project::Lane { channel_id: channel.id, notes: t.notes.clone(), controllers: t.controllers.clone() });
+            commands.push(Command::AddMixerChannel { channel: mixer, index: None });
+            commands.push(Command::AddChannel { channel, index: None });
+        }
+        let pattern = rawdawg_project::Pattern {
+            id: rawdawg_types::PatternId::new(),
+            name: name.clone(),
+            color: None,
+            length_ticks: imp.length_ticks,
+            steps: 16,
+            step_ticks: rawdawg_types::units::Tick(rawdawg_types::units::PPQ / 4),
+            lanes,
+        };
+        let pid = pattern.id;
+        commands.push(Command::AddPattern { pattern });
+        let track = rawdawg_project::Track { id: rawdawg_types::TrackId::new(), name: name.clone(), color: None, mute: false, solo: false, height: None, mixer_id: None };
+        let tid = track.id;
+        commands.push(Command::AddTrack { track, index: None });
+        commands.push(Command::AddClip {
+            clip: rawdawg_project::Clip {
+                id: rawdawg_types::ClipId::new(),
+                track_id: tid,
+                start_tick: rawdawg_types::units::Tick::ZERO,
+                length_ticks: imp.length_ticks,
+                muted: false,
+                content: rawdawg_project::ClipContent::Pattern { pattern_id: pid, source_offset_ticks: rawdawg_types::units::Tick::ZERO, looped: false },
+            },
+        });
+        let project_empty = self.project.patterns.iter().all(|p| p.lanes.iter().all(|l| l.notes.is_empty()));
+        let mut took_maps = false;
+        if project_empty {
+            commands.push(Command::SetTempoMap { tempo: imp.tempo.clone() });
+            commands.push(Command::SetMeterMap { meter: imp.meter.clone() });
+            took_maps = true;
+        }
+        self.apply(Command::Batch { commands });
+        self.project.selected_pattern = Some(pid);
+        let mut msg = format!("Imported {} MIDI track(s) from {} as pattern “{name}” on a new playlist track", imp.tracks.len(), path.display());
+        if took_maps {
+            msg.push_str("; tempo and meter maps taken from the file");
+        } else if imp.tempo.len() > 1 || imp.meter.len() > 1 {
+            msg.push_str("; the file's tempo/meter changes were not applied (project already has notes)");
+        }
+        if !imp.warnings.is_empty() {
+            msg.push_str(&format!(" — {}", imp.warnings.join("; ")));
+        }
+        self.status_line = msg;
+    }
+
     /// Import a file into the project's managed assets (no channel). Returns the asset id.
     pub(crate) fn import_asset_only(&mut self, path: &std::path::Path) -> Result<String, String> {
         let dir = self.working_dir().ok_or("No writable folder for assets")?;
@@ -464,8 +573,12 @@ impl App {
                 serde_json::to_value(rawdawg_sampler::SamplerPatch { asset_id: Some(asset.id.clone()), name: name.clone(), ..Default::default() })
                     .unwrap_or(serde_json::Value::Null),
             ),
+            rawdawg_project::AssetKind::Midi => {
+                self.import_midi_file(path);
+                return;
+            }
             _ => {
-                self.status_line = format!("{} is not an instrument file (MIDI import arrives in M5)", path.display());
+                self.status_line = format!("{} is not a sound, SoundFont or MIDI file", path.display());
                 return;
             }
         };
@@ -1113,6 +1226,10 @@ impl App {
                     self.save_project();
                     ui.close();
                 }
+                if ui.button("Export…").on_hover_text("Render to WAV/FLAC (and stems) or a MIDI file with the playback engine").clicked() {
+                    self.export.open = true;
+                    ui.close();
+                }
                 ui.label(egui::RichText::new("New / Open / Save As dialogs arrive in M6; use --open <folder>").color(theme::TEXT_SECONDARY));
             });
             ui.menu_button("Edit", |ui| {
@@ -1241,8 +1358,11 @@ impl App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let drop_target = self.playlist.drop_target.take();
         for p in dropped {
-            let is_audio = p.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "wav" | "flac" | "mp3"));
-            if let (Some((track, tick)), true) = (drop_target, is_audio) {
+            let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+            let is_audio = matches!(ext.as_str(), "wav" | "flac" | "mp3");
+            if matches!(ext.as_str(), "mid" | "midi" | "smf") {
+                self.import_midi_file(&p);
+            } else if let (Some((track, tick)), true) = (drop_target, is_audio) {
                 // dropped on a playlist lane: an audio clip, not a new channel
                 match self.import_asset_only(&p) {
                     Ok(id) => {
@@ -1327,6 +1447,10 @@ impl App {
         }
         if self.show_settings {
             settings::show(self, ui.ctx());
+        }
+        export::poll(self);
+        if self.export.open {
+            export::show(self, ui.ctx());
         }
     }
 

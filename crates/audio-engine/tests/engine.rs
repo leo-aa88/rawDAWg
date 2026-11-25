@@ -955,3 +955,85 @@ fn audio_clips_restart_at_the_loop_wrap_and_render_allocation_free() {
     assert_eq!(allocs, 0, "audio clip playback allocates");
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
+
+#[test]
+fn flac_export_decodes_back_exactly_and_stems_share_the_render_length() {
+    use rawdawg_audio_engine::offline::{ExportFormat, export_project, export_stems, render_project_with};
+    let root = std::env::temp_dir().join(format!("rawdawg-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let p = project_with_notes(&[(0, 960, 69), (1920, 960, 64)]);
+    let opts = OfflineOptions { tail_seconds: 0.25, ..Default::default() };
+    let (l, r, stats) = render_project(&p, &opts).unwrap();
+    for (format, tol) in [(ExportFormat::Flac24, 2.0 / 8_388_607.0), (ExportFormat::Flac16, 3.0 / 32767.0), (ExportFormat::Wav(WavFormat::Float32), 0.0)] {
+        let path = root.join(format!("out-{}.{}", format.label().replace(' ', "_"), format.extension()));
+        let mut calls = 0;
+        let mut last = 0;
+        let st = export_project(&p, &opts, format, &path, &mut |done, total| {
+            calls += 1;
+            assert!(done >= last && done <= total, "progress monotonic");
+            last = done;
+            true
+        })
+        .unwrap();
+        assert_eq!(st.frames, stats.frames);
+        assert_eq!(last, stats.frames, "progress reaches the end");
+        assert!(calls > 10);
+        let decoded = rawdawg_sampler::decode::decode_file(&path).unwrap();
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels.len(), 2, "{}", format.label());
+        assert_eq!(decoded.frames(), stats.frames, "{}: exact sample count", format.label());
+        let max_err = decoded.channels[0].iter().zip(&l).chain(decoded.channels[1].iter().zip(&r)).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err <= tol as f32 + 1e-7, "{}: max error {max_err} > {tol}", format.label());
+    }
+    // cancel: the callback refuses after a few blocks
+    let mut n = 0;
+    let err = render_project_with(
+        &p,
+        &opts,
+        &mut |_, _| {
+            n += 1;
+            n < 5
+        },
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, rawdawg_audio_engine::offline::RenderError::Cancelled));
+    assert_eq!(n, 5);
+    // stems: one file per mixer channel (channel + master), same length, unique sanitized names
+    let mut p2 = p.clone();
+    p2.mixer.channels[1].name = "Lead / Synth?".into();
+    let master = p2.mixer.master_id;
+    p2.mixer.channels.push(rawdawg_project::MixerChannel {
+        id: rawdawg_types::MixerChannelId::new(),
+        name: "Lead / Synth?".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db(0.0),
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![],
+        sends: vec![],
+        output_id: Some(master),
+    });
+    let dir = root.join("stems");
+    let (files, st) = export_stems(&p2, &opts, ExportFormat::Wav(WavFormat::Float32), &dir, &mut |_, _| true).unwrap();
+    assert_eq!(files.len(), 3);
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.iter().all(|n| !n.contains('/') && !n.contains('?')), "{names:?}");
+    assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 3, "unique: {names:?}");
+    let mut lens = Vec::new();
+    for f in &files {
+        let d = rawdawg_sampler::decode::decode_file(&f.path).unwrap();
+        lens.push(d.frames());
+        assert_eq!(d.frames(), st.frames, "{}", f.name);
+    }
+    // the instrument channel's stem carries the notes; the master stem is the mix (limiter aside)
+    let ch_stem = rawdawg_sampler::decode::decode_file(&files.iter().find(|f| f.mixer_id == p2.mixer.channels[1].id).unwrap().path).unwrap();
+    assert!(rms(&ch_stem.channels[0][..20_000]) > 0.05);
+    let master_stem = rawdawg_sampler::decode::decode_file(&files.iter().find(|f| f.mixer_id == master).unwrap().path).unwrap();
+    assert!((rms(&master_stem.channels[0][..20_000]) - rms(&l[..20_000])).abs() < 1e-3);
+    let empty = rawdawg_sampler::decode::decode_file(&files[2].path).unwrap();
+    assert_eq!(peak(&empty.channels[0]), 0.0, "an unused bus exports a silent stem of full length");
+    let _ = std::fs::remove_dir_all(&root);
+}

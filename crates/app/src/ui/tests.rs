@@ -397,3 +397,70 @@ fn armed_sample_places_an_audio_clip_and_edge_drags_trim_its_source_frames() {
     assert_eq!(h.app.project.tracks.iter().find(|t| t.id == tid).unwrap().mixer_id, None);
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }
+
+#[test]
+fn export_dialog_renders_on_a_worker_with_progress_and_midi_import_round_trips() {
+    use rawdawg_audio_engine::offline::{ExportFormat, WavFormat};
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(Some("../../fixtures/demo-song.rawdawg"));
+    h.app.export.open = true;
+    h.app.export.song = true;
+    h.app.export.format = ExportFormat::Wav(WavFormat::Pcm16);
+    h.app.export.stems = true;
+    h.app.export.tail_seconds = 0.1;
+    h.app.export.path = root.join("mix.wav").display().to_string();
+    h.frame(vec![]);
+    super::export::start(&mut h.app);
+    assert!(h.app.export.running(), "export runs on a worker");
+    let started = std::time::Instant::now();
+    while h.app.export.running() && started.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.frame(vec![]);
+    }
+    let result = h.app.export.last_result.clone().expect("a result message");
+    assert!(result.starts_with("Exported"), "{result}");
+    let mix = rawdawg_sampler::decode::decode_file(&root.join("mix.wav")).unwrap();
+    assert_eq!(mix.channels.len(), 2);
+    assert!(mix.frames() > 369_000, "whole song plus tail: {}", mix.frames());
+    let stems: Vec<_> = std::fs::read_dir(root.join("mix-stems")).unwrap().flatten().collect();
+    assert_eq!(stems.len(), h.app.project.mixer.channels.len(), "one stem per mixer channel");
+    for s in &stems {
+        assert_eq!(rawdawg_sampler::decode::decode_file(&s.path()).unwrap().frames(), mix.frames(), "stems share the render length");
+    }
+    // FLAC through the same path
+    h.app.export.format = ExportFormat::Flac24;
+    h.app.export.stems = false;
+    h.app.export.path = root.join("mix.flac").display().to_string();
+    super::export::start(&mut h.app);
+    let started = std::time::Instant::now();
+    while h.app.export.running() && started.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.frame(vec![]);
+    }
+    assert_eq!(rawdawg_sampler::decode::decode_file(&root.join("mix.flac")).unwrap().frames(), mix.frames());
+    // MIDI: export the arrangement, import it back as new channels/pattern/track in one undo step
+    let bytes = rawdawg_project::smf::export_song(&h.app.project).unwrap();
+    let mid = root.join("song.mid");
+    std::fs::write(&mid, bytes).unwrap();
+    let (channels, patterns, tracks, clips) = (h.app.project.channels.len(), h.app.project.patterns.len(), h.app.project.tracks.len(), h.app.project.clips.len());
+    h.app.import_midi_file(&mid);
+    assert!(h.app.status_line.starts_with("Imported"), "{}", h.app.status_line);
+    assert_eq!(h.app.project.channels.len(), channels + 1, "one channel per MIDI track with notes");
+    assert_eq!(h.app.project.patterns.len(), patterns + 1);
+    assert_eq!(h.app.project.tracks.len(), tracks + 1);
+    assert_eq!(h.app.project.clips.len(), clips + 1);
+    let pat = h.app.project.patterns.last().unwrap();
+    let imported_notes: usize = pat.lanes.iter().map(|l| l.notes.len()).sum();
+    let arranged = rawdawg_project::smf::song_notes(&h.app.project).iter().filter(|(c, _)| h.app.project.channels[..channels].iter().any(|ch| ch.id == *c)).count();
+    assert_eq!(imported_notes, arranged, "every arranged note came back");
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(
+        (h.app.project.channels.len(), h.app.project.patterns.len(), h.app.project.tracks.len(), h.app.project.clips.len()),
+        (channels, patterns, tracks, clips),
+        "one undo removes the import"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
