@@ -16,6 +16,16 @@ pub struct Preferences {
     pub typing_velocity: f32,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
+    /// Count-in before recording, in bars (0 = none).
+    #[serde(default = "default_count_in")]
+    pub count_in_bars: u32,
+    /// Recording offset in milliseconds (positive = recorded notes are moved earlier).
+    #[serde(default)]
+    pub record_offset_ms: f32,
+}
+
+fn default_count_in() -> u32 {
+    1
 }
 
 fn default_velocity() -> f32 {
@@ -32,6 +42,8 @@ impl Default for Preferences {
             typing_octave: 0,
             typing_velocity: default_velocity(),
             recent_projects: vec![],
+            count_in_bars: 1,
+            record_offset_ms: 0.0,
         }
     }
 }

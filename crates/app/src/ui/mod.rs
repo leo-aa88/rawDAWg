@@ -8,6 +8,7 @@ mod keyboard;
 mod piano_roll;
 mod playlist;
 mod presets;
+mod recording;
 mod sequencer;
 mod settings;
 mod synth_panel;
@@ -71,6 +72,9 @@ pub(crate) struct App {
     pub sequencer: sequencer::StepState,
     pub transport_mode: TransportMode,
     pub loop_enabled: bool,
+    pub record: recording::RecordState,
+    pub midi_learn: Option<rawdawg_project::AutomationTarget>,
+    pub midi_dirty: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
     pub devices: DeviceSnapshot,
     pub audio: AudioState,
     pub limits: EngineLimits,
@@ -195,6 +199,9 @@ impl App {
             sequencer: Default::default(),
             transport_mode: TransportMode::Pattern,
             loop_enabled: true,
+            record: Default::default(),
+            midi_learn: None,
+            midi_dirty: HashMap::new(),
         };
         app.rebuild_mirrors();
         app.recompile();
@@ -492,8 +499,11 @@ impl App {
             self.undo();
         }
         if space {
-            let playing = self.is_playing();
-            self.send(if playing { EngineCommand::Stop } else { EngineCommand::Play });
+            if self.is_playing() {
+                self.send(EngineCommand::Stop);
+            } else {
+                self.play_pressed();
+            }
         }
         if f6 {
             self.editor_view = EditorView::Rack;
@@ -519,6 +529,9 @@ impl App {
             self.midi_activity = self.midi_activity.wrapping_add(events.len() as u64);
         }
         for (ev, _ts) in events {
+            if self.handle_midi_control(&ev) {
+                continue;
+            }
             self.live(ev);
         }
     }
@@ -580,7 +593,7 @@ impl App {
             ui.separator();
             let playing = self.is_playing();
             if ui.add_enabled(!playing, egui::Button::new("Play")).on_hover_text("Space").clicked() {
-                self.send(EngineCommand::Play);
+                self.play_pressed();
             }
             if ui.add_enabled(playing, egui::Button::new("Stop")).on_hover_text("Space").clicked() {
                 self.send(EngineCommand::Stop);
@@ -677,6 +690,29 @@ impl App {
             sequencer::pattern_selector(self, ui, &mut cmds);
             for c in cmds {
                 self.apply(c);
+            }
+            ui.separator();
+            let mut armed = self.record.armed;
+            let rec_label = if self.record.take.is_some() { egui::RichText::new("● REC").color(theme::ERROR) } else { egui::RichText::new("Rec") };
+            if ui
+                .toggle_value(&mut armed, rec_label)
+                .on_hover_text("Arm recording: notes/controllers you play while the transport runs go into the selected pattern (song mode: a new take pattern + clip)")
+                .changed()
+            {
+                self.set_record_armed(armed);
+            }
+            egui::ComboBox::from_id_salt("count-in").selected_text(format!("Count-in {}", self.prefs.count_in_bars)).width(96.0).show_ui(ui, |ui| {
+                for b in 0..=2u32 {
+                    ui.selectable_value(&mut self.prefs.count_in_bars, b, format!("{b} bar{}", if b == 1 { "" } else { "s" }));
+                }
+            });
+            ui.add(egui::DragValue::new(&mut self.prefs.record_offset_ms).range(-100.0..=100.0).speed(0.5).suffix(" ms"))
+                .on_hover_text("Recording offset: positive moves recorded notes earlier (compensates input/buffer latency)");
+            if let AudioState::Running(sys) = &self.audio {
+                let left = sys.handle.status.count_in_frames.load(std::sync::atomic::Ordering::Relaxed);
+                if left > 0 {
+                    ui.label(egui::RichText::new(format!("count-in {:.1} s", left as f64 / f64::from(sys.sample_rate.0))).color(theme::WARNING));
+                }
             }
             ui.separator();
             ui.selectable_value(&mut self.editor_view, EditorView::Rack, "Rack").on_hover_text("F6");
@@ -1018,6 +1054,8 @@ impl eframe::App for App {
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();
+        self.poll_record();
+        self.commit_quiet_midi_changes();
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             self.import_file_as_channel(&p);

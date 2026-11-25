@@ -35,4 +35,17 @@ pub enum EngineCommand {
     /// Enable/disable the master protection limiter (explicit user choice).
     SetMasterProtection(bool),
     SetMetronome(bool),
+    /// Start playing after `beats` metronome clicks (count-in); no-op while playing.
+    PlayWithCountIn {
+        beats: u32,
+    },
+    /// Echo applied live events with their project frame to the record queue.
+    SetRecording(bool),
+}
+
+/// A live event as the engine applied it, with the absolute project frame it landed on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordedEvent {
+    pub frame: i64,
+    pub event: TimedEvent,
 }

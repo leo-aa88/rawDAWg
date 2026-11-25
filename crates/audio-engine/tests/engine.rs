@@ -443,3 +443,61 @@ fn editing_notes_while_playing_keeps_note_offs_and_picks_up_new_notes() {
     assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1, "old voice released (no hanging note), new voice active");
     assert_eq!(engine.status().dropped_events.get(), 0);
 }
+
+#[test]
+fn count_in_clicks_then_starts_and_recording_echoes_live_events_with_frames() {
+    use std::collections::HashMap;
+    let p = project_with_notes(&[(0, 960, 69)]);
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let first = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
+    engine.install_plan(first.plan);
+    handle.send(EngineCommand::SetRecording(true)).unwrap();
+    handle.send(EngineCommand::PlayWithCountIn { beats: 4 }).unwrap();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    let mut count_in = Vec::new();
+    // four beats at 120 BPM = 96 000 frames = 375 blocks of count-in (playback starts at its last frame)
+    for _ in 0..374 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        count_in.extend_from_slice(&l);
+    }
+    assert!(!engine.status().playing.load(std::sync::atomic::Ordering::Relaxed), "still counting in");
+    assert_eq!(engine.position_frame(), 0, "transport did not advance during the count-in");
+    l.fill(0.0);
+    r.fill(0.0);
+    engine.render_block(&mut l, &mut r);
+    count_in.extend_from_slice(&l);
+    assert!(engine.status().playing.load(std::sync::atomic::Ordering::Relaxed), "count-in finished");
+    assert_eq!(engine.position_frame(), 0);
+    // clicks at each beat (frames 0, 24000, 48000, 72000), silence between them
+    for beat in 0..4 {
+        let at = beat * 24_000;
+        assert!(peak(&count_in[at..at + 500]) > 0.1, "click at beat {beat}");
+        assert_eq!(peak(&count_in[at + 6_000..at + 23_000]), 0.0, "no transport notes during the count-in");
+    }
+    // next block: playing, the scheduled A4 starts at frame 0
+    l.fill(0.0);
+    engine.render_block(&mut l, &mut r);
+    assert!(engine.status().playing.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(engine.position_frame(), 256);
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // recording: a live note sent now lands at the start of the next block (frame 256) and is echoed with that frame
+    let ch = p.channels[0].id;
+    let ev = TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 77, 64, 0.7);
+    handle.send(EngineCommand::Live { channel: ch, event: ev }).unwrap();
+    engine.render_block(&mut l, &mut r);
+    let rec = handle.poll_recorded().expect("recorded event");
+    assert_eq!(rec.frame, 256);
+    assert_eq!(rec.event.kind, ev.kind);
+    assert_eq!(rec.event.source, EventSource::MidiDevice(0));
+    assert!(handle.poll_recorded().is_none());
+    // not recording → nothing echoed
+    handle.send(EngineCommand::SetRecording(false)).unwrap();
+    handle.send(EngineCommand::Live { channel: ch, event: TimedEvent::note_off(0, EventSource::MidiDevice(0), 0, 77, 64) }).unwrap();
+    engine.render_block(&mut l, &mut r);
+    assert!(handle.poll_recorded().is_none());
+    assert_eq!(engine.status().record_overflows.get(), 0);
+}

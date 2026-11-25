@@ -10,7 +10,7 @@ pub mod plan;
 pub mod schedule;
 
 pub use assets::{AssetResolver, NoAssets, ProjectAssetCache};
-pub use commands::{EngineCommand, TransportMode};
+pub use commands::{EngineCommand, RecordedEvent, TransportMode};
 pub use engine::{Engine, EngineHandle, EngineStatus};
 pub use offline::{OfflineOptions, RenderStats, render_project, render_project_to_wav};
 pub use plan::{CompileError, CompileOutput, Plan, compile, fingerprint_state};

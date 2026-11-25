@@ -125,6 +125,16 @@ pub enum Command {
         channel_id: ChannelId,
         note_ids: Vec<NoteId>,
     },
+    AddControllerEvents {
+        pattern_id: PatternId,
+        channel_id: ChannelId,
+        events: Vec<ControllerEvent>,
+    },
+    RemoveControllerEvents {
+        pattern_id: PatternId,
+        channel_id: ChannelId,
+        ids: Vec<ControllerEventId>,
+    },
     /// Replace notes by id (move/resize/velocity edits).
     UpdateNotes {
         pattern_id: PatternId,
@@ -440,6 +450,56 @@ impl Command {
                 let old = std::mem::replace(&mut p.selected_pattern, id);
                 Ok(Command::SelectPattern { id: old })
             }
+            Command::AddControllerEvents { pattern_id, channel_id, events } => {
+                let length = p.pattern(pattern_id).ok_or_else(|| unknown("pattern", pattern_id))?.length_ticks;
+                if p.channel(channel_id).is_none() {
+                    return Err(unknown("channel", channel_id));
+                }
+                for e in &events {
+                    let v = match e.kind {
+                        ControllerKind::Cc { cc, value } => {
+                            if cc > 127 {
+                                return Err(CommandError::Invalid("controller number".into()));
+                            }
+                            value
+                        }
+                        ControllerKind::PitchBend { value } => value.abs(),
+                        ControllerKind::ChannelPressure { value } => value,
+                    };
+                    if e.tick.0 < 0 || e.tick > length || e.channel > 15 || !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                        return Err(CommandError::Invalid(format!("controller event {}", e.id)));
+                    }
+                }
+                let pat = p.pattern_mut(pattern_id).expect("checked");
+                let lane = match pat.lanes.iter().position(|l| l.channel_id == channel_id) {
+                    Some(i) => &mut pat.lanes[i],
+                    None => {
+                        pat.lanes.push(Lane { channel_id, notes: vec![], controllers: vec![] });
+                        pat.lanes.last_mut().expect("just pushed")
+                    }
+                };
+                let ids: Vec<ControllerEventId> = events.iter().map(|e| e.id).collect();
+                if events.iter().any(|e| lane.controllers.iter().any(|x| x.id == e.id)) {
+                    return Err(CommandError::Invalid("controller event id already exists".into()));
+                }
+                lane.controllers.extend(events);
+                lane.controllers.sort_by_key(|e| e.tick.0);
+                Ok(Command::RemoveControllerEvents { pattern_id, channel_id, ids })
+            }
+            Command::RemoveControllerEvents { pattern_id, channel_id, ids } => {
+                let pat = p.pattern_mut(pattern_id).ok_or_else(|| unknown("pattern", pattern_id))?;
+                let lane = pat.lanes.iter_mut().find(|l| l.channel_id == channel_id).ok_or_else(|| unknown("lane", channel_id))?;
+                let mut removed = Vec::with_capacity(ids.len());
+                lane.controllers.retain(|e| {
+                    if ids.contains(&e.id) {
+                        removed.push(*e);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                Ok(Command::AddControllerEvents { pattern_id, channel_id, events: removed })
+            }
             Command::AddNotes { pattern_id, channel_id, notes } => {
                 let length = p.pattern(pattern_id).ok_or_else(|| unknown("pattern", pattern_id))?.length_ticks;
                 if p.channel(channel_id).is_none() {
@@ -735,6 +795,8 @@ impl Command {
             Command::RenameProject { .. } => "Rename project",
             Command::SetTempo { .. } => "Change tempo",
             Command::SetTempoMap { .. } => "Edit tempo map",
+            Command::AddControllerEvents { .. } => "Record controllers",
+            Command::RemoveControllerEvents { .. } => "Remove controllers",
             Command::SetMeterMap { .. } => "Edit time signatures",
             Command::AddChannel { .. } => "Add channel",
             Command::RemoveChannel { .. } => "Delete channel",

@@ -107,7 +107,26 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                 }
                 _ => ui.add(egui::Slider::new(&mut n, 0.0..=1.0).show_value(false)),
             };
-            ui.label(egui::RichText::new(d.format(n)).monospace().color(theme::TEXT_SECONDARY));
+            let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
+            let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
+            let resp = resp
+                .context_menu(|ui| {
+                    if ui.button("MIDI learn (then move a controller)").clicked() {
+                        app.arm_midi_learn(instance_id, d.id.0);
+                        ui.close();
+                    }
+                    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+                        app.remove_midi_mapping(instance_id, d.id.0);
+                        ui.close();
+                    }
+                })
+                .map(|r| r.response)
+                .unwrap_or(resp);
+            ui.label(egui::RichText::new(format!("{}{}{}", d.format(n), cc, if learning { " learn…" } else { "" })).monospace().color(if learning {
+                theme::WARNING
+            } else {
+                theme::TEXT_SECONDARY
+            }));
             ui.end_row();
             if resp.changed() && (n - current).abs() > 1e-7 {
                 let started = resp.drag_started() || app.instrument_panel.gesture.is_none();

@@ -1,7 +1,7 @@
 //! Real-time engine core. Owns the live plan; renders blocks; applies commands
 //! at block boundaries; publishes status through atomics.
 
-use crate::commands::{EngineCommand, TransportMode};
+use crate::commands::{EngineCommand, RecordedEvent, TransportMode};
 use crate::plan::Plan;
 use crate::schedule::{Schedule, ScheduledNote};
 use rawdawg_dsp::AudioBlock;
@@ -39,6 +39,10 @@ pub struct EngineStatus {
     pub max_block_ns: AtomicU64,
     pub tempo_bpm: AtomicF64,
     pub metronome: AtomicBool,
+    pub recording: AtomicBool,
+    pub record_overflows: Counter,
+    /// Count-in frames still to go (0 = none).
+    pub count_in_frames: AtomicI64,
     /// Master output (mono sum) for the live scope.
     pub scope: rawdawg_rt::ScopeBuffer,
 }
@@ -64,6 +68,9 @@ impl Default for EngineStatus {
             last_block_ns: AtomicU64::new(0),
             max_block_ns: AtomicU64::new(0),
             tempo_bpm: AtomicF64::new(120.0),
+            recording: AtomicBool::new(false),
+            record_overflows: Counter::new(),
+            count_in_frames: AtomicI64::new(0),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
         }
@@ -74,10 +81,16 @@ impl Default for EngineStatus {
 pub struct EngineHandle {
     commands: QueueProducer<EngineCommand>,
     plans: HandoffProducer<Plan>,
+    record: QueueConsumer<RecordedEvent>,
     pub status: Arc<EngineStatus>,
 }
 
 impl EngineHandle {
+    /// Next recorded live event (UI thread), if any.
+    pub fn poll_recorded(&mut self) -> Option<RecordedEvent> {
+        self.record.pop()
+    }
+
     pub fn send(&mut self, cmd: EngineCommand) -> Result<(), EngineCommand> {
         let r = self.commands.push(cmd);
         if r.is_err() {
@@ -155,6 +168,12 @@ pub struct Engine {
     metronome_enabled: bool,
     metronome: rawdawg_dsp::oscillator::SineOscillator,
     metronome_env: f32,
+    recording: bool,
+    record: QueueProducer<RecordedEvent>,
+    /// Count-in: frames left and the beat length; playback starts when it reaches zero.
+    count_in_left: i64,
+    count_in_total: i64,
+    count_in_beat_frames: i64,
 }
 
 impl Engine {
@@ -162,6 +181,7 @@ impl Engine {
     pub fn new(rate: SampleRate, max_frames: usize, limits: &EngineLimits) -> (Engine, EngineHandle) {
         let (cmd_p, cmd_c) = ControlQueue::create::<EngineCommand>(limits.max_control_messages_per_queue as usize);
         let (plan_p, plan_c) = Handoff::create::<Plan>(4);
+        let (rec_p, rec_c) = ControlQueue::create::<RecordedEvent>(limits.max_control_messages_per_queue as usize);
         let status = Arc::new(EngineStatus::default());
         let engine = Engine {
             plan: Plan::empty(rate, max_frames),
@@ -182,8 +202,13 @@ impl Engine {
             metronome_enabled: false,
             metronome: rawdawg_dsp::oscillator::SineOscillator::new(rate.as_f64()),
             metronome_env: 0.0,
+            recording: false,
+            record: rec_p,
+            count_in_left: 0,
+            count_in_total: 0,
+            count_in_beat_frames: 1,
         };
-        (engine, EngineHandle { commands: cmd_p, plans: plan_p, status })
+        (engine, EngineHandle { commands: cmd_p, plans: plan_p, record: rec_c, status })
     }
 
     pub fn status(&self) -> &Arc<EngineStatus> {
@@ -263,12 +288,33 @@ impl Engine {
                 }
             }
             EngineCommand::SetLoopEnabled(b) => self.loop_enabled_override = Some(b),
+            EngineCommand::SetRecording(b) => {
+                self.recording = b;
+                self.status.recording.store(b, Ordering::Relaxed);
+            }
+            EngineCommand::PlayWithCountIn { beats } => {
+                if !self.playing && self.count_in_left <= 0 {
+                    let tick = rawdawg_types::units::Tick(self.current_tick());
+                    let beat_ticks = self.plan.meter.meter_at(tick).beat_ticks();
+                    let f0 = self.plan.tempo.tick_to_frame(tick, self.sample_rate);
+                    let f1 = self.plan.tempo.tick_to_frame(rawdawg_types::units::Tick(tick.0 + beat_ticks.0), self.sample_rate);
+                    self.count_in_beat_frames = (f1 - f0).max(1);
+                    self.count_in_total = self.count_in_beat_frames * i64::from(beats.min(64));
+                    self.count_in_left = self.count_in_total;
+                    if beats == 0 {
+                        self.playing = true;
+                        self.reseek_cursor();
+                    }
+                }
+            }
             EngineCommand::Live { channel, event } => {
                 if let Some(ci) = self.plan.channel_index(channel) {
                     let mut ev = event;
                     ev.frame = 0;
                     if !self.stage.push(ci, ev) {
                         self.status.dropped_events.incr();
+                    } else if self.recording && self.playing && self.record.push(RecordedEvent { frame: self.position, event: ev }).is_err() {
+                        self.status.record_overflows.incr();
                     }
                 } else {
                     self.status.dropped_events.incr();
@@ -379,6 +425,43 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Count-in clicks before playback starts (forced on, independent of the metronome toggle).
+    fn count_in_block(&mut self, l: &mut [f32], r: &mut [f32]) {
+        if self.count_in_left <= 0 {
+            return;
+        }
+        let frames = l.len();
+        let decay = (-1.0 / (0.03 * self.sample_rate.as_f64() as f32)).exp();
+        let beat = self.count_in_beat_frames.max(1);
+        let beats_total = self.count_in_total / beat;
+        let meter_beats = i64::from(self.plan.meter.meter_at(rawdawg_types::units::Tick(self.current_tick())).numerator.max(1));
+        for i in 0..frames {
+            if self.count_in_left <= 0 {
+                break;
+            }
+            let elapsed = self.count_in_total - self.count_in_left;
+            if elapsed % beat == 0 {
+                let beat_index = elapsed / beat;
+                let accent = (beats_total - beat_index) % meter_beats == 0;
+                self.metronome.set_frequency(if accent { 1760.0 } else { 1320.0 });
+                self.metronome.reset_phase(0.0);
+                self.metronome_env = 0.5;
+            }
+            if self.metronome_env > 1e-4 {
+                let s = self.metronome.next() * self.metronome_env;
+                self.metronome_env *= decay;
+                l[i] += s;
+                r[i] += s;
+            }
+            self.count_in_left -= 1;
+            if self.count_in_left == 0 {
+                self.playing = true;
+                self.reseek_cursor();
+            }
+        }
+        self.status.count_in_frames.store(self.count_in_left.max(0), Ordering::Relaxed);
     }
 
     fn metronome_block(&mut self, l: &mut [f32], r: &mut [f32]) {
@@ -556,6 +639,7 @@ impl Engine {
             out_l[..frames].copy_from_slice(ml);
             out_r[..frames].copy_from_slice(mr);
         }
+        self.count_in_block(&mut out_l[..frames], &mut out_r[..frames]);
         self.metronome_block(&mut out_l[..frames], &mut out_r[..frames]);
         let plan = &mut self.plan;
         if plan.master_protection {

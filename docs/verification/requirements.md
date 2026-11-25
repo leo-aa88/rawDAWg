@@ -6,7 +6,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 
 | ID | Status | Milestone | Evidence / notes |
 |---|---|---|---|
-| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 219 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
+| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 227 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
 | PLAT-02 | PARTIAL | M0/M1 | CPAL enumeration, pure negotiation policy with fake-device tests (stereo/f32 preference, nearest-supported hints), explicit device/rate/buffer controls in Settings with requested vs actual, rate-limited error reporting, automatic one-time fallback to the device buffer (preferences untouched), no-device/failed states with Retry. Evidence: `rawdawg --audio-smoke` → ALSA default 48 kHz F32, 0 xruns (WSLg PulseAudio bridge, **not** real hardware; the bridge later wedged, see PROGRESS.md). Real-device matrix: BLOCKED (HW-01). |
 | PLAT-03 | PARTIAL | M0 | Dark-only visuals forced every frame (`crates/app/src/theme.rs`), no theme toggle anywhere. Manual screenshot verification: BLOCKED (GUI-01). |
 | PLAT-04 | NOT RUN | M8 | `cargo xtask package` exists and refuses with an explicit message; no packaging yet. |
@@ -19,10 +19,10 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | CORE-05 | PARTIAL | M1 | Mixer channels, routing order, master, solo logic, master protection limiter (`PeakLimiter`). Missing: inserts, sends, meters UI, latency compensation (M4). |
 | CORE-06 | NOT RUN | M3 | Browser panel lists instruments/devices only. |
 | CORE-07 | PARTIAL | M0 | Command model with inverses, gestures (one undo entry, cancel restores exactly), revision/dirty tracking: `crates/project/src/commands.rs` tests. UI Undo/Redo buttons wired. Save/open via CLI/`--open`; Save/Save-as UI and autosave: M6. |
-| CORE-08 | NOT RUN | M3/M4 | Automation model validated; no playback/recording yet. |
-| IO-01 | PARTIAL | M1 | midir adapter with device list/enable/rescan/disconnect release, running-status parser, FIFO note identity, CC/bend/pressure; events routed to the selected channel with source `MidiDevice(n)`. Tests: `crates/midi`. Physical keyboard: BLOCKED (MIDI-01). Sample-accurate timestamp placement: M3. |
+| CORE-08 | PARTIAL | M3 | MIDI learn (arm/confirm/remove/replace policy, commit after rest) and controller capture. Automation curves (draw/edit, step/linear), automation clips, read/touch/write recording of parameters: next slice. |
+| IO-01 | PARTIAL | M1/M3 | midir inputs with enable/hotplug/disconnect release, notes/velocity/channel/bend/CC/sustain/pressure routed live; MIDI learn with per-device mappings (`ui/recording.rs`); recording through the engine echo (`record.rs`). Hardware session: BLOCKED (MIDI-01). |
 | IO-02 | PARTIAL | M1 | Typing keyboard (Z–/ map, octave ±, velocity, no capture in text fields or with Ctrl/Alt, release on focus loss/disable, OS repeat ignored, release uses original pitch) and on-screen piano (click/drag, Mouse source). Screenshot evidence `docs/verification/screenshots/m1-wslg-1440x900.png`; interactive verification: BLOCKED (GUI-01). |
-| IO-03 | NOT RUN | M3 | |
+| IO-03 | PARTIAL (automated pieces PASS, live session NOT RUN) | M3 | Takes from engine-applied events with absolute frames, capture tempo map, loop wrap/overdub, count-in (forced clicks, frozen transport), raw timing preserved, explicit Quantize with strength/preview, controller events into expression lanes, record offset. Tests: `engine.rs::count_in_*`, `record.rs`. Live typing/MIDI recording session: NOT RUN (audio device needed). |
 | IO-04 | NOT RUN | M5 | |
 | IO-05 | PARTIAL | M2 | WAV/FLAC/MP3 decode and SF2 import into the project with explicit unsupported-file errors; originals never modified. SMF import: M5. |
 | IO-06 | PARTIAL | M0/M1 | Headless WAV export (16/24-bit PCM with TPDF dither for 16, 32-bit float), same engine as playback, no normalization, range/tail options: `wav_export_round_trips_sample_count_and_content`, `rawdawg --headless-render`. FLAC/MIDI/stems/progress: M5. |

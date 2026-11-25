@@ -1,7 +1,7 @@
 //! Deterministic fixtures: demo project, sine/impulse/sweep/noise WAVs, chord project.
 
 use anyhow::Context;
-use rawdawg_project::{Lane, Note, Pattern, Project};
+use rawdawg_project::{ControllerEvent, ControllerKind, Lane, Note, Pattern, Project};
 use rawdawg_types::units::Tick;
 use rawdawg_types::{ChannelId, NoteId, PatternId};
 use std::path::Path;
@@ -45,7 +45,25 @@ pub fn demo_project() -> Project {
                 fixed_note(6, 1920, 960, 60, 0.7),
                 fixed_note(7, 2880, 960, 64, 0.8),
             ],
-            controllers: vec![],
+            // a captured expression gesture: pitch bend dip, mod wheel rise, sustain on/off
+            controllers: (0..=8)
+                .map(|i| ControllerEvent {
+                    id: rawdawg_types::ControllerEventId::from_u128(0xCE00_0100 + i),
+                    tick: Tick(1920 + i as i64 * 60),
+                    channel: 0,
+                    kind: ControllerKind::PitchBend { value: -(i as f32 / 8.0) * 0.5 },
+                })
+                .chain((0..=4).map(|i| ControllerEvent {
+                    id: rawdawg_types::ControllerEventId::from_u128(0xCE00_0200 + i),
+                    tick: Tick(i as i64 * 480),
+                    channel: 0,
+                    kind: ControllerKind::Cc { cc: 1, value: i as f32 / 4.0 },
+                }))
+                .chain([
+                    ControllerEvent { id: rawdawg_types::ControllerEventId::from_u128(0xCE00_0301), tick: Tick(2880), channel: 0, kind: ControllerKind::Cc { cc: 64, value: 1.0 } },
+                    ControllerEvent { id: rawdawg_types::ControllerEventId::from_u128(0xCE00_0302), tick: Tick(3800), channel: 0, kind: ControllerKind::Cc { cc: 64, value: 0.0 } },
+                ])
+                .collect(),
         }],
     };
     p.selected_pattern = Some(pat);

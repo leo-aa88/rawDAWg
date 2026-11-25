@@ -243,14 +243,29 @@ fn param_grid(
                         edits.push((d.id, d.default_normalized, true, true));
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button("MIDI learn (then move a controller)").clicked() {
+                        app.arm_midi_learn(instance_id, d.id.0);
+                        ui.close();
+                    }
+                    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+                        app.remove_midi_mapping(instance_id, d.id.0);
+                        ui.close();
+                    }
                 })
                 .map(|r| r.response)
                 .unwrap_or(resp);
+            let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
+            let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
             if labeled.is_some() {
-                ui.label("");
+                ui.label(egui::RichText::new(if learning { "learn…" } else { "" }).color(theme::WARNING));
             } else {
                 let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
-                ui.label(egui::RichText::new(format!("{}{}", d.format(n), if locked { " 🔒" } else { "" })).monospace().color(theme::TEXT_SECONDARY));
+                ui.label(
+                    egui::RichText::new(format!("{}{}{}{}", d.format(n), if locked { " 🔒" } else { "" }, cc, if learning { " learn…" } else { "" }))
+                        .monospace()
+                        .color(if learning { theme::WARNING } else { theme::TEXT_SECONDARY }),
+                );
             }
             ui.end_row();
             if resp.changed() && (n - current).abs() > 1e-7 {

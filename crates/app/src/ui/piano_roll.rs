@@ -15,6 +15,7 @@ use std::collections::HashSet;
 const KEYS_W: f32 = 52.0;
 const RULER_H: f32 = 20.0;
 const VEL_H: f32 = 72.0;
+const EXPR_H: f32 = 56.0;
 const MIN_ROW_H: f32 = 6.0;
 const MAX_ROW_H: f32 = 28.0;
 
@@ -465,6 +466,14 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
         let sel = app.piano_roll.selection.len();
         ui.label(egui::RichText::new(if sel == 0 { format!("{} notes", notes.len()) } else { format!("{sel} of {} selected", notes.len()) }).color(theme::TEXT_SECONDARY));
+        let ctrl_count = app.project.pattern(pid).and_then(|p| p.lanes.iter().find(|l| l.channel_id == cid)).map(|l| l.controllers.len()).unwrap_or(0);
+        if ctrl_count > 0
+            && ui.small_button(format!("Clear {ctrl_count} controller events")).on_hover_text("Remove recorded pitch bend / CC / pressure from this lane (undoable)").clicked()
+        {
+            let ids: Vec<_> =
+                app.project.pattern(pid).and_then(|p| p.lanes.iter().find(|l| l.channel_id == cid)).map(|l| l.controllers.iter().map(|c| c.id).collect()).unwrap_or_default();
+            cmds.push(Command::RemoveControllerEvents { pattern_id: pid, channel_id: cid, ids });
+        }
     });
     for c in cmds {
         app.apply(c);
@@ -482,10 +491,14 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let (full, resp) = ui.allocate_exact_size(vec2(avail.x.max(300.0), total_h), Sense::click_and_drag());
     let painter = ui.painter_at(full);
     painter.rect_filled(full, 3.0, theme::BACKGROUND);
-    let grid_rect = Rect::from_min_max(pos2(full.min.x + KEYS_W, full.min.y + RULER_H), pos2(full.max.x, full.max.y - VEL_H));
+    let controllers: Vec<rawdawg_project::ControllerEvent> =
+        app.project.pattern(pid).and_then(|p| p.lanes.iter().find(|l| l.channel_id == cid)).map(|l| l.controllers.clone()).unwrap_or_default();
+    let expr_h = if controllers.is_empty() { 0.0 } else { EXPR_H };
+    let grid_rect = Rect::from_min_max(pos2(full.min.x + KEYS_W, full.min.y + RULER_H), pos2(full.max.x, full.max.y - VEL_H - expr_h));
     let keys_rect = Rect::from_min_max(pos2(full.min.x, grid_rect.min.y), pos2(grid_rect.min.x, grid_rect.max.y));
     let ruler_rect = Rect::from_min_max(pos2(grid_rect.min.x, full.min.y), pos2(full.max.x, grid_rect.min.y));
-    let vel_rect = Rect::from_min_max(pos2(grid_rect.min.x, grid_rect.max.y), pos2(full.max.x, full.max.y));
+    let vel_rect = Rect::from_min_max(pos2(grid_rect.min.x, grid_rect.max.y), pos2(full.max.x, full.max.y - expr_h));
+    let expr_rect = Rect::from_min_max(pos2(grid_rect.min.x, vel_rect.max.y), pos2(full.max.x, full.max.y));
 
     // wheel: vertical scroll, Shift horizontal, Ctrl zoom (around pointer)
     let hovered = ui.rect_contains_pointer(full);
@@ -630,12 +643,67 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         painter.line_segment([pos2(x, vel_rect.max.y), pos2(x, vel_rect.max.y - h)], Stroke::new(2.0, col));
         painter.circle_filled(pos2(x, vel_rect.max.y - h), 2.5, col);
     }
+    // expression lane (captured controllers): pitch bend line, CC/pressure points
+    if expr_h > 0.0 {
+        painter.rect_filled(expr_rect, 0.0, theme::PANEL.linear_multiply(0.55));
+        painter.line_segment([expr_rect.left_top(), expr_rect.right_top()], Stroke::new(1.0, theme::BORDER));
+        painter.text(
+            expr_rect.left_top() + vec2(4.0, 2.0),
+            egui::Align2::LEFT_TOP,
+            format!("expression · {} events (bend line, CC dots, sustain = CC64)", controllers.len()),
+            egui::FontId::proportional(9.0),
+            theme::TEXT_SECONDARY,
+        );
+        let mid = expr_rect.center().y + 4.0;
+        let half = (expr_rect.height() - 16.0) * 0.5;
+        let mut last_bend: Option<Pos2> = None;
+        for c in &controllers {
+            let x = x_of(c.tick.0);
+            if x < expr_rect.min.x - 2.0 || x > expr_rect.max.x + 2.0 {
+                continue;
+            }
+            match c.kind {
+                rawdawg_project::ControllerKind::PitchBend { value } => {
+                    let p = pos2(x, mid - value * half);
+                    if let Some(l) = last_bend {
+                        painter.line_segment([l, p], Stroke::new(1.5, Color32::from_rgb(0xD9, 0x8A, 0xE0)));
+                    }
+                    last_bend = Some(p);
+                }
+                rawdawg_project::ControllerKind::Cc { cc, value } => {
+                    let col = if cc == 64 { theme::WARNING } else { theme::ACCENT };
+                    painter.circle_filled(pos2(x, mid + half - value * 2.0 * half), 2.0, col);
+                }
+                rawdawg_project::ControllerKind::ChannelPressure { value } => {
+                    painter.circle_filled(pos2(x, mid + half - value * 2.0 * half), 2.0, Color32::from_rgb(0x7F, 0xA8, 0xE6));
+                }
+            }
+        }
+    }
+    // notes of a recording in progress (not yet committed)
+    if let Some(take) = app.record.take.as_ref()
+        && take.pattern == pid
+        && take.channel == cid
+    {
+        for n in &take.notes {
+            let r = note_rect(n).intersect(grid_rect);
+            if r.is_positive() {
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, theme::ERROR), egui::StrokeKind::Inside);
+            }
+        }
+        for (tick, pitch) in take.open_notes() {
+            let r = Rect::from_min_max(pos2(x_of(tick), y_of(pitch as f32 + 1.0)), pos2(x_of(tick) + 6.0, y_of(pitch as f32))).intersect(grid_rect);
+            if r.is_positive() {
+                painter.rect_filled(r, 2.0, theme::ERROR);
+            }
+        }
+    }
     // playhead
     if let Some(tick) = app.playhead_tick() {
         let local = if length.0 > 0 && app.transport_mode == rawdawg_audio_engine::TransportMode::Pattern { tick.rem_euclid(length.0) } else { tick };
         let x = x_of(local);
         if x >= grid_rect.min.x && x <= grid_rect.max.x {
-            painter.line_segment([pos2(x, ruler_rect.min.y), pos2(x, vel_rect.max.y)], Stroke::new(1.5, theme::WARNING));
+            painter.line_segment([pos2(x, ruler_rect.min.y), pos2(x, full.max.y)], Stroke::new(1.5, theme::WARNING));
         }
     }
 
