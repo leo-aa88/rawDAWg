@@ -288,9 +288,11 @@ impl Engine {
     pub fn plan_mut(&mut self) -> &mut Plan {
         &mut self.plan
     }
-    /// Install a plan directly (offline renderer / tests; not used by the RT path).
-    pub fn install_plan(&mut self, plan: Plan) -> Plan {
+    /// Install a plan directly (offline renderer / tests; not used by the RT path). Like the
+    /// RT swap, carried-over nodes migrate their live state from the previous plan.
+    pub fn install_plan(&mut self, mut plan: Plan) -> Plan {
         self.stage.ensure_channels(plan.slots.len().max(1));
+        plan.migrate_from(&mut self.plan);
         let old = std::mem::replace(&mut self.plan, plan);
         self.on_plan_changed();
         old

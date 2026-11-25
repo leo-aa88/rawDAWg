@@ -134,6 +134,24 @@ fn one() -> f32 {
 }
 
 impl Instance {
+    /// A hosted third-party plugin instance (state starts empty; the host fills it).
+    pub fn external(format: PluginFormat, plugin_id: &str, display_name: &str, vendor: &str, version: &str, path_hint: Option<String>) -> Self {
+        Self {
+            id: InstanceId::new(),
+            format,
+            type_id: TypeId::new(plugin_id),
+            display_name: display_name.to_owned(),
+            vendor: vendor.to_owned(),
+            version: version.to_owned(),
+            state_version: 1,
+            state: Value::Null,
+            opaque_state_path: None,
+            bypass: false,
+            mix: 1.0,
+            path_hint,
+        }
+    }
+
     pub fn native(type_id: &str, state: Value) -> Self {
         Self {
             id: InstanceId::new(),

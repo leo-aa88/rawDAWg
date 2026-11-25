@@ -417,6 +417,19 @@ pub fn compile(
     live: &HashMap<InstanceId, u64>,
     assets: &dyn AssetResolver,
 ) -> Result<CompileOutput, CompileError> {
+    compile_with(project, revision, max_frames, limits, live, assets, &mut crate::externals::NoExternals)
+}
+
+/// [`compile`] with a provider for hosted third-party plugins (the app's plugin host).
+pub fn compile_with(
+    project: &Project,
+    revision: u64,
+    max_frames: usize,
+    limits: &EngineLimits,
+    live: &HashMap<InstanceId, u64>,
+    assets: &dyn AssetResolver,
+    externals: &mut dyn crate::externals::ExternalPlugins,
+) -> Result<CompileOutput, CompileError> {
     let mut missing_plugins: Vec<String> = Vec::new();
     rawdawg_project::validate(project).map_err(|e| CompileError::Invalid(e.to_string()))?;
     if project.channels.len() + project.mixer.channels.len() > limits.max_processing_nodes as usize {
@@ -439,14 +452,24 @@ pub fn compile(
         let mut inserts = Vec::with_capacity(m.inserts.len());
         for (ii, inst) in m.inserts.iter().enumerate() {
             let owner = format!("{} / {}", m.name, inst.display_name);
-            let mut processor = make_effect(inst, &owner, assets)?;
-            if inst.format != rawdawg_project::PluginFormat::Native {
-                missing_plugins.push(missing_label(inst, &owner));
-            }
+            let external = if inst.format != rawdawg_project::PluginFormat::Native {
+                externals.instantiate(inst, crate::externals::PluginRole::Insert, &spec).map_err(|e| CompileError::Prepare(owner.clone(), e))?
+            } else {
+                None
+            };
+            let mut processor = match external {
+                Some(p) => p,
+                None => {
+                    if inst.format != rawdawg_project::PluginFormat::Native {
+                        missing_plugins.push(missing_label(inst, &owner));
+                    }
+                    make_effect(inst, &owner, assets)?
+                }
+            };
             processor.prepare(&spec).map_err(|e| CompileError::Prepare(owner.clone(), e.to_string()))?;
             attach_effect_assets(processor.as_mut(), assets);
             let fingerprint = fingerprint_state(inst.type_id.as_str(), &inst.state);
-            let carry_over = live.get(&inst.id) == Some(&fingerprint);
+            let carry_over = live.get(&inst.id) == Some(&fingerprint) || processor.carries_live_state();
             fingerprints.insert(inst.id, fingerprint);
             let latency = processor.latency_frames();
             let has_mix = rawdawg_effects::info(inst.type_id.as_str()).is_some_and(|i| i.has_mix);
@@ -534,13 +557,23 @@ pub fn compile(
     let mut channels = Vec::with_capacity(project.channels.len());
     let mut table_senders = Vec::new();
     for c in &project.channels {
-        let (mut processor, sender) = make_instrument(&c.instrument, &c.name, assets)?;
-        if c.instrument.format != rawdawg_project::PluginFormat::Native {
-            missing_plugins.push(missing_label(&c.instrument, &c.name));
-        }
+        let external = if c.instrument.format != rawdawg_project::PluginFormat::Native {
+            externals.instantiate(&c.instrument, crate::externals::PluginRole::Instrument, &spec).map_err(|e| CompileError::Prepare(c.name.clone(), e))?
+        } else {
+            None
+        };
+        let (mut processor, sender) = match external {
+            Some(p) => (p, None),
+            None => {
+                if c.instrument.format != rawdawg_project::PluginFormat::Native {
+                    missing_plugins.push(missing_label(&c.instrument, &c.name));
+                }
+                make_instrument(&c.instrument, &c.name, assets)?
+            }
+        };
         processor.prepare(&spec).map_err(|e| CompileError::Prepare(c.name.clone(), e.to_string()))?;
         let fingerprint = fingerprint_state(c.instrument.type_id.as_str(), &c.instrument.state);
-        let carry_over = live.get(&c.instrument.id) == Some(&fingerprint);
+        let carry_over = live.get(&c.instrument.id) == Some(&fingerprint) || processor.carries_live_state();
         fingerprints.insert(c.instrument.id, fingerprint);
         if !carry_over && let Some(s) = sender {
             table_senders.push((c.instrument.id, s));

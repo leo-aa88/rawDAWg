@@ -92,6 +92,12 @@ pub trait Processor: Send + std::any::Any {
     /// RT-safe, bounded: take over live state (voices, queues, tables) from `old`,
     /// an instance of the same type prepared with the same spec. Default: nothing.
     fn migrate_from(&mut self, _old: &mut dyn Processor) {}
+    /// `true` when the live audio state lives outside the plan and follows the main-thread
+    /// instance regardless of the project's stored state (hosted plugins): the compiler then
+    /// always migrates such a node instead of restarting it. Default: `false`.
+    fn carries_live_state(&self) -> bool {
+        false
+    }
     /// Parameter catalog (static, no allocation).
     fn descriptors(&self) -> &'static [ParamDescriptor];
     fn prepare(&mut self, spec: &PrepareSpec) -> Result<(), PrepareError>;

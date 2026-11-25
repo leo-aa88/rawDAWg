@@ -18,3 +18,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 rawdawg-plugin-clap = { path = "../plugin-clap" }
+rawdawg-audio-engine = { path = "../audio-engine" }
+rawdawg-project = { path = "../project" }
+rawdawg-effects = { path = "../effects" }
+rawdawg-synthesizer = { path = "../synthesizer" }
