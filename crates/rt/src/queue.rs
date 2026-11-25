@@ -77,6 +77,10 @@ pub struct QueueConsumer<T> {
 }
 
 impl<T> QueueConsumer<T> {
+    /// Look at the next item without taking it.
+    pub fn peek(&self) -> Option<&T> {
+        self.inner.peek().ok()
+    }
     pub fn pop(&mut self) -> Option<T> {
         match self.inner.pop() {
             Ok(v) => {

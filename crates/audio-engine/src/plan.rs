@@ -145,9 +145,15 @@ pub struct Plan {
 
 /// An audio clip resolved for playback (song mode): resident decoded asset, project-frame
 /// bounds and the mixer node it plays into. Rates and fades are in output frames.
+/// Where an audio clip's samples come from.
+pub enum ClipSource {
+    Resident(std::sync::Arc<rawdawg_sampler::SampleAsset>),
+    Streamed(crate::stream::ClipStream),
+}
+
 pub struct AudioClipNode {
     pub clip_id: rawdawg_types::ClipId,
-    pub asset: std::sync::Arc<rawdawg_sampler::SampleAsset>,
+    pub source: ClipSource,
     /// First project frame of the clip and its length in output frames.
     pub start_frame: i64,
     pub len_frames: i64,
@@ -235,6 +241,8 @@ pub struct CompileOutput {
     /// Processor slot of every instance (meters, parameter events).
     pub slots: HashMap<InstanceId, usize>,
     pub output_latency: u32,
+    /// Decoding worker for streamed audio clips; keep it alive while the plan plays.
+    pub stream_worker: Option<crate::stream::StreamWorker>,
 }
 
 /// Build an (unprepared) native effect processor for an insert instance. Effects that
@@ -266,8 +274,15 @@ pub fn attach_effect_assets(p: &mut dyn Processor, assets: &dyn AssetResolver) {
 /// audio thread migrates their voices/tables instead of restarting them.
 /// Resolve the project's audio clips against the asset store. Clips on muted tracks and
 /// clips whose asset is missing are skipped (missing assets are reported by the resolver).
-fn audio_clip_nodes(project: &Project, tempo: &TempoMap, rate: SampleRate, master_index: usize, assets: &dyn AssetResolver) -> Vec<AudioClipNode> {
+fn audio_clip_nodes(
+    project: &Project,
+    tempo: &TempoMap,
+    rate: SampleRate,
+    master_index: usize,
+    assets: &dyn AssetResolver,
+) -> (Vec<AudioClipNode>, Option<crate::stream::StreamWorker>) {
     let mut out = Vec::new();
+    let mut stream_requests: Vec<(rawdawg_sampler::stream::StreamInfo, u64)> = Vec::new();
     for clip in &project.clips {
         let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &clip.content else { continue };
         if clip.muted || out.len() >= MAX_AUDIO_CLIPS {
@@ -277,17 +292,27 @@ fn audio_clip_nodes(project: &Project, tempo: &TempoMap, rate: SampleRate, maste
         if track.mute {
             continue;
         }
-        let Some(asset) = assets.sample(asset_id) else { continue };
-        if !asset.is_valid() || asset.frames() == 0 {
-            continue;
-        }
+        // resident when the cache allows it, otherwise streamed from disk
+        let (source, asset_rate, asset_frames) = match assets.sample(asset_id) {
+            Some(asset) if asset.is_valid() && asset.frames() > 0 => {
+                let (r, f) = (asset.sample_rate, asset.frames() as u64);
+                (ClipSource::Resident(asset), r, f)
+            }
+            _ => match assets.stream_info(asset_id) {
+                Some(info) if info.frames > 0 => {
+                    stream_requests.push((info.clone(), *source_offset_frames));
+                    (ClipSource::Streamed(crate::stream::ClipStream::placeholder(info.frames)), info.sample_rate, info.frames)
+                }
+                _ => continue,
+            },
+        };
         let mixer_index = track.mixer_id.and_then(|m| project.mixer.channels.iter().position(|c| c.id == m)).unwrap_or(master_index);
-        let eff_rate = (playback_rate * f64::from(asset.sample_rate) / rate.as_f64()).max(1e-6);
-        let src_len = (*source_length_frames).min(asset.frames() as u64 - (*source_offset_frames).min(asset.frames() as u64 - 1)) as f64;
+        let eff_rate = (playback_rate * f64::from(asset_rate) / rate.as_f64()).max(1e-6);
+        let src_len = (*source_length_frames).min(asset_frames - (*source_offset_frames).min(asset_frames - 1)) as f64;
         let len_frames = (src_len / eff_rate).ceil().max(1.0) as i64;
         out.push(AudioClipNode {
             clip_id: clip.id,
-            asset,
+            source,
             start_frame: tempo.tick_to_frame(clip.start_tick, rate),
             len_frames,
             source_offset: *source_offset_frames as f64,
@@ -298,8 +323,29 @@ fn audio_clip_nodes(project: &Project, tempo: &TempoMap, rate: SampleRate, maste
             mixer_index,
         });
     }
+    // start the streams (one worker for the plan) and hand the RT ends to their nodes
+    let mut worker = None;
+    if !stream_requests.is_empty() {
+        match crate::stream::start_streams(&stream_requests) {
+            Ok((rts, w)) => {
+                let mut it = rts.into_iter();
+                for node in out.iter_mut() {
+                    if let ClipSource::Streamed(slot) = &mut node.source
+                        && let Some(rt) = it.next()
+                    {
+                        *slot = rt;
+                    }
+                }
+                worker = Some(w);
+            }
+            Err(e) => {
+                log::warn!("audio clip streaming unavailable: {e}");
+                out.retain(|n| matches!(n.source, ClipSource::Resident(_)));
+            }
+        }
+    }
     out.sort_by_key(|c| c.start_frame);
-    out
+    (out, worker)
 }
 
 pub fn compile(
@@ -552,7 +598,7 @@ pub fn compile(
     let pattern_schedule =
         project.selected_pattern.or_else(|| project.patterns.first().map(|p| p.id)).map(|pid| Schedule::for_pattern(project, pid, &tempo, rate)).unwrap_or_default();
     let song_schedule = Schedule::for_song(project, &tempo, rate);
-    let audio_clips = audio_clip_nodes(project, &tempo, rate, master_index, assets);
+    let (audio_clips, stream_worker) = audio_clip_nodes(project, &tempo, rate, master_index, assets);
     let _ = Db::UNITY;
     let plan = Plan {
         revision,
@@ -579,7 +625,7 @@ pub fn compile(
         output_latency,
     };
     let slot_map: HashMap<InstanceId, usize> = slot_instances.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    Ok(CompileOutput { plan, table_senders, fingerprints, slots: slot_map, output_latency })
+    Ok(CompileOutput { stream_worker, plan, table_senders, fingerprints, slots: slot_map, output_latency })
 }
 
 impl Plan {

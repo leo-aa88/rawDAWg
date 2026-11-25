@@ -53,6 +53,8 @@ pub struct EngineStatus {
     pub count_in_frames: AtomicI64,
     /// A browser preview is sounding.
     pub preview_active: AtomicBool,
+    /// Frames of streamed audio clips that were not ready (output as silence).
+    pub stream_dropouts: Counter,
     /// Master output (mono sum) for the live scope.
     pub scope: rawdawg_rt::ScopeBuffer,
 }
@@ -86,6 +88,7 @@ impl Default for EngineStatus {
             mixer_peak_r: (0..128).map(|_| AtomicF32::new(0.0)).collect(),
             count_in_frames: AtomicI64::new(0),
             preview_active: AtomicBool::new(false),
+            stream_dropouts: Counter::new(),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
         }
@@ -208,6 +211,20 @@ pub struct Engine {
     monitor_read: usize,
     monitor_write: usize,
     monitor_fill: usize,
+}
+
+/// Clip gain with linear fades at `local` output frames into the clip.
+#[inline]
+fn clip_gain(gain: f32, fade_in: f64, fade_out: f64, len_frames: i64, local: f64) -> f32 {
+    let mut g = gain;
+    if fade_in > 0.0 && local < fade_in {
+        g *= (local / fade_in) as f32;
+    }
+    let remaining = len_frames as f64 - local;
+    if fade_out > 0.0 && remaining < fade_out {
+        g *= (remaining / fade_out).max(0.0) as f32;
+    }
+    g
 }
 
 /// Frames the monitor ring holds (≈ 170 ms at 48 kHz).
@@ -553,6 +570,40 @@ impl Engine {
         }
     }
 
+    /// Offline rendering: whether every streamed clip has the source frames the next
+    /// `frames` of transport need (loops disabled); requests what is missing. Call from
+    /// the rendering thread, not from an audio callback.
+    pub fn streams_ready(&mut self, frames: usize) -> bool {
+        // apply queued transport commands first so the position/mode are current
+        while let Some(cmd) = self.commands.pop() {
+            self.handle_command(cmd);
+        }
+        if !self.playing || self.mode != TransportMode::Song {
+            return true;
+        }
+        let pos = self.pending_seek.unwrap_or(self.position);
+        let (start, end) = (pos, pos + frames as i64);
+        let mut ready = true;
+        for clip in self.plan.audio_clips.iter_mut() {
+            let crate::plan::ClipSource::Streamed(stream) = &mut clip.source else { continue };
+            let clip_end = clip.start_frame + clip.len_frames;
+            if clip.start_frame >= end || clip_end <= start {
+                continue;
+            }
+            let from = clip.start_frame.max(start);
+            let to = clip_end.min(end);
+            let s0 = (clip.source_offset + (from - clip.start_frame) as f64 * clip.rate).floor() as u64;
+            let s1 = (clip.source_offset + (to - clip.start_frame) as f64 * clip.rate).ceil() as u64 + 2;
+            let s1 = s1.min(stream.asset_frames);
+            stream.pump();
+            if !stream.has(s0, s1) {
+                stream.request_once(s0);
+                ready = false;
+            }
+        }
+        ready
+    }
+
     /// Attach the capture stream's monitor queue (non-RT, before the engine goes live).
     pub fn set_monitor_queue(&mut self, queue: Option<rawdawg_rt::QueueConsumer<rawdawg_audio_io::capture::CaptureBlock>>) {
         self.monitor = queue;
@@ -631,7 +682,7 @@ impl Engine {
         for si in 0..self.span_count {
             let (start, offset, len) = self.spans[si];
             let end = start + len as i64;
-            for clip in &plan.audio_clips {
+            for clip in plan.audio_clips.iter_mut() {
                 if clip.start_frame >= end {
                     break; // sorted by start
                 }
@@ -641,25 +692,47 @@ impl Engine {
                 }
                 let from = clip.start_frame.max(start);
                 let to = clip_end.min(end);
-                let node = &mut plan.mixer[clip.mixer_index];
-                let (bl, br) = node.buffer.stereo_mut(offset + len);
-                let stereo = clip.asset.is_stereo();
-                for f in from..to {
-                    let local = (f - clip.start_frame) as f64;
-                    let src = clip.source_offset + local * clip.rate;
-                    let mut g = clip.gain;
-                    if clip.fade_in > 0.0 && local < clip.fade_in {
-                        g *= (local / clip.fade_in) as f32;
+                let (bl, br) = plan.mixer[clip.mixer_index].buffer.stereo_mut(offset + len);
+                let mut dropouts = 0u64;
+                match &mut clip.source {
+                    crate::plan::ClipSource::Resident(asset) => {
+                        let stereo = asset.is_stereo();
+                        for f in from..to {
+                            let local = (f - clip.start_frame) as f64;
+                            let src = clip.source_offset + local * clip.rate;
+                            let g = clip_gain(clip.gain, clip.fade_in, clip.fade_out, clip.len_frames, local);
+                            let i = offset + (f - start) as usize;
+                            let l = asset.read(0, src) * g;
+                            let r = if stereo { asset.read(1, src) * g } else { l };
+                            bl[i] += l;
+                            br[i] += r;
+                        }
                     }
-                    let remaining = clip.len_frames as f64 - local;
-                    if clip.fade_out > 0.0 && remaining < clip.fade_out {
-                        g *= (remaining / clip.fade_out).max(0.0) as f32;
+                    crate::plan::ClipSource::Streamed(stream) => {
+                        stream.pump();
+                        let first_src = clip.source_offset + (from - clip.start_frame) as f64 * clip.rate;
+                        for f in from..to {
+                            let local = (f - clip.start_frame) as f64;
+                            let src = clip.source_offset + local * clip.rate;
+                            let g = clip_gain(clip.gain, clip.fade_in, clip.fade_out, clip.len_frames, local);
+                            let i = offset + (f - start) as usize;
+                            match stream.read(src) {
+                                Some((l, r)) => {
+                                    bl[i] += l * g;
+                                    br[i] += r * g;
+                                }
+                                None => {
+                                    dropouts += 1;
+                                    stream.request_once(src.floor() as u64);
+                                }
+                            }
+                        }
+                        // frames behind this block are done: let the worker run ahead
+                        stream.release_before((first_src.floor() as u64).saturating_sub(4));
                     }
-                    let i = offset + (f - start) as usize;
-                    let l = clip.asset.read(0, src) * g;
-                    let r = if stereo { clip.asset.read(1, src) * g } else { l };
-                    bl[i] += l;
-                    br[i] += r;
+                }
+                if dropouts > 0 {
+                    self.status.stream_dropouts.add(dropouts);
                 }
             }
         }

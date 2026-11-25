@@ -7,6 +7,7 @@ pub mod decode;
 pub mod sampler;
 pub mod sf2;
 pub mod sf2_player;
+pub mod stream;
 
 pub use asset::SampleAsset;
 pub use decode::{DecodeError, decode_file};

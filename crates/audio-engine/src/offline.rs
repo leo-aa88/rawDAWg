@@ -51,6 +51,8 @@ pub struct RenderStats {
     pub clipped_samples: u64,
     pub nonfinite_blocks: u64,
     pub dropped_events: u64,
+    /// Streamed-clip frames that were still missing after waiting (should be 0 offline).
+    pub stream_dropouts: u64,
     pub render_seconds: f64,
     pub realtime_factor: f64,
 }
@@ -138,7 +140,9 @@ pub fn render_project_with(
     let block = opts.block_frames.clamp(1, limits.max_block_frames as usize);
     let mut cache = crate::assets::ProjectAssetCache::new(opts.project_dir.clone());
     cache.sync(opts.project_dir.clone(), &project);
-    let plan = compile(&project, 1, block, &limits, &std::collections::HashMap::new(), &cache)?.plan;
+    let compiled = compile(&project, 1, block, &limits, &std::collections::HashMap::new(), &cache)?;
+    let _stream_worker = compiled.stream_worker;
+    let plan = compiled.plan;
     let sched = match opts.mode {
         TransportMode::Pattern => &plan.pattern_schedule,
         TransportMode::Song => &plan.song_schedule,
@@ -184,6 +188,11 @@ pub fn render_project_with(
             handle.send(EngineCommand::Pause).ok();
             stopped = true;
         }
+        // streamed clips: wait (outside the audio path) until their data is in
+        let waited = std::time::Instant::now();
+        while !engine.streams_ready(n) && waited.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let (l, r) = (&mut left[pos..pos + n], &mut right[pos..pos + n]);
         engine.render_block(l, r);
         if let Some(stems) = stems.as_deref_mut() {
@@ -210,6 +219,7 @@ pub fn render_project_with(
         clipped_samples: clipped,
         nonfinite_blocks: st.nonfinite_blocks.get(),
         dropped_events: st.dropped_events.get(),
+        stream_dropouts: st.stream_dropouts.get(),
         render_seconds: elapsed,
         realtime_factor: if elapsed > 0.0 { seconds / elapsed } else { f64::INFINITY },
     };

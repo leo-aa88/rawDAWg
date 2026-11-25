@@ -157,6 +157,8 @@ pub(crate) struct App {
     /// Assets handed to the engine for preview: held here until the preview ended so the
     /// audio thread never drops the last reference.
     preview_held: Vec<std::sync::Arc<rawdawg_sampler::SampleAsset>>,
+    /// Decoding worker of the live plan's streamed audio clips (replaced on recompile).
+    stream_worker: Option<rawdawg_audio_engine::stream::StreamWorker>,
     pub editor_view: EditorView,
     /// Main-thread mirrors of native synth state per instance (param edits, commits).
     pub synth_mirrors: HashMap<rawdawg_types::InstanceId, Synth>,
@@ -257,6 +259,7 @@ impl App {
             export: export::ExportState::default(),
             browser_search: String::new(),
             preview_held: Vec::new(),
+            stream_worker: None,
             editor_view: EditorView::Synth,
             synth_mirrors: HashMap::new(),
             live_fingerprints: HashMap::new(),
@@ -385,6 +388,8 @@ impl App {
                 match sys.handle.publish_plan(out.plan) {
                     Ok(_) => {
                         self.plan_error = None;
+                        // the old worker stops when replaced; the retired plan's streams go with it
+                        self.stream_worker = out.stream_worker;
                         self.live_fingerprints = out.fingerprints;
                         self.slots = out.slots;
                         for (id, sender) in out.table_senders {

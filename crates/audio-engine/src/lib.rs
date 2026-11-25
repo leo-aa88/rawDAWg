@@ -9,6 +9,7 @@ pub mod offline;
 pub mod plan;
 pub mod record;
 pub mod schedule;
+pub mod stream;
 
 pub use assets::{AssetResolver, NoAssets, ProjectAssetCache};
 pub use commands::{EngineCommand, RecordedEvent, TransportMode};

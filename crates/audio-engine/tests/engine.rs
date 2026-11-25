@@ -1083,3 +1083,126 @@ fn browser_preview_plays_an_asset_once_at_its_gain_and_can_be_stopped() {
     assert_eq!(allocs, 0);
     drop(held);
 }
+
+/// A 150 s mono file (440 Hz for 75 s, then 880 Hz): longer than the resident limit, so
+/// it streams. Returns (project dir, project, asset id).
+fn long_clip_project(tag: &str) -> (std::path::PathBuf, Project, rawdawg_types::AssetId) {
+    use rawdawg_project::{Clip, ClipContent, Track};
+    let root = std::env::temp_dir().join(format!("rawdawg-stream-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let wav = root.join("long.wav");
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    let total = 150 * 48_000usize;
+    for i in 0..total {
+        let f = if i < total / 2 { 440.0 } else { 880.0 };
+        w.write_sample(((std::f64::consts::TAU * f * i as f64 / 48_000.0).sin() * 16000.0) as i16).unwrap();
+    }
+    w.finalize().unwrap();
+    let dir = root.join("L.rawdawg");
+    let mut p = Project::new_default("stream", serde_json::json!({}));
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    let asset = rawdawg_project::assets::import_asset(&dir, &wav).unwrap();
+    p.assets.push(asset.clone());
+    let tid = rawdawg_types::TrackId::new();
+    p.tracks.push(Track { id: tid, name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
+    // bar 1: the first 2 s of the file; bar 2: 2 s from 100 s into the file (880 Hz region)
+    for (bar, offset) in [(0i64, 0u64), (1, 100 * 48_000)] {
+        p.clips.push(Clip {
+            id: rawdawg_types::ClipId::new(),
+            track_id: tid,
+            start_tick: Tick(bar * 3840),
+            length_ticks: Tick(3840),
+            muted: false,
+            content: ClipContent::Audio {
+                asset_id: asset.id.clone(),
+                source_offset_frames: offset,
+                source_length_frames: 96_000,
+                gain_db: rawdawg_types::units::Db(0.0),
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                playback_rate: 1.0,
+            },
+        });
+    }
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    (dir, p, asset.id)
+}
+
+#[test]
+fn long_audio_clips_stream_from_disk_with_accurate_offsets_and_no_dropouts_offline() {
+    use rawdawg_audio_engine::AssetResolver;
+    let (dir, p, id) = long_clip_project("offline");
+    let mut cache = rawdawg_audio_engine::ProjectAssetCache::new(Some(dir.clone()));
+    cache.sync(Some(dir.clone()), &p);
+    assert!(cache.sample(&id).is_none(), "150 s is above the resident limit");
+    let info = cache.stream_info(&id).expect("probed");
+    assert_eq!((info.sample_rate, info.channels, info.frames), (48_000, 1, 150 * 48_000));
+    assert!(cache.problems().iter().any(|m| m.contains("streamed")), "{:?}", cache.problems());
+    let opts = OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, end_tick: Some(Tick(7680)), project_dir: Some(dir.clone()), unprotected: true, ..Default::default() };
+    let (l, r, stats) = render_project(&p, &opts).unwrap();
+    assert_eq!(stats.stream_dropouts, 0, "offline waits for the stream");
+    assert_eq!(stats.nonfinite_blocks, 0);
+    assert!((dominant_frequency(&l[2000..40_000], 48_000.0) - 440.0).abs() < 1.0, "bar 1 streams the file start");
+    assert!((dominant_frequency(&l[100_000..140_000], 48_000.0) - 880.0).abs() < 1.0, "bar 2 streams from 100 s (accurate seek)");
+    let pk = peak(&l[2000..90_000]);
+    assert!((pk - 16000.0 / 32768.0).abs() < 0.01, "level {pk}");
+    assert!(l.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-6), "mono feeds both channels");
+    // deterministic: a second render is identical
+    let (l2, _, s2) = render_project(&p, &opts).unwrap();
+    assert_eq!(s2.stream_dropouts, 0);
+    assert_eq!(l, l2);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn streamed_clips_play_live_recover_after_a_loop_wrap_and_render_allocation_free() {
+    use rawdawg_project::LoopRange;
+    let (dir, mut p, _id) = long_clip_project("live");
+    p.r#loop = Some(LoopRange { start_tick: Tick(0), end_tick: Tick(7680), enabled: true });
+    let mut cache = rawdawg_audio_engine::ProjectAssetCache::new(Some(dir.clone()));
+    cache.sync(Some(dir.clone()), &p);
+    let limits = EngineLimits::DEFAULT;
+    let out = compile(&p, 1, 256, &limits, &Default::default(), &cache).unwrap();
+    let _worker = out.stream_worker.expect("a stream worker for the long clip");
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    engine.install_plan(out.plan);
+    assert!(handle.send(EngineCommand::SetMode(TransportMode::Song)).is_ok());
+    assert!(handle.send(EngineCommand::SetMasterProtection(false)).is_ok());
+    // give the worker a moment to pre-fill, then play 2.5 loops (10 s)
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(handle.send(EngineCommand::Play).is_ok());
+    let mut out_l = Vec::new();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    let t0 = std::time::Instant::now();
+    let total_blocks = 10 * 48_000 / 256;
+    for b in 0..total_blocks {
+        // pace roughly like a device so the worker can keep up (4× faster than real time)
+        let due = std::time::Duration::from_micros((b as u64 * 256 * 1_000_000 / 48_000) / 4);
+        if let Some(wait) = due.checked_sub(t0.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        engine.render_block(&mut l, &mut r);
+        out_l.extend_from_slice(&l);
+    }
+    // first pass: 440 Hz in bar 1, 880 Hz in bar 2
+    assert!((dominant_frequency(&out_l[20_000..40_000], 48_000.0) - 440.0).abs() < 1.0);
+    assert!((dominant_frequency(&out_l[120_000..160_000], 48_000.0) - 880.0).abs() < 1.0);
+    // after the wrap at 4 s (frame 192 000): the clip at bar 1 sounds again within 300 ms
+    let after = &out_l[192_000 + 14_400..192_000 + 48_000];
+    assert!(rms(after) > 0.2, "stream recovered after the loop wrap: rms {}", rms(after));
+    assert!((dominant_frequency(after, 48_000.0) - 440.0).abs() < 1.0);
+    let dropouts = handle.status.stream_dropouts.get();
+    assert!(dropouts < 2 * 14_400, "wrap dropouts bounded: {dropouts} frames");
+    // steady state is allocation-free on the audio side
+    let (_, allocs) = measure_rt(|| {
+        for _ in 0..8 {
+            engine.render_block(&mut l, &mut r);
+        }
+    });
+    assert_eq!(allocs, 0, "streamed clip playback allocates on the audio thread");
+    drop(engine);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
