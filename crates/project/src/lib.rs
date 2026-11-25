@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod model;
 pub mod persist;
+pub mod preset;
 pub mod validate;
 
 pub use commands::{Command, CommandError, History};

@@ -3,6 +3,7 @@
 
 mod evolve;
 mod keyboard;
+mod presets;
 mod settings;
 mod synth_panel;
 mod waveform;

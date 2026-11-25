@@ -13,6 +13,7 @@ pub mod morph;
 pub mod mutate;
 pub mod params;
 pub mod patch;
+pub mod presets;
 pub mod registry;
 pub mod sculpt;
 pub mod synth;

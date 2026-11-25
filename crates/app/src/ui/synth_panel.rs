@@ -19,11 +19,12 @@ pub(crate) struct SynthPanelState {
     pub advanced: bool,
     pub waveform: super::waveform::WaveformState,
     pub evolve: super::evolve::EvolveState,
+    pub presets: super::presets::PresetBrowserState,
 }
 
 impl Default for SynthPanelState {
     fn default() -> Self {
-        Self { gesture: None, advanced: false, waveform: Default::default(), evolve: super::evolve::EvolveState::new() }
+        Self { gesture: None, advanced: false, waveform: Default::default(), evolve: super::evolve::EvolveState::new(), presets: Default::default() }
     }
 }
 
@@ -54,6 +55,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             commit_patch(app, instance_id, rawdawg_synthesizer::Patch::default());
         }
     });
+    super::presets::show(app, ui, instance_id);
     super::waveform::show(app, ui, instance_id);
     super::evolve::randomize_bar(app, ui, instance_id);
     ui.separator();
