@@ -2204,7 +2204,7 @@
       "pan": 0.0,
       "mute": false,
       "solo": false,
-      "mixer_id": "00000000-0000-0000-0000-000031000002"
+      "mixer_id": "00000000-0000-0000-0000-000031000010"
     }
   ],
   "patterns": [
@@ -2549,6 +2549,120 @@
         "mute": false,
         "solo": false,
         "inserts": [],
+        "sends": [],
+        "output_id": "00000000-0000-0000-0000-000031000001"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000031000010",
+        "name": "Lead",
+        "color": null,
+        "gain_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false,
+        "inserts": [
+          {
+            "id": "00000000-0000-0000-0000-0000f0000001",
+            "format": "native",
+            "type_id": "native.fx.eq",
+            "display_name": "Parametric EQ",
+            "vendor": "",
+            "version": "",
+            "state_version": 1,
+            "state": {
+              "params": {
+                "band0.freq": 0.20068666338920593,
+                "band0.gain": 0.5,
+                "band0.kind": 0.800000011920929,
+                "band0.on": 1.0,
+                "band0.q": 0.4675000011920929,
+                "band1.freq": 0.8996566534042358,
+                "band1.gain": 0.5416666865348816,
+                "band1.kind": 0.4000000059604645,
+                "band1.on": 1.0,
+                "band1.q": 0.4675000011920929,
+                "band2.freq": 0.20000000298023224,
+                "band2.gain": 0.5,
+                "band2.kind": 0.0,
+                "band2.on": 0.0,
+                "band2.q": 0.4675000011920929,
+                "band3.freq": 0.3499999940395355,
+                "band3.gain": 0.5,
+                "band3.kind": 0.0,
+                "band3.on": 0.0,
+                "band3.q": 0.4675000011920929,
+                "band4.freq": 0.44999998807907104,
+                "band4.gain": 0.5,
+                "band4.kind": 0.0,
+                "band4.on": 0.0,
+                "band4.q": 0.4675000011920929,
+                "band5.freq": 0.6499999761581421,
+                "band5.gain": 0.5,
+                "band5.kind": 0.0,
+                "band5.on": 0.0,
+                "band5.q": 0.4675000011920929,
+                "band6.freq": 0.800000011920929,
+                "band6.gain": 0.5,
+                "band6.kind": 0.0,
+                "band6.on": 0.0,
+                "band6.q": 0.4675000011920929,
+                "band7.freq": 0.8999999761581421,
+                "band7.gain": 0.5,
+                "band7.kind": 0.4000000059604645,
+                "band7.on": 0.0,
+                "band7.q": 0.4675000011920929,
+                "output": 0.5
+              },
+              "version": 1
+            },
+            "bypass": false,
+            "mix": 1.0
+          }
+        ],
+        "sends": [
+          {
+            "target_id": "00000000-0000-0000-0000-000031000011",
+            "level_db": -9.0,
+            "tap": "post_fader",
+            "sidechain": false
+          }
+        ],
+        "output_id": "00000000-0000-0000-0000-000031000001"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000031000011",
+        "name": "Wide",
+        "color": null,
+        "gain_db": 0.0,
+        "pan": 0.0,
+        "mute": false,
+        "solo": false,
+        "inserts": [
+          {
+            "id": "00000000-0000-0000-0000-0000f0000002",
+            "format": "native",
+            "type_id": "native.fx.stereo",
+            "display_name": "Stereo",
+            "vendor": "",
+            "version": "",
+            "state_version": 1,
+            "state": {
+              "params": {
+                "balance": 0.5,
+                "gain": 0.7142857313156128,
+                "mono": 0.0,
+                "pan": 0.5,
+                "phase_l": 0.0,
+                "phase_r": 0.0,
+                "swap": 0.0,
+                "width": 0.75
+              },
+              "version": 1
+            },
+            "bypass": false,
+            "mix": 1.0
+          }
+        ],
         "sends": [],
         "output_id": "00000000-0000-0000-0000-000031000001"
       }

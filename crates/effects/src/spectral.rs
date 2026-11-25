@@ -20,6 +20,8 @@ pub const STATE_VERSION: u32 = 1;
 pub const FRAME: usize = 2048;
 pub const HOP: usize = 512;
 const BINS: usize = FRAME / 2 + 1;
+/// Tilt gain never exceeds this at the band edges (keeps impulses bounded).
+const MAX_TILT_DB: f32 = 18.0;
 
 pub const P_FREEZE: u32 = 1;
 pub const P_BLUR: u32 = 2;
@@ -162,9 +164,10 @@ fn process_frame(st: &mut State, spec: &mut [Complex<f32>], s: Settings) -> bool
         }
     }
     if s.tilt_db.abs() >= 1e-3 {
+        // the slope pivots at 1 kHz and is bounded to ±MAX_TILT_DB at the extremes
         for (k, m) in st.mag.iter_mut().enumerate().skip(1) {
             let oct = (k as f32 * s.bin_hz / 1000.0).log2();
-            *m *= db_to_lin(s.tilt_db * oct);
+            *m *= db_to_lin((s.tilt_db * oct).clamp(-MAX_TILT_DB, MAX_TILT_DB));
         }
     }
     // rebuild the spectrum: synthesised phases (freeze/robot) or the analysed ones

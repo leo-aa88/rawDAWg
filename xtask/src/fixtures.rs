@@ -150,6 +150,7 @@ pub fn demo_song_project() -> Project {
     let master = p.mixer.master_id;
     let lead = rawdawg_types::MixerChannelId::from_u128(0x3100_0010);
     let wide = rawdawg_types::MixerChannelId::from_u128(0x3100_0011);
+    let echo = rawdawg_types::MixerChannelId::from_u128(0x3100_0005);
     let eq_state: serde_json::Value =
         serde_json::from_slice(&rawdawg_effects::preset_state(rawdawg_effects::eq::TYPE_ID, &rawdawg_effects::eq::PRESETS[1]).expect("eq preset")).expect("json");
     let mut eq = Instance { id: rawdawg_types::InstanceId::from_u128(0xF000_0001), ..Instance::native(rawdawg_effects::eq::TYPE_ID, eq_state) };
@@ -167,7 +168,27 @@ pub fn demo_song_project() -> Project {
         mute: false,
         solo: false,
         inserts: vec![eq],
-        sends: vec![Send { target_id: wide, level_db: rawdawg_types::units::Db(-9.0), tap: SendTap::PostFader, sidechain: false }],
+        sends: vec![
+            Send { target_id: wide, level_db: rawdawg_types::units::Db(-9.0), tap: SendTap::PostFader, sidechain: false },
+            Send { target_id: echo, level_db: rawdawg_types::units::Db(-14.0), tap: SendTap::PostFader, sidechain: false },
+        ],
+        output_id: Some(master),
+    });
+    // an echo bus with a tempo-synced delay (dotted eighth), fed quietly from the lead
+    let delay_state: serde_json::Value =
+        serde_json::from_slice(&rawdawg_effects::preset_state(rawdawg_effects::delay::TYPE_ID, &rawdawg_effects::delay::PRESETS[1]).expect("delay preset")).expect("json");
+    let mut delay = Instance { id: rawdawg_types::InstanceId::from_u128(0xF000_0003), ..Instance::native(rawdawg_effects::delay::TYPE_ID, delay_state) };
+    delay.display_name = "Delay".into();
+    p.mixer.channels.push(MixerChannel {
+        id: echo,
+        name: "Echo".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![delay],
+        sends: vec![],
         output_id: Some(master),
     });
     p.mixer.channels.push(MixerChannel {
