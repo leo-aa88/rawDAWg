@@ -4,7 +4,6 @@
 mod audio;
 mod cli;
 mod prefs;
-mod record;
 mod theme;
 mod ui;
 

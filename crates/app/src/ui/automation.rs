@@ -3,7 +3,7 @@
 //! created from any parameter's context menu, touch/write capture of parameter
 //! gestures while the song plays, and morph gestures baked into curves.
 
-use super::{App, AudioState, EditorView, TransportMode};
+use super::{App, AudioState, EditorView, PointerState, TransportMode};
 use crate::theme;
 use egui::{Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_audio_engine::schedule::Schedule;
@@ -476,10 +476,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // interaction
-    let pointer = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+    let ptr = PointerState::read(ui);
+    let pointer = ptr.pos;
     let hit = |p: Pos2| pts.iter().find(|pt| (pos2(x_of(pt.tick.0), y_of(pt.value)) - p).length() < 7.0).cloned();
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Primary)
+    if ptr.primary_pressed
+        && resp.contains_pointer()
         && let Some(p) = pointer
         && area.contains(p)
     {
@@ -498,7 +499,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     }
-    if resp.dragged()
+    if ptr.primary_down
+        && !ptr.primary_pressed
         && let Some(p) = pointer
         && let Some((id, working)) = app.automation.drag.as_mut()
         && let Some(pt) = working.iter_mut().find(|q| q.id == *id)
@@ -506,7 +508,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         pt.tick = Tick(tick_at(p.x).max(0));
         pt.value = value_at(p.y);
     }
-    if resp.drag_stopped()
+    if (ptr.primary_released || !ptr.primary_down)
         && let Some((_, mut working)) = app.automation.drag.take()
     {
         working.sort_by_key(|q| q.tick.0);

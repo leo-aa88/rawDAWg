@@ -3,7 +3,7 @@
 //! undoable commands, maps learned CCs to instrument parameters.
 
 use super::{App, AudioState, EditorView, EngineCommand, TransportMode};
-use crate::record::Take;
+use rawdawg_audio_engine::Take;
 use rawdawg_dsp::processor::Processor;
 use rawdawg_project::{AutomationTarget, Clip, ClipContent, Command, Lane, MidiMapping, Pattern, Track};
 use rawdawg_types::events::{EventKind, EventSource, TimedEvent};

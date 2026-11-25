@@ -13,6 +13,8 @@ mod recording;
 mod sequencer;
 mod settings;
 mod synth_panel;
+#[cfg(test)]
+mod tests;
 mod waveform;
 
 use crate::audio::AudioSystem;
@@ -57,6 +59,47 @@ pub(crate) enum AudioState {
     Failed(String),
 }
 
+/// Pointer snapshot for custom editors (press/release are edge events of this frame).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PointerState {
+    pub pos: Option<egui::Pos2>,
+    pub primary_pressed: bool,
+    pub secondary_pressed: bool,
+    pub primary_down: bool,
+    pub secondary_down: bool,
+    pub primary_released: bool,
+    pub secondary_released: bool,
+}
+
+impl PointerState {
+    pub fn read(ui: &egui::Ui) -> Self {
+        ui.input(|i| Self {
+            pos: i.pointer.latest_pos(),
+            primary_pressed: i.pointer.button_pressed(egui::PointerButton::Primary),
+            secondary_pressed: i.pointer.button_pressed(egui::PointerButton::Secondary),
+            primary_down: i.pointer.primary_down(),
+            secondary_down: i.pointer.secondary_down(),
+            primary_released: i.pointer.button_released(egui::PointerButton::Primary),
+            secondary_released: i.pointer.button_released(egui::PointerButton::Secondary),
+        })
+    }
+    pub fn any_down(&self) -> bool {
+        self.primary_down || self.secondary_down
+    }
+    pub fn any_released(&self) -> bool {
+        self.primary_released || self.secondary_released
+    }
+}
+
+/// Which custom editor receives editing keys when the pointer is not over one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum KeyTarget {
+    #[default]
+    None,
+    Playlist,
+    PianoRoll,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EditorView {
     Rack,
@@ -76,8 +119,10 @@ pub(crate) struct App {
     pub loop_enabled: bool,
     pub record: recording::RecordState,
     pub automation: automation::AutomationState,
+    pub key_target: KeyTarget,
     pub midi_learn: Option<rawdawg_project::AutomationTarget>,
     pub midi_dirty: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
+    persist_prefs: bool,
     pub devices: DeviceSnapshot,
     pub audio: AudioState,
     pub limits: EngineLimits,
@@ -120,9 +165,14 @@ pub(crate) struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, opts: GuiOptions) -> Self {
-        theme::apply(&cc.egui_ctx);
+        Self::build(&cc.egui_ctx, opts, Preferences::load(), true)
+    }
+
+    /// Build the app for a context; `persist_prefs` is false for headless UI tests.
+    pub(crate) fn build(ctx: &egui::Context, opts: GuiOptions, prefs: Preferences, persist_prefs: bool) -> Self {
+        theme::apply(ctx);
         let limits = EngineLimits::DEFAULT;
-        let mut prefs = Preferences::load();
+        let mut prefs = prefs;
         let (project, project_path, mut status_line) = match &opts.open {
             Some(p) => match rawdawg_project::load_project_dir(p) {
                 Ok(proj) => {
@@ -204,8 +254,10 @@ impl App {
             loop_enabled: true,
             record: Default::default(),
             automation: Default::default(),
+            key_target: KeyTarget::None,
             midi_learn: None,
             midi_dirty: HashMap::new(),
+            persist_prefs,
         };
         app.rebuild_mirrors();
         app.recompile();
@@ -1061,6 +1113,23 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.step(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if self.persist_prefs {
+            let _ = self.prefs.save();
+        }
+    }
+}
+
+impl App {
+    /// Per-frame logic (shortcuts, input polling, engine housekeeping). Also used by headless tests.
+    pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
             self.save_project();
@@ -1108,45 +1177,65 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("browser").resizable(true).default_size(220.0).show(ui, |ui| self.browser(ui));
-        egui::Panel::bottom("editor").resizable(true).default_size(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.editor_view {
-                EditorView::Rack => self.rack(ui),
-                EditorView::PianoRoll => piano_roll::show(self, ui),
-                EditorView::Automation => automation::show(self, ui),
-                EditorView::Synth => {
-                    let is_synth =
-                        self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);
-                    match (is_synth, self.selected_channel.and_then(|id| self.project.channel(id)).map(|c| c.instrument.id)) {
-                        (true, _) => synth_panel::show(self, ui),
-                        (false, Some(inst)) => instrument_panel::show(self, ui, inst),
-                        _ => {
-                            ui.label("Select a channel in the rack.");
-                        }
-                    }
-                }
+    /// The whole window layout. Also used by headless tests.
+    pub(crate) fn draw(&mut self, ui: &mut egui::Ui) {
+        self.draw_parts(ui, u8::MAX);
+    }
+
+    /// Window layout with selectable parts (bitmask; tests isolate interactions).
+    pub(crate) fn draw_parts(&mut self, ui: &mut egui::Ui, parts: u8) {
+        if parts & 1 != 0 {
+            egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
+        }
+        if parts & 2 != 0 {
+            egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        }
+        if parts & 4 != 0 {
+            egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        }
+        if parts & 8 != 0 {
+            egui::Panel::left("browser").resizable(true).default_size(220.0).show(ui, |ui| self.browser(ui));
+        }
+        if parts & 16 != 0 {
+            egui::Panel::bottom("editor").resizable(true).default_size(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.editor_contents(ui));
             });
-        });
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("playlist-scroll").show(ui, |ui| playlist::show(self, ui));
-        });
+        }
+        if parts & 32 != 0 {
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("playlist-scroll").auto_shrink([false, false]).show(ui, |ui| playlist::show(self, ui));
+            });
+        }
         if self.show_settings {
             settings::show(self, ui.ctx());
         }
     }
 
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
-        let _ = self.prefs.save();
+    fn editor_contents(&mut self, ui: &mut egui::Ui) {
+        match self.editor_view {
+            EditorView::Rack => self.rack(ui),
+            EditorView::PianoRoll => piano_roll::show(self, ui),
+            EditorView::Automation => automation::show(self, ui),
+            EditorView::Synth => {
+                let is_synth =
+                    self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);
+                match (is_synth, self.selected_channel.and_then(|id| self.project.channel(id)).map(|c| c.instrument.id)) {
+                    (true, _) => synth_panel::show(self, ui),
+                    (false, Some(inst)) => instrument_panel::show(self, ui, inst),
+                    _ => {
+                        ui.label("Select a channel in the rack.");
+                    }
+                }
+            }
+        }
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
         self.send(EngineCommand::Panic { source: None });
-        let _ = self.prefs.save();
+        if self.persist_prefs {
+            let _ = self.prefs.save();
+        }
     }
 }

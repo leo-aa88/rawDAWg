@@ -119,7 +119,8 @@ pub(crate) fn step_row(app: &mut App, ui: &mut egui::Ui, channel_id: ChannelId, 
             let in_step: Vec<&Note> = notes.iter().filter(|n| n.tick.0 >= start && n.tick.0 < end).collect();
             let on = in_step.iter().any(|n| n.tick.0 == start);
             let marker = in_step.iter().any(|n| n.tick.0 != start);
-            let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let resp = ui.interact(rect, egui::Id::unique(("step", channel_id, i)), Sense::click_and_drag());
             let group_dark = (i / 4) % 2 == 1;
             let fill = if on {
                 let v = in_step.iter().map(|n| n.velocity).fold(0.0f32, f32::max);
@@ -165,11 +166,12 @@ pub(crate) fn step_row(app: &mut App, ui: &mut egui::Ui, channel_id: ChannelId, 
                     cmds.push(Command::RemoveNotes { pattern_id: pid, channel_id, note_ids: ids });
                 }
             };
-            if resp.drag_started() || resp.clicked() {
+            let pressed_here = resp.contains_pointer() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+            if pressed_here {
                 let want = !on;
                 app.sequencer.paint = Some((channel_id, want));
                 toggle_to(app, want, cmds);
-            } else if resp.hovered()
+            } else if resp.contains_pointer()
                 && pointer_down
                 && let Some((ch, want)) = app.sequencer.paint
                 && ch == channel_id

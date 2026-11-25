@@ -297,6 +297,24 @@ impl Clip {
     }
 }
 
+impl Pattern {
+    /// An independent copy under new ids (pattern, notes, controller events) — "make unique".
+    pub fn duplicate(&self, name: String) -> Pattern {
+        let mut p = self.clone();
+        p.id = PatternId::new();
+        p.name = name;
+        for lane in &mut p.lanes {
+            for n in &mut lane.notes {
+                n.id = NoteId::new();
+            }
+            for c in &mut lane.controllers {
+                c.id = ControllerEventId::new();
+            }
+        }
+        p
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendTap {

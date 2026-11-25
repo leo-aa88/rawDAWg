@@ -4,7 +4,7 @@
 //! playhead and click-to-seek. Audio clips are shown but play back in M5.
 
 use super::piano_roll::Snap;
-use super::{App, EngineCommand, TransportMode};
+use super::{App, EngineCommand, PointerState, TransportMode};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_project::{Clip, ClipContent, Command, LoopRange, MeterPoint, Pattern, TempoPoint, Track};
@@ -25,6 +25,12 @@ enum Gesture {
     Erase,
     Box { start: Pos2 },
     LoopRange { start_tick: i64 },
+}
+
+/// Screen position of (tick, track row) inside the lanes for the current view (tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lane_point(st: &PlaylistState, full: Rect, tick: i64, row: usize) -> Pos2 {
+    pos2(full.min.x + HEADER_W + (tick as f32 - st.scroll_tick) * st.px_per_tick, full.min.y + RULER_H + MARKER_H + (row as f32 + 0.5) * TRACK_H)
 }
 
 pub(crate) struct PlaylistState {
@@ -110,9 +116,9 @@ fn commit(app: &mut App) {
     }
 }
 
-/// Clone a pattern under a new id (Make unique).
+/// Clone a pattern under new ids (Make unique).
 fn clone_pattern(p: &Pattern, n: usize) -> Pattern {
-    Pattern { id: PatternId::new(), name: format!("{} copy {n}", p.name), ..p.clone() }
+    p.duplicate(format!("{} copy {n}", p.name))
 }
 
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -176,7 +182,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let avail = ui.available_size();
     let tracks = app.project.tracks.clone();
     let total_h = (RULER_H + MARKER_H + TRACK_H * tracks.len().max(1) as f32 + 8.0).max(avail.y.min(600.0)).max(160.0);
-    let (full, resp) = ui.allocate_exact_size(vec2(avail.x.max(300.0), total_h), Sense::click_and_drag());
+    let (full, _) = ui.allocate_exact_size(vec2(avail.x.max(300.0), total_h), Sense::hover());
+    let resp = ui.interact(full, egui::Id::unique("playlist-surface"), Sense::click_and_drag());
     let painter = ui.painter_at(full);
     painter.rect_filled(full, 3.0, theme::BACKGROUND);
     let lanes_rect = Rect::from_min_max(pos2(full.min.x + HEADER_W, full.min.y + RULER_H + MARKER_H), full.max);
@@ -486,7 +493,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // --- interaction ---
     let mods = ui.input(|i| i.modifiers);
-    let pointer = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+    let ptr = PointerState::read(ui);
+    let over = resp.contains_pointer();
+    let pointer = ptr.pos;
     let egrid = if mods.alt { None } else { grid };
     let hit = |p: Pos2| clips.iter().rev().find(|c| clip_rect(c).contains(p)).cloned();
     let selected_pattern = app.project.selected_pattern.or_else(|| app.project.patterns.first().map(|p| p.id));
@@ -499,8 +508,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // ruler: click seeks, drag sets the loop range
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Primary)
+    if ptr.primary_pressed
+        && over
         && let Some(p) = pointer
         && ruler_rect.contains(p)
     {
@@ -517,12 +526,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         app.editor_view = super::EditorView::Automation;
     }
     // lanes: primary press
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Primary)
+    if ptr.primary_pressed
+        && over
         && let Some(p) = pointer
         && lanes_rect.contains(p)
     {
-        resp.request_focus();
+        app.key_target = super::KeyTarget::Playlist;
         let st = &mut app.playlist;
         match hit(p) {
             Some(c) => {
@@ -569,20 +578,20 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     }
-    // secondary press: delete / erase
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Secondary)
+    // secondary press on empty lane: erase gesture (right-click on a clip opens its menu)
+    if ptr.secondary_pressed
+        && over
         && let Some(p) = pointer
         && lanes_rect.contains(p)
+        && hit(p).is_none()
     {
         app.playlist.gesture = Some(Gesture::Erase);
-        if let Some(c) = hit(p) {
-            app.playlist.selection.remove(&c.id);
-            cmds.push(Command::RemoveClip { id: c.id });
-        }
     }
-    // drag updates
-    if resp.dragged()
+    // drag updates (while a button is held)
+    if ptr.any_down()
+        && !ptr.primary_pressed
+        && !ptr.secondary_pressed
+        && app.playlist.gesture.is_some()
         && let Some(p) = pointer
     {
         match app.playlist.gesture.as_mut() {
@@ -690,7 +699,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // release
-    if resp.drag_stopped() || (app.playlist.gesture.is_some() && !resp.dragged() && !resp.drag_started()) {
+    if app.playlist.gesture.is_some() && (ptr.any_released() || !ptr.any_down()) {
         match app.playlist.gesture.take() {
             Some(Gesture::Box { start }) => {
                 if let Some(p) = pointer {
@@ -781,8 +790,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         });
     }
     // keys
-    let focused = resp.has_focus();
-    if (ui.rect_contains_pointer(full) || focused) && !ui.memory(|m| m.focused().is_some_and(|f| f != resp.id)) {
+    let text_focused = ui.memory(|m| m.focused().is_some());
+    if (ui.rect_contains_pointer(full) || app.key_target == super::KeyTarget::Playlist) && !text_focused {
         let (del, split, dup, all, esc) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),

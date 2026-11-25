@@ -5309,6 +5309,7 @@ dependencies = [
  "rawdawg-project",
  "rawdawg-sampler",
  "rawdawg-synthesizer",
+ "rawdawg-transport",
  "rawdawg-types",
  "serde",
  "serde_json",

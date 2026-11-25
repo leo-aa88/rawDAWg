@@ -4,7 +4,7 @@
 //! controller events. Raw timing is preserved; quantization is a separate,
 //! explicit step.
 
-use rawdawg_audio_engine::RecordedEvent;
+use crate::commands::RecordedEvent;
 use rawdawg_project::{ControllerEvent, ControllerKind, Note};
 use rawdawg_transport::TempoMap;
 use rawdawg_types::events::{EventKind, EventSource};

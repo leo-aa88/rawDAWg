@@ -3,7 +3,7 @@
 //! scale highlight/snap, chord insertion and quantize with strength + preview.
 //! Same note model as the step grid; every persistent edit is a command.
 
-use super::{App, EngineCommand};
+use super::{App, EngineCommand, PointerState};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_project::{Command, Note};
@@ -238,6 +238,13 @@ pub(crate) struct QuantizeDialog {
     pub preview: bool,
     /// Notes before preview (restored on cancel/apply through the gesture).
     previewing: bool,
+}
+
+/// Screen position of (tick, pitch) inside the grid for the current view (tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn grid_point(st: &PianoRollState, full: Rect, tick: i64, pitch: f32) -> Pos2 {
+    let grid_min = pos2(full.min.x + KEYS_W, full.min.y + RULER_H);
+    pos2(grid_min.x + (tick as f32 - st.scroll_tick) * st.px_per_tick, grid_min.y + (st.view_top - pitch) * st.row_h)
 }
 
 pub(crate) struct PianoRollState {
@@ -488,7 +495,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     // layout
     let avail = ui.available_size();
     let total_h = avail.y.max(220.0);
-    let (full, resp) = ui.allocate_exact_size(vec2(avail.x.max(300.0), total_h), Sense::click_and_drag());
+    let (full, _) = ui.allocate_exact_size(vec2(avail.x.max(300.0), total_h), Sense::hover());
+    let resp = ui.interact(full, egui::Id::unique("piano-roll-surface"), Sense::click_and_drag());
     let painter = ui.painter_at(full);
     painter.rect_filled(full, 3.0, theme::BACKGROUND);
     let controllers: Vec<rawdawg_project::ControllerEvent> =
@@ -709,7 +717,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
 
     // --- interaction ---
     let mods = ui.input(|i| i.modifiers);
-    let pointer = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+    let ptr = PointerState::read(ui);
+    let over = resp.contains_pointer();
+    let pointer = ptr.pos;
     let effective_grid = if mods.alt { None } else { grid };
     let hit = |p: Pos2| notes.iter().rev().find(|n| note_rect(n).contains(p)).cloned();
     app.piano_roll.hover_text.clear();
@@ -722,7 +732,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut cmds: Vec<Command> = Vec::new();
 
     // keyboard ruler audition
-    if resp.drag_started()
+    if ptr.primary_pressed
+        && over
         && let Some(p) = pointer
         && keys_rect.contains(p)
     {
@@ -731,12 +742,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // primary press in the grid
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Primary)
+    if ptr.primary_pressed
+        && over
         && let Some(p) = pointer
         && grid_rect.contains(p)
     {
-        resp.request_focus();
+        app.key_target = super::KeyTarget::PianoRoll;
         let st = &mut app.piano_roll;
         let box_mode = st.tool == Tool::Select || mods.command;
         match hit(p) {
@@ -794,8 +805,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // secondary press: delete / erase
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Secondary)
+    if ptr.secondary_pressed
+        && over
         && let Some(p) = pointer
         && grid_rect.contains(p)
     {
@@ -807,8 +818,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // velocity lane press
-    if resp.drag_started()
-        && resp.dragged_by(egui::PointerButton::Primary)
+    if ptr.primary_pressed
+        && over
         && let Some(p) = pointer
         && vel_rect.contains(p)
     {
@@ -819,8 +830,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         app.piano_roll.gesture_target = Some((pid, cid));
     }
 
-    // drag updates
-    if resp.dragged()
+    // drag updates (while a button is held)
+    if ptr.any_down()
+        && !ptr.primary_pressed
+        && !ptr.secondary_pressed
+        && app.piano_roll.gesture.is_some()
         && let Some(p) = pointer
     {
         let st = &mut app.piano_roll;
@@ -907,7 +921,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // release
-    if resp.drag_stopped() || (app.piano_roll.gesture.is_some() && !resp.dragged() && !resp.drag_started()) {
+    if app.piano_roll.gesture.is_some() && (ptr.any_released() || !ptr.any_down()) {
         match app.piano_roll.gesture.take() {
             Some(Gesture::Box { start, additive }) => {
                 if let Some(p) = pointer {
@@ -939,8 +953,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     // keys (when the roll is hovered or focused)
-    let focused = resp.has_focus();
-    if (hovered || focused) && !ui.memory(|m| m.focused().is_some_and(|f| f != resp.id)) {
+    let text_focused = ui.memory(|m| m.focused().is_some());
+    if (hovered || app.key_target == super::KeyTarget::PianoRoll) && !text_focused {
         let (del, dup, copy, cut, paste, all, left, right, up, down, esc) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),

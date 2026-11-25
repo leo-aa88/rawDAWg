@@ -242,6 +242,236 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok((format!("centroid {c_early:.0} Hz → {c_late:.0} Hz across the sweep"), Some(dir.display().to_string())))
     }));
+    checks.push(check(
+        "E2E-02 (headless subset) steps, piano-roll edits, count-in recording, arrangement, tempo change, loop, export",
+        &["CORE-01", "CORE-02", "CORE-03", "CORE-04", "IO-03"],
+        || {
+            use rawdawg_audio_engine::commands::EngineCommand;
+            use rawdawg_audio_engine::engine::Engine;
+            use rawdawg_audio_engine::{Take, compile};
+            use rawdawg_project::{Clip, ClipContent, Command, History, LoopRange, Note, Pattern, Project, Track};
+            use rawdawg_types::events::{EventSource, TimedEvent};
+            use rawdawg_types::units::{PPQ, SampleRate, Tick, UsPerQuarter};
+            use rawdawg_types::{ClipId, NoteId, PatternId, TrackId};
+            let limits = rawdawg_types::limits::EngineLimits::DEFAULT;
+            let mut project = Project::new_default("e2e-02", serde_json::to_value(rawdawg_synthesizer::Patch::default())?);
+            let mut history = History::new();
+            let ch = project.channels[0].id;
+            let drums = project.patterns[0].id;
+            // 1. drum-like steps: four-on-the-floor on C2 through the step model (AddNotes per step)
+            for step in [0, 4, 8, 12] {
+                history.apply(
+                    &mut project,
+                    Command::AddNotes {
+                        pattern_id: drums,
+                        channel_id: ch,
+                        notes: vec![Note { id: NoteId::new(), tick: Tick(step * 240), duration_ticks: Tick(240), pitch: 36, velocity: 0.9, channel: 0 }],
+                    },
+                )?;
+            }
+            // 2. melodic pattern: notes, a chord, velocity edits
+            let melody = PatternId::new();
+            history.apply(
+                &mut project,
+                Command::AddPattern {
+                    pattern: Pattern { id: melody, name: "Melody".into(), color: None, length_ticks: Tick(PPQ * 4), steps: 16, step_ticks: Tick(240), lanes: vec![] },
+                },
+            )?;
+            let chord: Vec<Note> =
+                [60u8, 64, 67].iter().map(|p| Note { id: NoteId::new(), tick: Tick(PPQ * 2), duration_ticks: Tick(PPQ), pitch: *p, velocity: 0.6, channel: 0 }).collect();
+            let lead = Note { id: NoteId::new(), tick: Tick(0), duration_ticks: Tick(PPQ), pitch: 72, velocity: 0.5, channel: 0 };
+            history.apply(&mut project, Command::AddNotes { pattern_id: melody, channel_id: ch, notes: vec![lead] })?;
+            history.apply(&mut project, Command::AddNotes { pattern_id: melody, channel_id: ch, notes: chord.clone() })?;
+            history.apply(&mut project, Command::UpdateNotes { pattern_id: melody, channel_id: ch, notes: vec![Note { velocity: 1.0, ..lead }] })?;
+            history.undo(&mut project)?;
+            history.redo(&mut project)?;
+            if project.pattern(melody).unwrap().lanes[0].notes.iter().find(|n| n.id == lead.id).unwrap().velocity != 1.0 {
+                bail!("velocity edit lost across undo/redo");
+            }
+            // 3. record with a one-bar count-in: a live note on beat 2 of the pattern loop (overdub onto the melody)
+            history.apply(&mut project, Command::SelectPattern { id: Some(melody) })?;
+            let out = compile(&project, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets)?;
+            let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+            engine.install_plan(out.plan);
+            handle.send(EngineCommand::SetRecording(true)).map_err(|_| anyhow::anyhow!("queue"))?;
+            handle.send(EngineCommand::PlayWithCountIn { beats: 4 }).map_err(|_| anyhow::anyhow!("queue"))?;
+            let mut l = vec![0.0f32; 256];
+            let mut r = vec![0.0f32; 256];
+            let mut take = Take::new(melody, ch, PPQ * 4, 0, true, rawdawg_transport::TempoMap::constant(UsPerQuarter(500_000)), SampleRate(48_000), 0.0);
+            let mut blocks = 0;
+            let mut started = false;
+            while blocks < 375 + 300 {
+                if engine.status().playing.load(std::sync::atomic::Ordering::Relaxed) && !started {
+                    started = true;
+                }
+                // play a note while the transport is at beat 2 (frames 24 000..) → note-on at block 94 after start
+                let pos = engine.position_frame();
+                if started && pos == 94 * 256 {
+                    handle
+                        .send(EngineCommand::Live { channel: ch, event: TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 500, 65, 0.8) })
+                        .map_err(|_| anyhow::anyhow!("queue"))?;
+                }
+                if started && pos == 140 * 256 {
+                    handle
+                        .send(EngineCommand::Live { channel: ch, event: TimedEvent::note_off(0, EventSource::MidiDevice(0), 0, 500, 65) })
+                        .map_err(|_| anyhow::anyhow!("queue"))?;
+                }
+                l.fill(0.0);
+                r.fill(0.0);
+                engine.render_block(&mut l, &mut r);
+                while let Some(ev) = handle.poll_recorded() {
+                    take.push(ev);
+                }
+                blocks += 1;
+            }
+            take.finish(engine.position_frame());
+            if take.notes.len() != 1 {
+                bail!("expected one recorded note, got {}", take.notes.len());
+            }
+            let rec = take.notes[0];
+            // on at frame 94*256 = 24 064 → tick 962 (raw, not snapped); off at 140*256 → 1434 ticks later
+            if rec.tick.0 != 962 || rec.duration_ticks.0 != 471 || rec.pitch != 65 {
+                bail!("recorded note {rec:?}: expected tick 962, duration 471, pitch 65");
+            }
+            history.apply(&mut project, Command::AddNotes { pattern_id: melody, channel_id: ch, notes: take.notes.clone() })?;
+            // 4. arrange: drums repeat for 4 bars (looped clip), melody twice, make the second unique and trim it
+            let t1 = TrackId::new();
+            let t2 = TrackId::new();
+            history.apply(&mut project, Command::AddTrack { track: Track { id: t1, name: "Drums".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
+            history.apply(&mut project, Command::AddTrack { track: Track { id: t2, name: "Melody".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
+            history.apply(
+                &mut project,
+                Command::AddClip {
+                    clip: Clip {
+                        id: ClipId::new(),
+                        track_id: t1,
+                        start_tick: Tick(0),
+                        length_ticks: Tick(PPQ * 16),
+                        muted: false,
+                        content: ClipContent::Pattern { pattern_id: drums, source_offset_ticks: Tick::ZERO, looped: true },
+                    },
+                },
+            )?;
+            history.apply(
+                &mut project,
+                Command::AddClip {
+                    clip: Clip {
+                        id: ClipId::new(),
+                        track_id: t2,
+                        start_tick: Tick(0),
+                        length_ticks: Tick(PPQ * 4),
+                        muted: false,
+                        content: ClipContent::Pattern { pattern_id: melody, source_offset_ticks: Tick::ZERO, looped: false },
+                    },
+                },
+            )?;
+            let second = ClipId::new();
+            history.apply(
+                &mut project,
+                Command::AddClip {
+                    clip: Clip {
+                        id: second,
+                        track_id: t2,
+                        start_tick: Tick(PPQ * 8),
+                        length_ticks: Tick(PPQ * 4),
+                        muted: false,
+                        content: ClipContent::Pattern { pattern_id: melody, source_offset_ticks: Tick::ZERO, looped: false },
+                    },
+                },
+            )?;
+            let unique = project.pattern(melody).unwrap().duplicate("Melody copy".into());
+            let uid = unique.id;
+            history.apply(
+                &mut project,
+                Command::Batch {
+                    commands: vec![
+                        Command::AddPattern { pattern: unique },
+                        Command::UpdateClip {
+                            clip: Clip {
+                                id: second,
+                                track_id: t2,
+                                start_tick: Tick(PPQ * 8),
+                                length_ticks: Tick(PPQ * 4),
+                                muted: false,
+                                content: ClipContent::Pattern { pattern_id: uid, source_offset_ticks: Tick::ZERO, looped: false },
+                            },
+                        },
+                    ],
+                },
+            )?;
+            // trim the start of the unique clip by one beat (keeps the source offset) and transpose its chord up an octave
+            history.apply(
+                &mut project,
+                Command::UpdateClip {
+                    clip: Clip {
+                        id: second,
+                        track_id: t2,
+                        start_tick: Tick(PPQ * 9),
+                        length_ticks: Tick(PPQ * 3),
+                        muted: false,
+                        content: ClipContent::Pattern { pattern_id: uid, source_offset_ticks: Tick(PPQ), looped: false },
+                    },
+                },
+            )?;
+            let up: Vec<Note> = project.pattern(uid).unwrap().lanes[0].notes.iter().filter(|n| n.tick.0 == PPQ * 2).map(|n| Note { pitch: n.pitch + 12, ..*n }).collect();
+            history.apply(&mut project, Command::UpdateNotes { pattern_id: uid, channel_id: ch, notes: up })?;
+            if project.pattern(melody).unwrap().lanes[0].notes.iter().any(|n| n.pitch > 72) {
+                bail!("make unique leaked edits into the original pattern");
+            }
+            // 5. tempo change at bar 3 and a loop range over bars 2–3
+            let mut tempo = project.tempo.clone();
+            tempo.push(rawdawg_project::TempoPoint { tick: Tick(PPQ * 8), us_per_quarter: UsPerQuarter(400_000) });
+            history.apply(&mut project, Command::SetTempoMap { tempo })?;
+            history.apply(&mut project, Command::SetLoop { range: Some(LoopRange { start_tick: Tick(PPQ * 4), end_tick: Tick(PPQ * 12), enabled: true }) })?;
+            rawdawg_project::validate(&project)?;
+            // 6. export the song and inspect timing: kick onsets at every beat; bars 1–2 at 120 BPM (4 s),
+            //    bars 3–4 at 150 BPM (8 beats × 0.4 s)
+            let mut p_export = project.clone();
+            p_export.r#loop = None;
+            let opts = OfflineOptions { mode: rawdawg_audio_engine::TransportMode::Song, tail_seconds: 0.0, ..Default::default() };
+            let (l, _, stats) = render_project(&p_export, &opts)?;
+            let expected_frames = 48_000.0 * (4.0 + 8.0 * 0.4);
+            if (stats.frames as f64 - expected_frames).abs() > 2.0 {
+                bail!("song length {} frames, expected ≈{expected_frames:.0}", stats.frames);
+            }
+            let rms_at = |f: usize| rawdawg_dsp::math::rms(&l[f..f + 2_000]);
+            for beat in 0..8usize {
+                let at = beat * 24_000;
+                if rms_at(at + 100) < 0.02 {
+                    bail!("no kick at beat {beat} (frame {at})");
+                }
+            }
+            // after the tempo change (bar 3 = frame 192 000) beats are 19 200 frames apart
+            for beat in 0..8usize {
+                let at = 192_000 + beat * 19_200;
+                if rms_at(at + 100) < 0.02 {
+                    bail!("no kick at bar 3 beat {beat} (frame {at}) after the tempo change");
+                }
+            }
+            // the recorded note (F4, 962 ticks ≈ frame 24 050) sounds in bar 1
+            let f = dominant_frequency(&l[26_000..34_000], 48_000.0);
+            let ok_f4 = (f - 349.23).abs() < 3.0 || (f - 65.41).abs() < 2.0; // F4 or the kick fundamental, depending on balance
+            if !ok_f4 {
+                bail!("unexpected dominant frequency after the recorded note: {f:.1} Hz");
+            }
+            // loop range playback: with the loop on, the engine wraps at bar 3 instead of continuing
+            let out = compile(&project, 2, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets)?;
+            let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+            engine.install_plan(out.plan);
+            handle.send(EngineCommand::SetMode(rawdawg_audio_engine::TransportMode::Song)).map_err(|_| anyhow::anyhow!("queue"))?;
+            handle.send(EngineCommand::SeekTick(PPQ * 11)).map_err(|_| anyhow::anyhow!("queue"))?;
+            handle.send(EngineCommand::Play).map_err(|_| anyhow::anyhow!("queue"))?;
+            let (mut bl, mut br) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+            for _ in 0..200 {
+                engine.render_block(&mut bl, &mut br);
+            }
+            let tick_now = engine.status().position_tick.load(std::sync::atomic::Ordering::Relaxed);
+            if !(PPQ * 4..PPQ * 12).contains(&tick_now) {
+                bail!("loop did not wrap into bars 2–3: playhead at tick {tick_now}");
+            }
+            Ok((format!("recorded note tick 962/dur 471, undo/redo exact, song {} frames with tempo change, loop wrapped to tick {tick_now}", stats.frames), None))
+        },
+    ));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");
