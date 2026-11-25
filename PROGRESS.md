@@ -129,6 +129,14 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - `native.fx.gate`: threshold, hysteresis, attack, hold, release, range (floor), external sidechain, GR meter. Presets: Drum gate, Noise cleanup, Chopper (sidechain). Tests: closed below threshold, opens on a burst, hysteresis keeps it open between the close and open points, hold then close, range floor.
 - Effect editor shows a gain-reduction bar for dynamics. All three are allocation-free on the process path and carry over across plan swaps like other inserts.
 
+### Slice 3 — delays (FX-01/02/03 subset)
+
+256 automated tests pass, clippy clean.
+
+- `native.fx.delay` with five modes: **Stereo** (independent L/R, L/R offset ±50 percent), **Ping-pong** (mono in, crossed feedback alternating sides), **Tape** (wow LFO modulating the read position, tanh saturation with drive in the feedback path), **Multitap** (16 taps, each on/off, time as a ratio 0–4× of the base time, gain, pan; taps read the input line, feedback from the base tap) and **Reverse** (segment buffers of the base time played backwards; latency = segment length, reported and compensated; feedback re-enters the segment). Base time in ms (1–2000, 20 ms glide) or **tempo-synced** (1/32 … 1/1 with dotted and triplet values from the transport tempo). Feedback bounded at 98 percent with a soft clip in the loop, damping low-pass and low-cut in the feedback path, wet width control, mix. Tail reported as frames to −60 dB or Unknown near unity feedback. 7 presets covering every mode (Slapback, Dotted eighth, Ping-pong 1/4, Tape wobble, Multitap rhythm, Reverse 1/2, Dub throw).
+- Effect editor: multitap **tap canvas** (time ratio × gain with ms labels for the current base time; click adds a tap, drag moves it, wheel pans, right-click toggles) — "tap drag changes time/gain" per DSP.md; tap parameters move to the Advanced grid.
+- Tests (`crates/effects/tests/delay.rs`): echo at 250 ms with geometric decay at 50 percent feedback and silence between repeats, L/R offset, tempo sync at 120/90 BPM and dotted eighths, ping-pong alternation, multitap tap positions/gains/pan, reverse ramp reversal with 4800-frame latency, tape wow spacing modulation and bounded output at maximum feedback with full drive, a preset per mode (all distinct), allocation-free processing in every mode (a `Vec`-returning tap helper found by the guard and replaced with a fixed array).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -183,7 +191,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M4 in progress (slices 1–2: mixer routing/inserts, EQ, stereo, compressor, limiter, gate); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M4 in progress (slices 1–3: mixer routing/inserts, EQ, stereo, dynamics, delay); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M4 — mixer UI and routing (buses/sends/sidechain/parallel, latency compensation), then native effects one vertical slice each (EQ, compressor, limiter, delay, reverbs, distortion, modulation, stereo, pitch/formant, granular, spectral) with presets, tests and dark editors; automation/MIDI-learn targets extended to mixer and effects.
 2. M3 leftovers when touched: rack channel reorder/duplicate, pattern-mode automation, CC capture into automation.
 3. (was) pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.

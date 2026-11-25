@@ -15,6 +15,8 @@ pub(crate) struct EffectPanelState {
     pub advanced: bool,
     /// EQ band being dragged.
     eq_drag: Option<usize>,
+    /// Delay tap being dragged.
+    tap_drag: Option<usize>,
 }
 
 fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
@@ -120,10 +122,16 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     if type_id == rawdawg_effects::eq::TYPE_ID {
         eq_editor(app, ui, instance_id, &mut edits);
     }
+    if type_id == rawdawg_effects::delay::TYPE_ID {
+        delay_editor(app, ui, instance_id, &mut edits);
+    }
     let descriptors: Vec<ParamDescriptor> = app.other_mirrors[&instance_id].descriptors().iter().filter(|d| !d.flags.hidden).copied().collect();
     let simple_only = !app.effect_panel.advanced && type_id == rawdawg_effects::eq::TYPE_ID;
     if !simple_only {
-        param_grid(app, ui, instance_id, &descriptors, &mut edits);
+        // the multitap tap parameters are edited on the canvas unless Advanced is on
+        let shown: Vec<ParamDescriptor> =
+            if type_id == rawdawg_effects::delay::TYPE_ID && !app.effect_panel.advanced { descriptors.iter().filter(|d| d.id.0 < 100).copied().collect() } else { descriptors };
+        param_grid(app, ui, instance_id, &shown, &mut edits);
     }
     apply_edits(app, instance_id, &type_id, edits);
     for c in cmds {
@@ -407,4 +415,129 @@ fn eq_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &
         }
         ui.label(egui::RichText::new("Click the plot to add a bell · drag a band · wheel changes Q · right-click removes").color(theme::TEXT_SECONDARY).small());
     });
+}
+
+// ---------------------------------------------------------------------------
+// Delay: multitap editor (time ratio × gain, drag taps; pan with the wheel)
+
+fn delay_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    use rawdawg_effects::delay::{Delay, MAX_TAPS, MODE_LABELS, T_GAIN, T_ON, T_PAN, T_TIME, tap_param};
+    let descs = app.other_mirrors[&instance_id].descriptors();
+    let desc = |id: u32| descs.iter().find(|d| d.id.0 == id).copied();
+    let (mode, taps, base_ms) = {
+        let m = app.other_mirrors.get_mut(&instance_id).expect("mirror");
+        let d = m.as_any_mut().downcast_mut::<Delay>().expect("delay mirror");
+        (d.mode(), d.taps(), d.base_time_ms(app.project.tempo.first().map(|t| t.us_per_quarter.bpm().0).unwrap_or(120.0)))
+    };
+    ui.label(egui::RichText::new(format!("{} · base time {base_ms:.0} ms", MODE_LABELS[mode.min(4)])).color(theme::TEXT_SECONDARY));
+    if mode != 3 {
+        return;
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(300.0), 160.0), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, theme::BACKGROUND);
+    let x_of = |ratio: f32| rect.min.x + ratio.clamp(0.0, 4.0) / 4.0 * rect.width();
+    let y_of = |gain_db: f32| rect.max.y - (gain_db.clamp(-48.0, 6.0) + 48.0) / 54.0 * rect.height();
+    for k in 0..=8 {
+        let x = x_of(k as f32 * 0.5);
+        painter.line_segment([pos2(x, rect.min.y), pos2(x, rect.max.y)], Stroke::new(1.0, theme::BORDER.linear_multiply(if k % 2 == 0 { 1.0 } else { 0.4 })));
+        painter.text(
+            pos2(x + 2.0, rect.max.y - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{:.0} ms", k as f32 * 0.5 * base_ms),
+            egui::FontId::proportional(9.0),
+            theme::TEXT_SECONDARY,
+        );
+    }
+    let ptr = super::PointerState::read(ui);
+    let pointer = ptr.pos;
+    let mut hovered: Option<usize> = None;
+    for (t, (on, time, gain, pan)) in taps.iter().enumerate() {
+        let p = pos2(x_of(*time), y_of(*gain));
+        let col = if *on { theme::WARNING } else { theme::TEXT_SECONDARY.linear_multiply(0.35) };
+        painter.line_segment([pos2(p.x, rect.max.y), p], Stroke::new(if *on { 2.0 } else { 1.0 }, col));
+        painter.circle(p, 5.0, col, Stroke::new(1.0, theme::BACKGROUND));
+        painter.text(
+            p + vec2(0.0, -9.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("{}{}", t + 1, if pan.abs() > 0.05 { if *pan < 0.0 { "L" } else { "R" } } else { "" }),
+            egui::FontId::proportional(9.0),
+            theme::TEXT,
+        );
+        if pointer.is_some_and(|q| (q - p).length() < 9.0) {
+            hovered = Some(t);
+        }
+    }
+    let over = resp.contains_pointer();
+    if ptr.primary_pressed
+        && over
+        && let Some(p) = pointer
+    {
+        match hovered {
+            Some(t) => {
+                app.effect_panel.tap_drag = Some(t);
+                if !taps[t].0
+                    && let Some(d) = desc(tap_param(t, T_ON))
+                {
+                    edits.push((d.id, 1.0, true, false));
+                }
+            }
+            None => {
+                if let Some(t) = taps.iter().position(|x| !x.0) {
+                    let ratio = ((p.x - rect.min.x) / rect.width() * 4.0).clamp(0.0, 4.0);
+                    let gain = (rect.max.y - p.y) / rect.height() * 54.0 - 48.0;
+                    if let (Some(don), Some(dt), Some(dg)) = (desc(tap_param(t, T_ON)), desc(tap_param(t, T_TIME)), desc(tap_param(t, T_GAIN))) {
+                        edits.push((don.id, 1.0, true, false));
+                        edits.push((dt.id, dt.to_normalized(f64::from(ratio)), false, false));
+                        edits.push((dg.id, dg.to_normalized(f64::from(gain)), false, false));
+                    }
+                    app.effect_panel.tap_drag = Some(t);
+                }
+            }
+        }
+    }
+    if ptr.primary_down
+        && !ptr.primary_pressed
+        && let Some(t) = app.effect_panel.tap_drag
+        && let Some(p) = pointer
+    {
+        let ratio = ((p.x - rect.min.x) / rect.width() * 4.0).clamp(0.0, 4.0);
+        let gain = (rect.max.y - p.y) / rect.height() * 54.0 - 48.0;
+        if let (Some(dt), Some(dg)) = (desc(tap_param(t, T_TIME)), desc(tap_param(t, T_GAIN))) {
+            edits.push((dt.id, dt.to_normalized(f64::from(ratio)), false, false));
+            edits.push((dg.id, dg.to_normalized(f64::from(gain)), false, false));
+        }
+    }
+    if (ptr.primary_released || !ptr.primary_down)
+        && let Some(t) = app.effect_panel.tap_drag.take()
+        && let Some(dt) = desc(tap_param(t, T_TIME))
+    {
+        edits.push((dt.id, dt.to_normalized(f64::from(taps[t].1)), false, true));
+    }
+    if ptr.secondary_pressed
+        && over
+        && let Some(t) = hovered
+        && let Some(d) = desc(tap_param(t, T_ON))
+    {
+        edits.push((d.id, if taps[t].0 { 0.0 } else { 1.0 }, true, true));
+    }
+    if over && let Some(t) = hovered {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0
+            && let Some(dp) = desc(tap_param(t, T_PAN))
+        {
+            let pan = (taps[t].3 + scroll.signum() * 0.1).clamp(-1.0, 1.0);
+            edits.push((dp.id, dp.to_normalized(f64::from(pan)), true, true));
+        }
+        resp.clone().on_hover_text_at_pointer(format!(
+            "Tap {}: {:.0} ms ({:.2}×) · {:+.1} dB · pan {:+.2}\ndrag: time/gain · wheel: pan · right-click: on/off",
+            t + 1,
+            taps[t].1 * base_ms,
+            taps[t].1,
+            taps[t].2,
+            taps[t].3
+        ));
+    }
+    let _ = MAX_TAPS;
+    ui.label(egui::RichText::new("Click the canvas to add a tap · drag taps · wheel pans · right-click toggles").color(theme::TEXT_SECONDARY).small());
 }
