@@ -3638,8 +3638,10 @@ dependencies = [
  "clack-plugin",
  "clap-sys",
  "rawdawg-dsp",
+ "rawdawg-effects",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "serde_json",
 ]
 
 [[package]]

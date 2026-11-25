@@ -84,7 +84,7 @@ A project is a folder ending in `.rawdawg` with `project.json` and the media you
 
 The build produces real plugin binaries in `target/<profile>/`:
 
-- `librawdawg_clap.so` / `rawdawg_clap.dll` — CLAP, id `rawdawg.synth`, display name **rawDAWg Synth** (notes in, stereo out, parameters, state). Rename/copy to `rawDAWg.clap` for hosts that require the extension.
+- `librawdawg_clap.so` / `rawdawg_clap.dll` — one CLAP module containing **rawDAWg Synth** (`rawdawg.synth`: notes in, stereo out) and every effect family as its own plugin (`rawdawg.fx.eq`, `rawdawg.fx.compressor`, `rawdawg.fx.limiter`, `rawdawg.fx.gate`, `rawdawg.fx.distortion`, `rawdawg.fx.multiband`, `rawdawg.fx.delay`, `rawdawg.fx.chorus`, `rawdawg.fx.flanger`, `rawdawg.fx.phaser`, `rawdawg.fx.pitch`, `rawdawg.fx.granular`, `rawdawg.fx.spectral`, `rawdawg.fx.reverb`, `rawdawg.fx.convolution`, `rawdawg.fx.stereo`; display names **rawDAWg Parametric EQ**, **rawDAWg Reverb**, …). Effects take stereo in/out, report latency and tail, follow the host tempo, and add **Bypass** and **Mix** parameters; the compressor and gate expose a stereo **Sidechain** input. Rename/copy the module to `rawDAWg.clap` for hosts that require the extension. Effect presets saved from the app load as plugin state. The convolution plugin has no impulse response outside a rawDAWg project yet (it passes the dry signal).
 - `librawdawg_vst3.so` / `rawdawg_vst3.dll` — VST3 module exporting **rawDAWg Gain** (M0 ABI fixture; the synth and effects follow in M7, together with the `.vst3` bundle layout).
 
 Validation with `clap-validator`, the VST3 validator and independent hosts is tracked as open gates in `PROGRESS.md`.

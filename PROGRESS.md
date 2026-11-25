@@ -299,6 +299,18 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - T-DATA PARTIAL (round trip, schema/nesting/atomic save, autosave ring/recovery, Save As, moved folder, lock, relink, migrations, opaque plugin bytes; missing: imported-archive traversal/zip-bomb cases beyond presets, disk-full fault injection, cross-OS execution), T-EXPORT PASS, E2E-06 headless subset PASS. DATA-01 PASS (automated), DATA-02 PASS (automated; cross-OS transfer NOT RUN), CORE-07 PASS (automated), CORE-08 PASS (automated; capture of MIDI-driven changes into automation still open), QUAL-03 PARTIAL (CI defined, NOT RUN on GitHub; Windows build NOT RUN).
 - Checkpoint "save, recover, transfer and reopen full native project": automated on Ubuntu/WSL (E2E-06, UI test); Windows transfer open. M6 is an automated checkpoint with its platform gates open.
 
+## M7 additions (2026-11-25)
+
+### Slice 1 — CLAP export of the synth and every effect family (PLUG-01)
+
+- `crates/plugin-clap`: one generic plugin type (`RawPlugin`) wraps any native `Processor`; the multi-plugin factory (`RawFactory`, `RawdawgEntry`) exposes `rawdawg.synth` plus `rawdawg.fx.<family>` for the 16 listed catalogue effects (`rawDAWg Parametric EQ`, `rawDAWg Reverb`, …; test effects excluded). Mechanical id mapping `clap_id_for_native`/`native_type_id_for_clap`.
+- Extensions: audio ports (stereo main in/out with in-place pair; stereo `Sidechain` input for compressor and gate), note ports (synth only), params, state, latency (default-prepared value before activation, actual after), tail (processor tail + latency; infinite for unbounded/feedback effects). Process status follows the tail (`Tail` for finite tails, `Continue` for infinite). Host transport (tempo, beats position, time signature, playing) feeds the processors' `TransportView`, so tempo-synced delay/modulation follow the host.
+- Wrapper parameters for effects, outside the native descriptor space: `Bypass` (`IS_BYPASS`, latency-preserving true bypass) and `Mix` (wet/dry with the dry path delayed by the reported latency; only where the catalogue marks `has_mix`). Effect state is a versioned envelope `{rawdawg_clap, type_id, bypass, mix, processor}`; loading also accepts a bare processor state (app preset) and rejects another plugin's envelope. Synth state stays the raw patch.
+- Inputs are copied to scratch per chunk (handles in-place hosts and mono inputs); mono-only outputs get a downmix; host blocks above 8192 frames are split with event offsets preserved. No allocation in `process`.
+- Tests (`crates/plugin-clap/tests/host_roundtrip.rs`, in-process entry and the built `librawdawg_clap.so`): factory order/ids; for every effect: descriptor name/features, port counts, every param formats, state envelope/bare/garbage/wrong-plugin, finite audio from a sine, latency stable across activation, tail covers latency, bypass equals latency-aligned dry, mix 0 equals dry; behaviour: stereo tool identity and gain, compressor external sidechain ducking, pitch latency 2048, reverb tail. Synth test unchanged (440 Hz, release, state).
+- Commands: `cargo test -p rawdawg-plugin-clap` (3 passed), `cargo clippy --workspace --all-targets -- -D warnings` (clean).
+- Not done: GUI extension (M7 later slice), VST3 generalisation, validators (PL-03/04 BLOCKED), independent hosts (PL-05 BLOCKED).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -353,8 +365,9 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M4 in progress (slices 1–10: mixer routing/inserts, the complete FX-01 effect list, FX-03 rack tools/parallel branches/LFO modulation, E2E-05 headless subset); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
-1. M4 — mixer UI and routing (buses/sends/sidechain/parallel, latency compensation), M7: plugin hosting — CLAP host (scan in a separate process with crash quarantine, load, audio/note ports, params, state, GUI embedding where possible), VST3 host, safe mode, missing-plugin relink; then exports of the synth/effects as CLAP/VST3 with validators (PL-03/04) and E2E-07 with presets, tests and dark editors; automation/MIDI-learn targets extended to mixer and effects.
-2. M3 leftovers when touched: rack channel reorder/duplicate, pattern-mode automation, CC capture into automation.
-3. (was) pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
-Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).
+M7 in progress (slice 1 done: CLAP export of the synth and every effect family). Next, in order:
+1. M7 slice 2 — `plugin-host` crate: CLAP catalog (standard + user paths, fingerprints), scanner subprocess (`rawdawg --scan-plugin`, 15 s timeout, bounded output, crash/timeout quarantine), safe mode, preferences persistence; tests self-scan the built `librawdawg_clap.so`.
+2. M7 slice 3 — CLAP host processor (clack-host): instantiate from the catalog, audio/note/param/state/latency, sidechain, transport; engine injection for `PluginFormat::Clap`; opaque state in projects; tests compare a CLAP-hosted rawDAWg effect against the native one.
+3. M7 slice 4 — UI: Settings › Plugins (scan, paths, quarantine retry/remove), browser Plugins list, insert/instrument from the catalog, generic parameter editor, missing-plugin relink; E2E-07 headless subset.
+4. M7 slice 5 — plugin GUI embedding where the platform allows (X11/XWayland on WSLg: expect BLOCKED for real hosts), VST3 export generalisation and host; validators remain BLOCKED unless installed.
+5. M8 — packaging, Windows CI, reference benchmarks. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery.
