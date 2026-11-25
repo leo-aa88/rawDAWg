@@ -393,7 +393,7 @@ impl App {
         self.synth_mirrors.clear();
         // hosted plugin instances stay alive while their project instance exists
         let project = &self.project;
-        self.other_mirrors.retain(|id, p| rawdawg_dsp::processor::Processor::type_id(p.as_ref()).starts_with("clap:") && project.instance(*id).is_some());
+        self.other_mirrors.retain(|id, p| rawdawg_plugin_host::is_hosted(p.as_ref()) && project.instance(*id).is_some());
         for c in &self.project.channels {
             if c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH {
                 let mut s = Synth::default();
@@ -419,7 +419,7 @@ impl App {
         // retired plans are dropped here (off RT): hosted plugins hand their audio halves back
         sys.handle.collect_retired();
         for m in self.other_mirrors.values_mut() {
-            if let Some(live) = m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>() {
+            if let Some(live) = rawdawg_plugin_host::hosted_mut(m.as_mut()) {
                 live.collect_returns();
             }
         }
@@ -1787,7 +1787,7 @@ impl App {
         self.plugin_refresh_counter = self.plugin_refresh_counter.wrapping_add(1);
         if self.plugin_refresh_counter.is_multiple_of(6) {
             for m in self.other_mirrors.values_mut() {
-                if let Some(live) = m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>() {
+                if let Some(live) = rawdawg_plugin_host::hosted_mut(m.as_mut()) {
                     live.collect_returns();
                     live.refresh_values();
                 }

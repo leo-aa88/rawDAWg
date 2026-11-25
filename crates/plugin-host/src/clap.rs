@@ -97,7 +97,7 @@ fn descriptor_cache() -> &'static Mutex<HashMap<String, &'static [ParamDescripto
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn leak_str(s: &str) -> &'static str {
+pub(crate) fn leak_str(s: &str) -> &'static str {
     static CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());

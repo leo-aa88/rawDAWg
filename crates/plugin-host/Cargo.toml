@@ -12,6 +12,8 @@ rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
 clack-host = { workspace = true }
 clack-extensions = { workspace = true, features = ["clack-host"] }
+vst3 = { workspace = true }
+libloading = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
@@ -22,3 +24,4 @@ rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-project = { path = "../project" }
 rawdawg-effects = { path = "../effects" }
 rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-plugin-api = { path = "../plugin-api" }

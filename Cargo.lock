@@ -3663,16 +3663,19 @@ version = "0.1.0"
 dependencies = [
  "clack-extensions",
  "clack-host",
+ "libloading 0.9.1",
  "log",
  "rawdawg-audio-engine",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-plugin-api",
  "rawdawg-plugin-clap",
  "rawdawg-project",
  "rawdawg-synthesizer",
  "rawdawg-types",
  "serde",
  "serde_json",
+ "vst3",
 ]
 
 [[package]]

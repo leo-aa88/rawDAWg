@@ -410,9 +410,9 @@ fn plugins_section(app: &mut App, ui: &mut egui::Ui) {
     let problems: Vec<(String, u32)> = app
         .other_mirrors
         .values_mut()
-        .filter_map(|m| m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>())
+        .filter_map(|m| rawdawg_plugin_host::hosted_mut(m.as_mut()))
         .filter(|l| l.problem_count() > 0)
-        .map(|l| (l.info.name.clone(), l.problem_count()))
+        .map(|l| (l.display_name().to_owned(), l.problem_count()))
         .collect();
     for (name, n) in problems {
         ui.colored_label(theme::WARNING, format!("{name}: {n} block(s) with processing errors or non-finite output were muted"));

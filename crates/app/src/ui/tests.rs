@@ -770,6 +770,43 @@ fn hosted_plugins_are_added_from_the_catalog_edited_through_mirrors_and_shown_in
     h.frame(vec![]);
     assert!(!h.app.other_mirrors.contains_key(&uid), "no mirror for an unavailable plugin");
 
+    // the same flow for a VST3 bundle: described, listed, inserted and mirrored through the VST3 bridge
+    let bundle = {
+        let exe = std::env::current_exe().unwrap();
+        let target = exe.parent().unwrap().parent().unwrap();
+        let status = std::process::Command::new(env!("CARGO")).args(["build", "-q", "-p", "rawdawg-plugin-vst3"]).status().expect("cargo build");
+        assert!(status.success());
+        let base = std::env::temp_dir().join(format!("rawdawg-ui-vst3-{}", std::process::id()));
+        let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
+        let inner = base.join("rawDAWg.vst3").join("Contents").join(arch);
+        std::fs::create_dir_all(&inner).unwrap();
+        let name = if cfg!(target_os = "windows") { "rawdawg_vst3.dll" } else { "librawdawg_vst3.so" };
+        std::fs::copy(target.join(name), inner.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" })).unwrap();
+        base.join("rawDAWg.vst3")
+    };
+    // SAFETY: our own freshly built module.
+    let vst3_lib = unsafe { rawdawg_plugin_host::vst3::describe_vst3_module(&bundle) }.expect("describe vst3");
+    h.app.plugin_host.catalog.insert_library(vst3_lib);
+    assert_eq!(h.app.plugin_host.catalog.plugins().count(), 34);
+    let (vreverb, vpath) = h
+        .app
+        .plugin_host
+        .catalog
+        .plugins()
+        .find(|(_, p)| p.format == rawdawg_plugin_host::Format::Vst3 && p.name == "rawDAWg Reverb")
+        .map(|(l, p)| (p.clone(), l.path.clone()))
+        .unwrap();
+    h.app.add_catalog_plugin(&vreverb, &vpath, master);
+    let vinst = h.app.project.mixer_channel(master).unwrap().inserts.iter().find(|i| i.format == rawdawg_project::PluginFormat::Vst3).cloned().expect("VST3 insert");
+    assert_eq!(vinst.type_id.as_str(), vreverb.plugin_id);
+    h.frame(vec![]);
+    let vm = h.app.other_mirrors.get_mut(&vinst.id).expect("hosted VST3 mirror");
+    assert!(rawdawg_dsp::processor::Processor::type_id(vm.as_ref()).starts_with("vst3:"));
+    assert!(vm.descriptors().iter().any(|d| d.flags.is_bypass));
+    let vstate: serde_json::Value = serde_json::from_slice(&vm.save_state()).unwrap();
+    assert_eq!(vstate["format"], "vst3");
+    let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+
     // safe mode: catalog plugins are never loaded
     h.app.plugin_host.safe_mode = true;
     h.app.other_mirrors.clear();

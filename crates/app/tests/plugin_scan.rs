@@ -182,3 +182,50 @@ fn scan_plugins_cli_writes_the_given_catalog_and_reports_json() {
     assert_eq!(catalog.plugins().count(), 17);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn built_vst3_bundle(dir: &std::path::Path) -> PathBuf {
+    let status = std::process::Command::new(env!("CARGO")).args(["build", "-q", "-p", "rawdawg-plugin-vst3"]).status().expect("cargo build");
+    assert!(status.success());
+    let exe = std::env::current_exe().unwrap();
+    let target = exe.parent().unwrap().parent().unwrap();
+    let name = if cfg!(target_os = "windows") { "rawdawg_vst3.dll" } else { "librawdawg_vst3.so" };
+    let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
+    let inner = dir.join("rawDAWg.vst3").join("Contents").join(arch);
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::copy(target.join(name), inner.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" })).unwrap();
+    dir.join("rawDAWg.vst3")
+}
+
+#[test]
+fn scanner_child_describes_a_vst3_bundle_and_the_cli_scans_both_formats() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let dir = temp_dir("vst3");
+    let bundle = built_vst3_bundle(&dir);
+    match scan_library(&bundle, Format::Vst3, &opts(30)) {
+        ScanOutcome::Scanned(lib) => {
+            assert_eq!(lib.plugins.len(), 17);
+            assert!(lib.plugins.iter().all(|p| p.format == Format::Vst3));
+            assert!(lib.plugins.iter().any(|p| p.name == "rawDAWg Synth" && p.is_instrument && p.note_inputs == 1));
+            assert!(lib.plugins.iter().any(|p| p.name == "rawDAWg Gate" && p.is_effect && p.audio_inputs == 2));
+        }
+        ScanOutcome::Quarantined(q) => panic!("quarantined: {}", q.reason.summary()),
+    }
+    // the CLI scans CLAP and VST3 roots: ~/.vst3 under a temporary HOME holds the bundle
+    let home = dir.join("home");
+    let vst3_root = home.join(".vst3");
+    std::fs::create_dir_all(&vst3_root).unwrap();
+    let installed = built_vst3_bundle(&vst3_root);
+    assert!(installed.is_dir());
+    let clap_root = dir.join("clap");
+    std::fs::create_dir_all(&clap_root).unwrap();
+    std::fs::copy(built_clap_module(), clap_root.join("rawDAWg.clap")).unwrap();
+    let catalog_file = dir.join("plugins.json");
+    let out = std::process::Command::new(EXE).args(["--scan-plugins", "--catalog"]).arg(&catalog_file).env("CLAP_PATH", &clap_root).env("HOME", &home).output().expect("run");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
+    assert_eq!(report["scanned"], 2, "{report}");
+    let plugins = report["plugins"].as_array().unwrap();
+    assert_eq!(plugins.len(), 34);
+    assert_eq!(plugins.iter().filter(|p| p["format"] == "vst3").count(), 17);
+    let _ = std::fs::remove_dir_all(&dir);
+}

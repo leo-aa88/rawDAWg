@@ -989,8 +989,8 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
         let classes: Vec<serde_json::Value> = plugins
             .iter()
             .map(|p| {
-                let (pc, _) = p.vst3_class_ids();
-                serde_json::json!({ "CID": format!("{:08X}{:08X}{:08X}{:08X}", pc.0, pc.1, pc.2, pc.3), "Category": "Audio Module Class", "Name": p.name, "Vendor": "rawDAWg", "Version": rawdawg_types::VERSION, "SDKVersion": rawdawg_vst3::SDK_VERSION, "Sub Categories": p.vst3_subcategories().split('|').collect::<Vec<_>>(), "Class Flags": 0, "Cardinality": 2147483647 })
+                let (pc, _) = rawdawg_vst3::class_ids(p);
+                serde_json::json!({ "CID": pc.iter().map(|b| format!("{:02X}", *b as u8)).collect::<String>(), "Category": "Audio Module Class", "Name": p.name, "Vendor": "rawDAWg", "Version": rawdawg_types::VERSION, "SDKVersion": rawdawg_vst3::SDK_VERSION, "Sub Categories": p.vst3_subcategories().split('|').collect::<Vec<_>>(), "Class Flags": 0, "Cardinality": 2147483647 })
             })
             .collect();
         let moduleinfo = serde_json::json!({ "Name": "rawDAWg", "Version": rawdawg_types::VERSION, "Factory Info": { "Vendor": "rawDAWg", "URL": rawdawg_plugin_api::exported::URL, "E-Mail": "", "Flags": { "Unicode": true, "Classes Discardable": false, "Component Non Discardable": false } }, "Compatibility": [], "Classes": classes });
@@ -1024,6 +1024,21 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             std::fs::create_dir_all(&plugins)?;
             std::fs::copy(&module, plugins.join("rawDAWg.clap"))?;
             std::fs::write(plugins.join("broken.clap"), b"not a plugin")?;
+            // the VST3 bundle laid out by PL-01, installed under the temporary HOME's ~/.vst3
+            let vst3_src = out.join("bundles").join("rawDAWg.vst3");
+            if !vst3_src.is_dir() {
+                bail!("PL-01 bundle missing at {}", vst3_src.display());
+            }
+            let vst3_root = base.join("home").join(".vst3").join("rawDAWg.vst3");
+            for entry in walkdir(&vst3_src)? {
+                let rel = entry.strip_prefix(&vst3_src)?.to_path_buf();
+                if entry.is_dir() {
+                    std::fs::create_dir_all(vst3_root.join(&rel))?;
+                } else {
+                    std::fs::create_dir_all(vst3_root.join(&rel).parent().unwrap())?;
+                    std::fs::copy(&entry, vst3_root.join(&rel))?;
+                }
+            }
             let catalog = base.join("plugins.json");
             // 1. scan through the CLI (each module in its own child process)
             let o = Command::new(&exe).args(["--scan-plugins", "--catalog"]).arg(&catalog).env("CLAP_PATH", &plugins).env("HOME", base.join("home")).output()?;
@@ -1032,8 +1047,9 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             }
             let report: serde_json::Value = serde_json::from_slice(&o.stdout)?;
             let n = report["plugins"].as_array().map(|a| a.len()).unwrap_or(0);
-            if n != 17 || report["quarantine"].as_array().map(|a| a.len()) != Some(1) {
-                bail!("expected 17 plugins and 1 quarantined module, got {n} and {:?}", report["quarantine"]);
+            let vst3_n = report["plugins"].as_array().map(|a| a.iter().filter(|p| p["format"] == "vst3").count()).unwrap_or(0);
+            if n != 34 || vst3_n != 17 || report["quarantine"].as_array().map(|a| a.len()) != Some(1) {
+                bail!("expected 17 CLAP + 17 VST3 plugins and 1 quarantined module, got {n} ({vst3_n} VST3) and {:?}", report["quarantine"]);
             }
             // 2. a hanging scanner child is killed and quarantined (test hook, 1 s timeout)
             let mut cat = rawdawg_plugin_host::Catalog::load(&catalog);
@@ -1053,7 +1069,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
                 rawdawg_plugin_host::ScanOutcome::Scanned(_) => bail!("a hanging scanner produced a library"),
             }
             // 3. hosted render equals native render; safe mode and missing plugins become stand-ins
-            let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_host"]).status()?;
+            let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_host", "--test", "vst3_host"]).status()?;
             if !status.success() {
                 bail!("hosted-vs-native engine tests failed");
             }
@@ -1223,4 +1239,23 @@ pub fn bench_audio(root: &Path, seconds: f64) -> anyhow::Result<()> {
     let report = serde_json::json!({"voices": voices, "block": block, "blocks": blocks, "seconds": seconds, "wall_seconds": elapsed, "p50_ms": pct(0.5), "p95_ms": pct(0.95), "p99_ms": pct(0.99), "max_ms": times[times.len()-1], "deadline_ms": deadline_ms, "build": if cfg!(debug_assertions) {"debug"} else {"release"}, "os": std::env::consts::OS});
     std::fs::write(out.join("bench-audio.json"), serde_json::to_vec_pretty(&report)?)?;
     Ok(())
+}
+
+/// Every path below `root` (directories first), bounded depth.
+fn walkdir(root: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 8 {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let p = entry?.path();
+            out.push(p.clone());
+            if p.is_dir() {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    Ok(out)
 }

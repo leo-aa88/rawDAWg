@@ -4,7 +4,7 @@
 //! - [`scan`]: discovery in standard/user directories and the isolated scanner
 //!   subprocess (timeout, bounded output, crash/timeout quarantine).
 //! - [`describe`]: in-process module description, run inside the scanner child.
-//! - [`clap`]: the in-process CLAP bridge (main-thread instance + realtime half).
+//! - [`clap`] / [`vst3`]: the in-process bridges (main-thread instance + realtime half).
 //! - [`host`]: the clack host handlers rawDAWg presents to plugins.
 //! - [`marker`]: crash marker telling the next start which plugins were live.
 //!
@@ -16,10 +16,14 @@ pub mod catalog;
 pub mod clap;
 pub mod describe;
 pub mod host;
+pub mod hosted;
 pub mod main_thread;
 pub mod marker;
 pub mod scan;
+pub mod vst3;
 
 pub use catalog::{Catalog, Format, PluginDescription, QuarantineReason, QuarantineRecord, ScannedLibrary};
 pub use clap::{ClapInstance, ClapProcessor, ModuleCache};
+pub use hosted::{HostedInstance, hosted_mut, is_hosted};
 pub use scan::{ScanOptions, ScanOutcome, ScanReport};
+pub use vst3::{Vst3Instance, Vst3ModuleCache, Vst3Processor};

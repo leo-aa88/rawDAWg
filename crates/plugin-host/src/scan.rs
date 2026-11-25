@@ -169,7 +169,11 @@ pub fn run_scanner_child(path: &Path, format: Format) -> i32 {
             Ok(library) => ChildReport::Ok { library },
             Err(message) => ChildReport::LoadFailed { message },
         },
-        Format::Vst3 => ChildReport::LoadFailed { message: "VST3 scanning is not implemented yet".to_owned() },
+        // SAFETY: as above.
+        Format::Vst3 => match unsafe { crate::vst3::describe_vst3_module(path) } {
+            Ok(library) => ChildReport::Ok { library },
+            Err(message) => ChildReport::LoadFailed { message },
+        },
     };
     let code = if matches!(report, ChildReport::Ok { .. }) { 0 } else { 1 };
     match serde_json::to_string(&report) {

@@ -5,8 +5,10 @@
 use rawdawg_audio_engine::externals::{ExternalPlugins, PluginRole};
 use rawdawg_dsp::processor::{PrepareSpec, Processor};
 use rawdawg_plugin_host::clap::{ClapInstance, ModuleCache};
+use rawdawg_plugin_host::hosted_mut;
 use rawdawg_plugin_host::marker::Marker;
 use rawdawg_plugin_host::scan::{ScanOptions, ScanReport};
+use rawdawg_plugin_host::vst3::{Vst3Instance, Vst3ModuleCache};
 use rawdawg_plugin_host::{Catalog, Format};
 use rawdawg_project::{Instance, PluginFormat};
 use rawdawg_types::InstanceId;
@@ -45,6 +47,7 @@ pub struct PluginHost {
     pub catalog: Catalog,
     pub catalog_path: Option<PathBuf>,
     pub modules: ModuleCache,
+    pub vst3_modules: Vst3ModuleCache,
     pub safe_mode: bool,
     /// Persist the catalog and marker (false for headless tests).
     pub persist: bool,
@@ -61,7 +64,19 @@ impl PluginHost {
         let catalog_path = if persist || catalog_override.is_some() { catalog_path(catalog_override) } else { None };
         let catalog = catalog_path.as_deref().map(Catalog::load).unwrap_or_default();
         let previous_crash = if persist { marker_path().and_then(|p| Marker::read(&p)).map(|m| m.plugins) } else { None };
-        Self { catalog, catalog_path, modules: ModuleCache::default(), safe_mode, persist, scan: None, last_report: None, last_error: None, previous_crash, marker_written: false }
+        Self {
+            catalog,
+            catalog_path,
+            modules: ModuleCache::default(),
+            vst3_modules: Vst3ModuleCache::default(),
+            safe_mode,
+            persist,
+            scan: None,
+            last_report: None,
+            last_error: None,
+            previous_crash,
+            marker_written: false,
+        }
     }
 
     pub fn save(&self) {
@@ -94,9 +109,17 @@ impl PluginHost {
         std::thread::Builder::new()
             .name("plugin-scan".into())
             .spawn(move || {
-                let report = rawdawg_plugin_host::scan::refresh(&mut catalog, Format::Clap, &opts, |p, i, n| {
-                    let _ = progress_tx.send(ScanMsg::Progress { path: p.to_path_buf(), index: i, total: n });
-                });
+                let mut report = ScanReport::default();
+                for format in [Format::Clap, Format::Vst3] {
+                    let r = rawdawg_plugin_host::scan::refresh(&mut catalog, format, &opts, |p, i, n| {
+                        let _ = progress_tx.send(ScanMsg::Progress { path: p.to_path_buf(), index: i, total: n });
+                    });
+                    report.candidates += r.candidates;
+                    report.scanned += r.scanned;
+                    report.quarantined += r.quarantined;
+                    report.unchanged += r.unchanged;
+                    report.pruned += r.pruned;
+                }
                 let _ = tx.send(ScanMsg::Done { catalog, report });
             })
             .ok();
@@ -151,8 +174,7 @@ impl PluginHost {
         }
         match inst.format {
             PluginFormat::Native => None,
-            PluginFormat::Vst3 => Some("VST3 hosting is not implemented yet".into()),
-            PluginFormat::Clap => {
+            PluginFormat::Clap | PluginFormat::Vst3 => {
                 if self.lookup(inst).is_some() {
                     None
                 } else if let Some(q) = inst.path_hint.as_deref().and_then(|p| self.catalog.quarantined(std::path::Path::new(p))) {
@@ -165,14 +187,16 @@ impl PluginHost {
     }
 
     /// Create the main-thread instance for a project instance and load its saved state.
-    pub fn create_instance(&mut self, inst: &Instance) -> Result<ClapInstance, String> {
+    pub fn create_instance(&mut self, inst: &Instance) -> Result<Box<dyn Processor>, String> {
         if let Some(reason) = self.unavailable_reason(inst) {
             return Err(reason);
         }
         let (path, desc) = self.lookup(inst).map(|(l, d)| (l.path.clone(), d.clone())).ok_or_else(|| "not in the plugin catalog".to_owned())?;
         // SAFETY: the module passed the isolated scan and the user placed it in the project.
-        let module = unsafe { self.modules.load(&path) }?;
-        let mut live = ClapInstance::new(module, &desc)?;
+        let mut live: Box<dyn Processor> = match desc.format {
+            Format::Clap => Box::new(ClapInstance::new(unsafe { self.modules.load(&path) }?, &desc)?),
+            Format::Vst3 => Box::new(Vst3Instance::new(unsafe { self.vst3_modules.load(&path) }?, &desc)?),
+        };
         if !inst.state.is_null() {
             let bytes = serde_json::to_vec(&inst.state).map_err(|e| e.to_string())?;
             if let Err(e) = live.load_state(&bytes) {
@@ -219,11 +243,11 @@ impl PluginHost {
 
 /// Make sure `mirrors` holds the live main-thread instance for an external `inst`.
 pub fn ensure_external_mirror(host: &mut PluginHost, mirrors: &mut HashMap<InstanceId, Box<dyn Processor>>, inst: &Instance) -> Result<(), String> {
-    if mirrors.get(&inst.id).is_some_and(|p| Processor::type_id(p.as_ref()).starts_with("clap:")) {
+    if mirrors.get(&inst.id).is_some_and(|p| rawdawg_plugin_host::is_hosted(p.as_ref())) {
         return Ok(());
     }
     let live = host.create_instance(inst)?;
-    mirrors.insert(inst.id, Box::new(live));
+    mirrors.insert(inst.id, live);
     Ok(())
 }
 
@@ -245,7 +269,7 @@ impl ExternalPlugins for AppExternals<'_> {
             self.unavailable.push(format!("{name}: {reason}"));
             return Ok(None);
         }
-        let Some(live) = self.mirrors.get_mut(&inst.id).and_then(|p| p.as_any_mut().downcast_mut::<ClapInstance>()) else {
+        let Some(live) = self.mirrors.get_mut(&inst.id).and_then(|p| hosted_mut(p.as_mut())) else {
             return Ok(None);
         };
         // the project's stored state changed underneath the live instance (undo, preset load)
@@ -258,8 +282,8 @@ impl ExternalPlugins for AppExternals<'_> {
         }
         match live.activate_for_rt(spec) {
             Ok(p) => {
-                self.live_ids.push(format!("clap:{}", live.plugin_id()));
-                Ok(Some(Box::new(p)))
+                self.live_ids.push(live.live_id());
+                Ok(Some(p))
             }
             Err(e) => {
                 self.unavailable.push(format!("{name}: {e}"));
@@ -305,7 +329,15 @@ pub fn scan_cli(catalog_override: Option<PathBuf>) -> anyhow::Result<i32> {
     let path = catalog_path(catalog_override).ok_or_else(|| anyhow::anyhow!("no configuration directory available"))?;
     let mut catalog = Catalog::load(&path);
     let opts = scan_options(catalog.timeout_secs)?;
-    let report = rawdawg_plugin_host::scan::refresh(&mut catalog, Format::Clap, &opts, |p, i, n| eprintln!("scanning {}/{}: {}", i + 1, n, p.display()));
+    let mut report = ScanReport::default();
+    for format in [Format::Clap, Format::Vst3] {
+        let r = rawdawg_plugin_host::scan::refresh(&mut catalog, format, &opts, |p, i, n| eprintln!("scanning {} {}/{}: {}", format.label(), i + 1, n, p.display()));
+        report.candidates += r.candidates;
+        report.scanned += r.scanned;
+        report.quarantined += r.quarantined;
+        report.unchanged += r.unchanged;
+        report.pruned += r.pruned;
+    }
     catalog.save(&path).map_err(|e| anyhow::anyhow!("saving catalog {}: {e}", path.display()))?;
     let out = CliReport {
         catalog: &path,
