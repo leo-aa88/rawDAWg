@@ -22,6 +22,15 @@ pub struct Preferences {
     /// Recording offset in milliseconds (positive = recorded notes are moved earlier).
     #[serde(default)]
     pub record_offset_ms: f32,
+    /// Open an input device for recording (off until the owner enables it).
+    #[serde(default)]
+    pub input_enabled: bool,
+    pub input_device_id: Option<String>,
+    #[serde(default)]
+    pub input_channels: rawdawg_audio_io::capture::InputChannels,
+    /// Route the live input into the mixer (off by default; beware of feedback).
+    #[serde(default)]
+    pub monitor_input: bool,
 }
 
 fn default_count_in() -> u32 {
@@ -44,6 +53,10 @@ impl Default for Preferences {
             recent_projects: vec![],
             count_in_bars: 1,
             record_offset_ms: 0.0,
+            input_enabled: false,
+            input_device_id: None,
+            input_channels: rawdawg_audio_io::capture::InputChannels::default(),
+            monitor_input: false,
         }
     }
 }

@@ -3561,6 +3561,7 @@ dependencies = [
  "flacenc",
  "hound",
  "log",
+ "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
  "rawdawg-project",
@@ -3579,6 +3580,7 @@ name = "rawdawg-audio-io"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "hound",
  "log",
  "rawdawg-rt",
  "rawdawg-types",

@@ -28,6 +28,114 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         ui.heading("Audio");
         let mut apply = false;
         let mut rescan = false;
+        // ---- input (recording)
+        egui::CollapsingHeader::new("Input (recording)").default_open(true).show(ui, |ui| {
+            let mut changed = false;
+            changed |= ui.checkbox(&mut app.prefs.input_enabled, "Open an input device").on_hover_text("Off by default; the input is opened at the output's sample rate").changed();
+            ui.horizontal(|ui| {
+                ui.label("Input device");
+                let current = app.prefs.input_device_id.as_ref().and_then(|id| app.devices.find(id)).map(|d| d.name.clone()).unwrap_or_else(|| "System default".to_owned());
+                egui::ComboBox::from_id_salt("input-device").selected_text(current).width(300.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(app.prefs.input_device_id.is_none(), "System default").clicked() {
+                        app.prefs.input_device_id = None;
+                        changed = true;
+                    }
+                    for d in app.devices.devices.iter().filter(|d| d.supports_input()) {
+                        if ui.selectable_label(app.prefs.input_device_id.as_deref() == Some(d.id.as_str()), format!("{} [{}]", d.name, d.backend.label())).clicked() {
+                            app.prefs.input_device_id = Some(d.id.clone());
+                            changed = true;
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Channels");
+                use rawdawg_audio_io::capture::InputChannels;
+                let max_ch = app
+                    .prefs
+                    .input_device_id
+                    .as_ref()
+                    .and_then(|id| app.devices.find(id))
+                    .or_else(|| app.devices.devices.iter().find(|d| d.is_default_input))
+                    .and_then(|d| d.default_input_channels)
+                    .unwrap_or(2)
+                    .max(1);
+                let label = match app.prefs.input_channels {
+                    InputChannels::Mono(c) => format!("Mono: input {}", c + 1),
+                    InputChannels::Stereo(l, r) => format!("Stereo: inputs {} + {}", l + 1, r + 1),
+                };
+                egui::ComboBox::from_id_salt("input-channels").selected_text(label).show_ui(ui, |ui| {
+                    for c in 0..max_ch {
+                        if ui.selectable_label(app.prefs.input_channels == InputChannels::Mono(c), format!("Mono: input {}", c + 1)).clicked() {
+                            app.prefs.input_channels = InputChannels::Mono(c);
+                            changed = true;
+                        }
+                    }
+                    for c in (0..max_ch.saturating_sub(1)).step_by(2) {
+                        if ui.selectable_label(app.prefs.input_channels == InputChannels::Stereo(c, c + 1), format!("Stereo: inputs {} + {}", c + 1, c + 2)).clicked() {
+                            app.prefs.input_channels = InputChannels::Stereo(c, c + 1);
+                            changed = true;
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut app.prefs.monitor_input, "Monitor the input through the master")
+                    .on_hover_text("Off by default. Do not combine with your interface's direct monitoring (doubling) and keep speakers away from the microphone (feedback)")
+                    .changed()
+                {
+                    let target = app.prefs.monitor_input.then_some(app.project.mixer.channels.iter().position(|m| m.id == app.project.mixer.master_id).unwrap_or(0));
+                    app.send(super::EngineCommand::SetMonitor(target));
+                    let _ = app.prefs.save();
+                }
+                ui.label("Recording offset");
+                if ui
+                    .add(egui::DragValue::new(&mut app.prefs.record_offset_ms).range(-100.0..=100.0).speed(0.5).suffix(" ms"))
+                    .on_hover_text("Positive moves recordings earlier; calibrate with a loopback (record the metronome and read the offset)")
+                    .changed()
+                {
+                    let _ = app.prefs.save();
+                }
+            });
+            match &app.audio {
+                super::AudioState::Running(s) => match (&s.input, &s.input_error) {
+                    (Some(i), _) => {
+                        let st = &i.stream.status;
+                        let (l, r) = (st.peak_l.load(), st.peak_r.load());
+                        st.peak_l.store(0.0);
+                        st.peak_r.store(0.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Input open: {} ({} ch) at {} Hz — level L {:.0} dB R {:.0} dB, reported latency {:.1} ms, dropped blocks {}",
+                                i.stream.device_name,
+                                i.stream.device_channels,
+                                i.stream.sample_rate_hz,
+                                20.0 * l.max(1e-5).log10(),
+                                20.0 * r.max(1e-5).log10(),
+                                st.input_latency_s.load() * 1000.0,
+                                st.dropped_blocks.get()
+                            ))
+                            .color(theme::TEXT_SECONDARY),
+                        );
+                    }
+                    (None, Some(e)) => {
+                        ui.colored_label(theme::ERROR, e);
+                    }
+                    (None, None) => {
+                        ui.label(egui::RichText::new("No input open (enable above, then Apply)").color(theme::TEXT_SECONDARY));
+                    }
+                },
+                _ => {
+                    ui.label(egui::RichText::new("Audio is off").color(theme::TEXT_SECONDARY));
+                }
+            }
+            if changed {
+                let _ = app.prefs.save();
+                apply = true;
+            }
+        });
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Output device");
             let current_name = app.settings.device_id.as_ref().and_then(|id| app.devices.find(id)).map(|d| d.name.clone()).unwrap_or_else(|| "System default".to_owned());

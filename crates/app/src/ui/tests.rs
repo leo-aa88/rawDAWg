@@ -464,3 +464,71 @@ fn export_dialog_renders_on_a_worker_with_progress_and_midi_import_round_trips()
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn audio_takes_are_aligned_placed_as_clips_and_recovered_after_a_crash() {
+    use rawdawg_audio_io::capture::{CaptureProducer, InputChannels};
+    use rawdawg_audio_io::capture_writer::CaptureWriter;
+    use rawdawg_project::{ClipContent, Track};
+    // alignment: transport at 96 000, 512 frames output latency, 240 input, +10 ms offset → 94 768
+    assert_eq!(super::recording::aligned_start_frame(96_000, 512, 240, 10.0, 48_000), 96_000 - 512 - 240 - 480);
+    assert_eq!(super::recording::aligned_start_frame(100, 512, 0, 0.0, 48_000), 0, "never negative");
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-take-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("T.rawdawg");
+    let mut h = Harness::new(None);
+    rawdawg_project::save_project_dir(&dir, &h.app.project).unwrap();
+    h.app.project_path = Some(dir.clone());
+    let tid = rawdawg_types::TrackId::new();
+    h.app.apply(rawdawg_project::Command::AddTrack {
+        track: Track { id: tid, name: "Vocal".into(), color: None, mute: false, solo: false, height: None, mixer_id: None },
+        index: None,
+    });
+    // a finished take: 1.5 s of a mock stereo input, started at project frame 96 000 (bar 2)
+    let (mut producer, queues) = CaptureProducer::new(2, InputChannels::Stereo(0, 1));
+    let writer = CaptureWriter::start(&dir, queues.writer, 48_000, 96_000).unwrap();
+    let data: Vec<f32> = (0..72_000)
+        .flat_map(|i| {
+            let v = ((i as f32) * 0.01).sin() * 0.5;
+            [v, -v]
+        })
+        .collect();
+    producer.push_interleaved(&data);
+    producer.flush_partial();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let (wav, journal) = (writer.wav_path.clone(), writer.journal_path.clone());
+    let (j, _queue) = writer.stop().unwrap();
+    assert_eq!(j.frames_written, 72_000);
+    let clips = h.app.project.clips.len();
+    h.app.place_take(&wav, &journal, tid, j.start_project_frame, j.frames_written, j.lost_frames, 48_000);
+    assert_eq!(h.app.project.clips.len(), clips + 1);
+    let clip = h.app.project.clips.last().unwrap().clone();
+    assert_eq!(clip.track_id, tid);
+    assert_eq!(clip.start_tick, Tick(3840), "96 000 frames at 120 BPM = bar 2");
+    assert_eq!(clip.length_ticks, Tick(2880), "1.5 s = three beats");
+    let ClipContent::Audio { source_length_frames, asset_id, .. } = &clip.content else { panic!("audio clip") };
+    assert_eq!(*source_length_frames, 72_000);
+    assert!(h.app.project.assets.iter().any(|a| &a.id == asset_id), "take imported as a project asset");
+    assert!(!wav.exists() && !journal.exists(), "imported take files are removed from recovery");
+    assert!(h.app.status_line.starts_with("Recorded 1.50 s"), "{}", h.app.status_line);
+    // one undo removes clip and asset together
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.clips.len(), clips);
+    // a crashed take: journal unfinished, header never finalized → recovered on open
+    let (mut producer, queues) = CaptureProducer::new(1, InputChannels::Mono(0));
+    let writer = CaptureWriter::start(&dir, queues.writer, 48_000, 48_000).unwrap();
+    producer.push_interleaved(&vec![0.3f32; 24_000]);
+    producer.flush_partial();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::mem::forget(writer);
+    rawdawg_project::save_project_dir(&dir, &h.app.project).unwrap();
+    h.app.open_project(dir.clone());
+    assert!(h.app.status_line.starts_with("Recovered 1 unfinished"), "{}", h.app.status_line);
+    let rec = h.app.project.tracks.iter().find(|t| t.name == "Recovered").expect("recovered track");
+    let c = h.app.project.clips.iter().find(|c| c.track_id == rec.id).expect("recovered clip");
+    assert_eq!(c.start_tick, Tick(1920), "48 000 frames = beat 3 of bar 1");
+    let ClipContent::Audio { source_length_frames, .. } = &c.content else { panic!("audio clip") };
+    assert!(*source_length_frames >= 768 && *source_length_frames <= 24_000, "{source_length_frames}");
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+    let _ = std::fs::remove_dir_all(&root);
+}

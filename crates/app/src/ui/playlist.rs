@@ -506,6 +506,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         if child.toggle_value(&mut solo, "S").on_hover_text("Solo track").changed() {
             cmds.push(Command::SetTrackSolo { id: t.id, solo });
         }
+        let mut armed = app.record.armed_track == Some(t.id);
+        if child.toggle_value(&mut armed, "R").on_hover_text("Arm for audio recording: with Rec on and an input device open, Play records the input onto this track").changed() {
+            app.record.armed_track = armed.then_some(t.id);
+        }
         if child.small_button("×").on_hover_text("Delete track and its clips (undoable)").clicked() {
             let clips: Vec<Command> = app.project.clips.iter().filter(|c| c.track_id == t.id).map(|c| Command::RemoveClip { id: c.id }).collect();
             let mut all = clips;

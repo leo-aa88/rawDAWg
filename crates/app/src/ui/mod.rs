@@ -205,7 +205,13 @@ impl App {
         let audio = if opts.no_audio {
             AudioState::Disabled
         } else {
-            match AudioSystem::start(&req, &limits) {
+            let input_req = prefs.input_enabled.then(|| rawdawg_audio_io::capture::InputConfigRequest {
+                device_id: prefs.input_device_id.clone(),
+                sample_rate_hz: None,
+                buffer_frames: req.buffer_frames,
+                channels: prefs.input_channels,
+            });
+            match AudioSystem::start(&req, input_req.as_ref(), &limits) {
                 Ok(sys) => {
                     if let Some(n) = &sys.note {
                         status_line = n.clone();
@@ -312,6 +318,10 @@ impl App {
                 } else {
                     app.status_line = format!("Unknown effect {type_id}");
                 }
+            }
+            Some("settings") => {
+                app.show_settings = true;
+                app.prefs.input_enabled = true;
             }
             Some("export") => {
                 app.export.open = true;
@@ -804,7 +814,13 @@ impl App {
     fn restart_audio_with(&mut self, req: &StreamConfigRequest, persist: bool) {
         self.held.clear();
         self.audio = AudioState::Disabled; // drops the old stream first
-        match AudioSystem::start(req, &self.limits) {
+        let input_req = self.prefs.input_enabled.then(|| rawdawg_audio_io::capture::InputConfigRequest {
+            device_id: self.prefs.input_device_id.clone(),
+            sample_rate_hz: None,
+            buffer_frames: req.buffer_frames,
+            channels: self.prefs.input_channels,
+        });
+        match AudioSystem::start(req, input_req.as_ref(), &self.limits) {
             Ok(sys) => {
                 self.status_line = match &sys.note {
                     Some(n) => n.clone(),
@@ -1034,6 +1050,7 @@ impl App {
                 self.status_line = format!("Opened {}", path.display());
                 self.rebuild_mirrors();
                 self.recompile();
+                self.recover_takes();
             }
             Err(e) => self.status_line = format!("Could not open {}: {e}", path.display()),
         }
@@ -1353,6 +1370,7 @@ impl App {
         self.handle_typing(ctx);
         self.poll_midi();
         self.poll_record();
+        self.poll_audio_take();
         self.commit_quiet_midi_changes();
         automation::poll_capture(self);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());

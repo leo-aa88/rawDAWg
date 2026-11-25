@@ -22,6 +22,9 @@ pub enum EngineCommand {
     SeekTick(i64),
     SetMode(TransportMode),
     SetLoopEnabled(bool),
+    /// Route the live audio input (monitor queue) into a mixer channel by plan index;
+    /// `None` switches monitoring off (the default).
+    SetMonitor(Option<usize>),
     /// Live event (typing keyboard, MIDI, mouse) routed to a channel's instrument.
     /// `frame` is ignored and replaced by the block offset derived from the timestamp.
     Live {

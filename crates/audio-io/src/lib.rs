@@ -2,6 +2,8 @@
 //! real-time thread; the output stream callback only pulls prepared f32 frames
 //! from a [`RenderSource`] and converts sample formats at the edge.
 
+pub mod capture;
+pub mod capture_writer;
 pub mod devices;
 pub mod stream;
 

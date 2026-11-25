@@ -17,6 +17,30 @@ pub(crate) struct RecordState {
     pub take: Option<Take>,
     /// Song-mode takes record into a fresh pattern placed as a clip on this track.
     pub song_pattern: Option<(PatternId, String)>,
+    /// Playlist track armed for audio recording (its clips come from the input device).
+    pub armed_track: Option<TrackId>,
+    /// Running audio take.
+    pub audio: Option<AudioTake>,
+    /// Last take's report (lost frames, placement) for the status line.
+    pub last_audio_report: Option<String>,
+}
+
+/// An audio take in progress: the disk writer, the target track and the aligned start.
+pub(crate) struct AudioTake {
+    pub writer: rawdawg_audio_io::capture_writer::CaptureWriter,
+    pub track: TrackId,
+    /// Project frame the first captured sample corresponds to (latency-aligned).
+    pub start_frame: i64,
+    pub sample_rate: u32,
+}
+
+/// Project frame the first captured sample belongs to: the transport position when the
+/// take started, moved earlier by the output latency (what the performer heard was that
+/// late), the input latency (the sound reached the converter before the callback delivered
+/// it) and the user offset (positive = earlier). Never negative.
+pub(crate) fn aligned_start_frame(position_frame: i64, output_latency_frames: i64, input_latency_frames: i64, offset_ms: f32, sample_rate: u32) -> i64 {
+    let offset = (f64::from(offset_ms) / 1000.0 * f64::from(sample_rate)).round() as i64;
+    (position_frame - output_latency_frames - input_latency_frames - offset).max(0)
 }
 
 /// How long a MIDI-controlled parameter may rest before its state is committed as one undo entry.
@@ -184,6 +208,170 @@ impl App {
     pub(crate) fn remove_midi_mapping(&mut self, instance_id: InstanceId, param_id: u32) {
         let mappings: Vec<MidiMapping> = self.project.midi_mappings.iter().filter(|m| !(m.target.instance_id == instance_id && m.target.param_id == param_id)).cloned().collect();
         self.apply(Command::SetMidiMappings { mappings });
+    }
+
+    /// Audio take lifecycle (every UI frame): start the disk writer when the transport
+    /// records with an armed track and an input device, stop it when recording ends and
+    /// place the take as an audio clip; drain the capture queue while idle.
+    pub(crate) fn poll_audio_take(&mut self) {
+        let (playing, frame, out_latency, in_latency_s, sample_rate, has_input) = match &self.audio {
+            AudioState::Running(s) => (
+                s.handle.status.playing.load(std::sync::atomic::Ordering::Relaxed),
+                s.handle.status.position_frame.load(std::sync::atomic::Ordering::Relaxed),
+                i64::from(s.handle.status.output_latency.load(std::sync::atomic::Ordering::Relaxed)),
+                s.input.as_ref().map(|i| i.stream.status.input_latency_s.load()).unwrap_or(0.0),
+                s.sample_rate.0,
+                s.input.is_some(),
+            ),
+            _ => (false, 0, 0, 0.0, 48_000, false),
+        };
+        let recording = self.record.armed && playing && self.transport_mode == TransportMode::Song;
+        if self.record.audio.is_none() {
+            if let AudioState::Running(s) = &mut self.audio {
+                s.drain_idle_capture();
+            }
+            if recording
+                && has_input
+                && let Some(track) = self.record.armed_track
+            {
+                self.start_audio_take(frame, out_latency, in_latency_s, sample_rate, track);
+            }
+        } else if !recording {
+            self.finish_audio_take();
+        }
+    }
+
+    fn start_audio_take(&mut self, frame: i64, out_latency: i64, in_latency_s: f64, sample_rate: u32, track: TrackId) {
+        let Some(dir) = self.working_dir() else {
+            self.status_line = "No writable folder for the recording".into();
+            return;
+        };
+        let in_latency = (in_latency_s * f64::from(sample_rate)).round() as i64;
+        let start_frame = aligned_start_frame(frame, out_latency, in_latency, self.prefs.record_offset_ms, sample_rate);
+        let AudioState::Running(sys) = &mut self.audio else { return };
+        let Some(input) = sys.input.as_mut() else { return };
+        let Some(queue) = input.writer_queue.take() else { return };
+        // drop whatever was captured before the take began
+        let mut queue = queue;
+        while queue.pop().is_some() {}
+        match rawdawg_audio_io::capture_writer::CaptureWriter::start(&dir, queue, sample_rate, start_frame) {
+            Ok(writer) => {
+                self.record.audio = Some(AudioTake { writer, track, start_frame, sample_rate });
+                self.status_line = "Recording audio…".into();
+            }
+            Err(e) => self.status_line = format!("Could not start the audio take: {e}"),
+        }
+    }
+
+    fn finish_audio_take(&mut self) {
+        let Some(take) = self.record.audio.take() else { return };
+        let AudioTake { writer, track, start_frame, sample_rate } = take;
+        let wav_path = writer.wav_path.clone();
+        let journal_path = writer.journal_path.clone();
+        match writer.stop() {
+            Ok((journal, queue)) => {
+                if let AudioState::Running(sys) = &mut self.audio
+                    && let Some(input) = sys.input.as_mut()
+                {
+                    input.writer_queue = Some(queue);
+                }
+                if journal.frames_written == 0 {
+                    let _ = std::fs::remove_file(&wav_path);
+                    let _ = std::fs::remove_file(&journal_path);
+                    self.status_line = "Audio take stopped: nothing captured".into();
+                    return;
+                }
+                self.place_take(&wav_path, &journal_path, track, start_frame, journal.frames_written, journal.lost_frames, sample_rate);
+            }
+            Err(e) => self.status_line = format!("Audio take failed: {e} (the file stays in recovery/takes)"),
+        }
+    }
+
+    /// Import a finished take as an asset and place it as a clip (one undo step).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_take(&mut self, wav_path: &std::path::Path, journal_path: &std::path::Path, track: TrackId, start_frame: i64, frames: u64, lost: u64, sample_rate: u32) {
+        let Some(dir) = self.working_dir() else { return };
+        let asset = match rawdawg_project::assets::import_asset(&dir, wav_path) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status_line = format!("Take kept in recovery/takes but could not be imported: {e}");
+                return;
+            }
+        };
+        let rate = rawdawg_types::SampleRate::new(sample_rate).unwrap_or(self.project.sample_rate_hz);
+        let start_tick = self.project.tempo_map().map(|t| t.frame_to_tick_floor(start_frame, rate).0).unwrap_or(0).max(0);
+        let out_frames = frames as f64 * self.project.sample_rate_hz.as_f64() / f64::from(sample_rate);
+        let length_ticks = self
+            .project
+            .tempo_map()
+            .map(|t| {
+                (t.frame_to_tick_f64(t.tick_to_frame(Tick(start_tick), self.project.sample_rate_hz) + out_frames.round() as i64, self.project.sample_rate_hz) - start_tick as f64)
+                    .round() as i64
+            })
+            .unwrap_or(PPQ)
+            .max(1);
+        let clip = Clip {
+            id: ClipId::new(),
+            track_id: track,
+            start_tick: Tick(start_tick),
+            length_ticks: Tick(length_ticks),
+            muted: false,
+            content: ClipContent::Audio {
+                asset_id: asset.id.clone(),
+                source_offset_frames: 0,
+                source_length_frames: frames,
+                gain_db: rawdawg_types::units::Db::UNITY,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
+                playback_rate: 1.0,
+            },
+        };
+        let mut commands = Vec::new();
+        if self.project.assets.iter().all(|a| a.id != asset.id) {
+            commands.push(Command::AddAsset { asset });
+        }
+        commands.push(Command::AddClip { clip });
+        self.apply(Command::Batch { commands });
+        let _ = std::fs::remove_file(wav_path);
+        let _ = std::fs::remove_file(journal_path);
+        let report = if lost > 0 {
+            format!(
+                "Recorded {:.2} s at bar {} — {} frames were lost (queue overflow) and replaced by silence",
+                frames as f64 / f64::from(sample_rate),
+                start_tick / (PPQ * 4) + 1,
+                lost
+            )
+        } else {
+            format!("Recorded {:.2} s, placed at bar {}", frames as f64 / f64::from(sample_rate), start_tick / (PPQ * 4) + 1)
+        };
+        self.record.last_audio_report = Some(report.clone());
+        self.status_line = report;
+    }
+
+    /// On open: unfinished takes left by a crash get their headers rebuilt and come back
+    /// as clips on a "Recovered" track (nothing is deleted until the import succeeds).
+    pub(crate) fn recover_takes(&mut self) {
+        let Some(dir) = self.project_path.clone() else { return };
+        let found = rawdawg_audio_io::capture_writer::scan_unfinished(&dir);
+        if found.is_empty() {
+            return;
+        }
+        let track = Track { id: TrackId::new(), name: "Recovered".into(), color: Some([0xE6, 0x6E, 0x6E]), mute: false, solo: false, height: None, mixer_id: None };
+        let tid = track.id;
+        self.apply(Command::AddTrack { track, index: None });
+        let mut n = 0;
+        for (journal_path, journal) in found {
+            let wav = rawdawg_audio_io::capture_writer::takes_dir(&dir).join(&journal.wav);
+            match rawdawg_audio_io::capture_writer::finalize_from_data(&wav) {
+                Ok(frames) if frames > 0 => {
+                    self.place_take(&wav, &journal_path, tid, journal.start_project_frame, frames, journal.lost_frames, journal.sample_rate);
+                    n += 1;
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("take {} not recoverable: {e}", journal.id),
+            }
+        }
+        self.status_line = format!("Recovered {n} unfinished recording(s) onto the “Recovered” track");
     }
 
     /// Route a MIDI controller event: learning, or mapped parameter control.

@@ -66,6 +66,10 @@ pub struct Args {
     #[arg(long)]
     pub audio_smoke: bool,
 
+    /// Open the default (or --device) input for 1 s and report captured frames, then exit.
+    #[arg(long)]
+    pub capture_smoke: bool,
+
     /// Audio device id (from --list-audio-devices) for --audio-smoke / GUI startup.
     #[arg(long)]
     pub device: Option<String>,
@@ -117,6 +121,9 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
     }
     if args.audio_smoke {
         return crate::audio::smoke_test(args.device.clone(), args.buffer);
+    }
+    if args.capture_smoke {
+        return crate::audio::capture_smoke(args.device.clone(), rawdawg_audio_io::capture::InputChannels::default());
     }
     if let Some(project_path) = &args.headless_render {
         let output = args.output.clone().context("--output is required")?;

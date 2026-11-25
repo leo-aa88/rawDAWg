@@ -195,7 +195,18 @@ pub struct Engine {
     span_count: usize,
     /// Post-fader copies of every mixer channel's block (offline stem export only; `None` live).
     stems: Option<Vec<AudioBuffer>>,
+    /// Live input monitoring: the capture stream's monitor queue and a bounded ring that
+    /// smooths the block cadence difference between the input and output callbacks.
+    monitor: Option<rawdawg_rt::QueueConsumer<rawdawg_audio_io::capture::CaptureBlock>>,
+    monitor_target: Option<usize>,
+    monitor_ring: AudioBuffer,
+    monitor_read: usize,
+    monitor_write: usize,
+    monitor_fill: usize,
 }
+
+/// Frames the monitor ring holds (≈ 170 ms at 48 kHz).
+const MONITOR_RING: usize = 8192;
 
 const MAX_SPANS: usize = 8;
 
@@ -235,6 +246,12 @@ impl Engine {
             spans: [(0, 0, 0); MAX_SPANS],
             span_count: 0,
             stems: None,
+            monitor: None,
+            monitor_target: None,
+            monitor_ring: AudioBuffer::new(2, MONITOR_RING),
+            monitor_read: 0,
+            monitor_write: 0,
+            monitor_fill: 0,
         };
         (engine, EngineHandle { commands: cmd_p, plans: plan_p, record: rec_c, status })
     }
@@ -373,6 +390,14 @@ impl Engine {
                 }
             }
             EngineCommand::SetMasterProtection(b) => self.plan.master_protection = b,
+            EngineCommand::SetMonitor(target) => {
+                self.monitor_target = target;
+                if target.is_none() {
+                    self.monitor_fill = 0;
+                    self.monitor_read = 0;
+                    self.monitor_write = 0;
+                }
+            }
             EngineCommand::SetMetronome(b) => {
                 self.metronome_enabled = b;
                 self.status.metronome.store(b, Ordering::Relaxed);
@@ -511,6 +536,56 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Attach the capture stream's monitor queue (non-RT, before the engine goes live).
+    pub fn set_monitor_queue(&mut self, queue: Option<rawdawg_rt::QueueConsumer<rawdawg_audio_io::capture::CaptureBlock>>) {
+        self.monitor = queue;
+        self.monitor_fill = 0;
+        self.monitor_read = 0;
+        self.monitor_write = 0;
+    }
+
+    /// Drain captured blocks into the ring and add `frames` of them to the monitored mixer
+    /// channel. Bounded: at most the ring's capacity is held; older audio is dropped when
+    /// the ring is full (counted as dropped events). No allocation.
+    fn render_monitor(&mut self, frames: usize) {
+        let Some(queue) = self.monitor.as_mut() else { return };
+        let target = self.monitor_target;
+        // always drain so a stale queue never piles up; only keep audio when monitoring
+        while let Some(block) = queue.pop() {
+            if target.is_none() {
+                continue;
+            }
+            let n = usize::from(block.frames).min(rawdawg_audio_io::capture::BLOCK_FRAMES);
+            for i in 0..n {
+                if self.monitor_fill == MONITOR_RING {
+                    // overwrite the oldest
+                    self.monitor_read = (self.monitor_read + 1) % MONITOR_RING;
+                    self.monitor_fill -= 1;
+                    self.status.dropped_events.incr();
+                }
+                let (l, r) = self.monitor_ring.stereo_mut(MONITOR_RING);
+                l[self.monitor_write] = block.left[i];
+                r[self.monitor_write] = block.right[i];
+                self.monitor_write = (self.monitor_write + 1) % MONITOR_RING;
+                self.monitor_fill += 1;
+            }
+        }
+        let Some(mi) = target else { return };
+        if mi >= self.plan.mixer.len() {
+            return;
+        }
+        let take = frames.min(self.monitor_fill);
+        let (dl, dr) = self.plan.mixer[mi].buffer.stereo_mut(frames);
+        let (rl, rr) = self.monitor_ring.stereo_mut(MONITOR_RING);
+        for i in 0..take {
+            let idx = (self.monitor_read + i) % MONITOR_RING;
+            dl[i] += rl[idx];
+            dr[i] += rr[idx];
+        }
+        self.monitor_read = (self.monitor_read + take) % MONITOR_RING;
+        self.monitor_fill -= take;
     }
 
     /// Capture post-fader stems of every mixer channel from the next block on (non-RT:
@@ -745,6 +820,8 @@ impl Engine {
         if self.mode == TransportMode::Song {
             self.render_audio_clips();
         }
+        // 4b. input monitoring (off by default): captured blocks → the chosen mixer channel
+        self.render_monitor(frames);
         let plan = &mut self.plan;
         let transport = TransportView {
             playing: self.playing,
