@@ -87,7 +87,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 {
                     let target = app.prefs.monitor_input.then_some(app.project.mixer.channels.iter().position(|m| m.id == app.project.mixer.master_id).unwrap_or(0));
                     app.send(super::EngineCommand::SetMonitor(target));
-                    let _ = app.prefs.save();
+                    app.save_prefs();
                 }
                 ui.label("Recording offset");
                 if ui
@@ -95,7 +95,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     .on_hover_text("Positive moves recordings earlier; calibrate with a loopback (record the metronome and read the offset)")
                     .changed()
                 {
-                    let _ = app.prefs.save();
+                    app.save_prefs();
                 }
             });
             match &app.audio {
@@ -131,7 +131,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 }
             }
             if changed {
-                let _ = app.prefs.save();
+                app.save_prefs();
                 apply = true;
             }
         });
@@ -281,7 +281,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 }
                 app.prefs.midi_enabled.retain(|x| x != &id);
             }
-            let _ = app.prefs.save();
+            app.save_prefs();
         }
         ui.separator();
         ui.heading("Typing keyboard");

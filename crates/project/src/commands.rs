@@ -248,10 +248,30 @@ pub enum Command {
     SetMidiMappings {
         mappings: Vec<MidiMapping>,
     },
+    /// Relink with different content: swap the asset entry and rewrite every reference
+    /// (audio clips, instrument and insert states) from `old` to `new.id`.
+    ReplaceAsset {
+        old: AssetId,
+        new: Asset,
+    },
     /// Several commands applied atomically as one undo entry.
     Batch {
         commands: Vec<Command>,
     },
+}
+
+/// Rewrite every occurrence of an asset id inside a JSON state (sampler/SF2 `asset_id`,
+/// convolution `ir_asset`, anything else that stores the hex id as a string).
+fn rewrite_asset_refs(v: &mut Value, old: &str, new: &str) -> usize {
+    match v {
+        Value::String(s) if s == old => {
+            *s = new.to_owned();
+            1
+        }
+        Value::Array(items) => items.iter_mut().map(|i| rewrite_asset_refs(i, old, new)).sum(),
+        Value::Object(map) => map.values_mut().map(|i| rewrite_asset_refs(i, old, new)).sum(),
+        _ => 0,
+    }
 }
 
 fn unknown<T: std::fmt::Display>(kind: &'static str, id: T) -> CommandError {
@@ -791,6 +811,30 @@ impl Command {
                 let old = std::mem::replace(&mut p.midi_mappings, mappings);
                 Ok(Command::SetMidiMappings { mappings: old })
             }
+            Command::ReplaceAsset { old, new } => {
+                if !new.id.is_valid() || !crate::validate::is_safe_relative_path(&new.path) {
+                    return Err(CommandError::Invalid("asset".into()));
+                }
+                let idx = p.assets.iter().position(|a| a.id == old).ok_or_else(|| unknown("asset", &old))?;
+                let previous = std::mem::replace(&mut p.assets[idx], new.clone());
+                let (o, n) = (old.to_string(), new.id.to_string());
+                for c in p.clips.iter_mut() {
+                    if let ClipContent::Audio { asset_id, .. } = &mut c.content
+                        && *asset_id == old
+                    {
+                        *asset_id = new.id.clone();
+                    }
+                }
+                for ch in p.channels.iter_mut() {
+                    rewrite_asset_refs(&mut ch.instrument.state, &o, &n);
+                }
+                for m in p.mixer.channels.iter_mut() {
+                    for ins in m.inserts.iter_mut() {
+                        rewrite_asset_refs(&mut ins.state, &o, &n);
+                    }
+                }
+                Ok(Command::ReplaceAsset { old: new.id.clone(), new: previous })
+            }
             Command::Batch { commands } => {
                 let mut inverses = Vec::with_capacity(commands.len());
                 for c in commands {
@@ -873,6 +917,7 @@ impl Command {
             Command::AddAsset { .. } => "Import asset",
             Command::RemoveAssetInternal { .. } => "Remove asset",
             Command::SetMidiMappings { .. } => "MIDI mappings",
+            Command::ReplaceAsset { .. } => "Relink asset",
             Command::Batch { .. } => "Edit",
         }
     }
@@ -938,6 +983,10 @@ impl History {
     }
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
+    }
+    /// Treat the current state as unsaved (e.g. after loading an autosave into memory).
+    pub fn mark_dirty(&mut self) {
+        self.saved_revision = u64::MAX;
     }
     pub fn mark_saved(&mut self) {
         self.saved_revision = self.revision;

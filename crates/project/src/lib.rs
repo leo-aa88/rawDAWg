@@ -3,6 +3,7 @@
 
 pub mod assets;
 pub mod commands;
+pub mod lock;
 pub mod model;
 pub mod persist;
 pub mod preset;
@@ -11,7 +12,7 @@ pub mod validate;
 
 pub use commands::{Command, CommandError, History};
 pub use model::*;
-pub use persist::{PersistError, load_project_dir, save_project_dir};
+pub use persist::{PersistError, autosave, load_project_dir, recovery_candidates, save_as, save_project_dir};
 pub use validate::{ValidationError, validate};
 
 /// Current schema version written by this build.

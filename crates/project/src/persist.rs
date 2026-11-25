@@ -17,6 +17,8 @@ const PREVIOUS_MANIFEST: &str = "recovery/project.previous.json";
 pub enum PersistError {
     #[error("I/O error at {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
+    #[error("{0} already exists and is not empty")]
+    Collision(PathBuf),
     #[error("project file too large ({bytes} bytes, max {max})")]
     TooLarge { bytes: u64, max: usize },
     #[error("project.json is not valid JSON: {0}")]
@@ -74,7 +76,13 @@ pub fn parse_project(bytes: &[u8]) -> Result<Project, PersistError> {
     if head.schema_version > crate::SCHEMA_VERSION {
         return Err(ValidationError::UnsupportedSchema { found: head.schema_version, supported: crate::SCHEMA_VERSION }.into());
     }
-    let project: Project = serde_json::from_slice(bytes).map_err(|e| PersistError::Json(e.to_string()))?;
+    let project: Project = if head.schema_version < crate::SCHEMA_VERSION {
+        // older manifest: migrate a copy in memory; the file is rewritten only on save
+        let (v, _) = migrate_json(bytes)?;
+        serde_json::from_value(v).map_err(|e| PersistError::Json(e.to_string()))?
+    } else {
+        serde_json::from_slice(bytes).map_err(|e| PersistError::Json(e.to_string()))?
+    };
     validate(&project)?;
     Ok(project)
 }
@@ -132,6 +140,144 @@ pub fn save_project_dir(dir: &Path, p: &Project) -> Result<(), PersistError> {
 /// Path of the previous manifest kept by the last save, if any.
 pub fn previous_manifest_path(dir: &Path) -> PathBuf {
     dir.join(PREVIOUS_MANIFEST)
+}
+
+/// Autosaves live here, newest `AUTOSAVE_KEEP` kept.
+pub const AUTOSAVE_DIR: &str = "recovery/autosave";
+pub const AUTOSAVE_KEEP: usize = 10;
+
+/// Write an autosave manifest (`<unix ms>-<revision>.json`, atomic) and prune the ring.
+/// Never touches `project.json` or the dirty state.
+pub fn autosave(dir: &Path, p: &Project) -> Result<PathBuf, PersistError> {
+    validate(p)?;
+    let d = dir.join(AUTOSAVE_DIR);
+    fs::create_dir_all(&d).map_err(io(&d))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+    let target = d.join(format!("{now:013}-{:08}.json", p.revision));
+    let tmp = d.join(format!("{now:013}-{:08}.json.tmp-{}", p.revision, std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp).map_err(io(&tmp))?;
+        f.write_all(&project_to_json(p)).map_err(io(&tmp))?;
+        f.sync_all().map_err(io(&tmp))?;
+    }
+    fs::rename(&tmp, &target).map_err(|e| PersistError::Io { path: target.clone(), source: e })?;
+    // prune: keep the newest AUTOSAVE_KEEP by name (timestamp-ordered)
+    let mut names: Vec<PathBuf> = fs::read_dir(&d).map_err(io(&d))?.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json")).collect();
+    names.sort();
+    while names.len() > AUTOSAVE_KEEP {
+        let old = names.remove(0);
+        let _ = fs::remove_file(old);
+    }
+    Ok(target)
+}
+
+/// A manifest that may be newer than the saved project.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryCandidate {
+    pub path: PathBuf,
+    pub revision: u64,
+    pub saved_unix_ms: u64,
+    /// `true` for autosaves, `false` for the previous-manifest backup.
+    pub autosave: bool,
+}
+
+/// Autosaves (newest first) whose revision is above the saved manifest's: what to offer
+/// after a crash. Unparseable files are skipped.
+pub fn recovery_candidates(dir: &Path) -> Vec<RecoveryCandidate> {
+    let saved_rev = load_project_dir(dir).map(|p| p.revision).unwrap_or(0);
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir.join(AUTOSAVE_DIR)) {
+        for e in rd.flatten() {
+            let path = e.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(p) = parse_project(&bytes) else { continue };
+            let ts = name.split('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
+            if p.revision > saved_rev {
+                out.push(RecoveryCandidate { path, revision: p.revision, saved_unix_ms: ts, autosave: true });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.revision.cmp(&a.revision).then(b.saved_unix_ms.cmp(&a.saved_unix_ms)));
+    out
+}
+
+/// Remove every autosave (after a successful save, or when the user discards them).
+pub fn clear_autosaves(dir: &Path) {
+    if let Ok(rd) = fs::read_dir(dir.join(AUTOSAVE_DIR)) {
+        for e in rd.flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Save As: an independent project folder at `dst` (must not exist or be empty) with the
+/// manifest and every referenced asset and plugin-state file copied from `src`. The source
+/// is never modified. Returns the project as saved (same ids; the name is kept).
+pub fn save_as(src: Option<&Path>, dst: &Path, p: &Project) -> Result<(), PersistError> {
+    if dst.exists() {
+        let non_empty = fs::read_dir(dst).map(|mut d| d.next().is_some()).unwrap_or(true);
+        if non_empty {
+            return Err(PersistError::Collision(dst.to_path_buf()));
+        }
+    }
+    if let Some(s) = src
+        && fs::canonicalize(s).ok() == fs::canonicalize(dst).ok()
+        && dst.exists()
+    {
+        return Err(PersistError::Collision(dst.to_path_buf()));
+    }
+    fs::create_dir_all(dst).map_err(io(dst))?;
+    for sub in [ASSETS_DIR, PLUGIN_STATE_DIR, RECOVERY_DIR, CACHE_DIR] {
+        let d = dst.join(sub);
+        fs::create_dir_all(&d).map_err(io(&d))?;
+    }
+    if let Some(src) = src {
+        for a in &p.assets {
+            if let Some(from) = crate::assets::asset_path(src, a)
+                && from.is_file()
+            {
+                let to = dst.join(&a.path);
+                if let Some(parent) = to.parent() {
+                    fs::create_dir_all(parent).map_err(io(parent))?;
+                }
+                fs::copy(&from, &to).map_err(io(&to))?;
+            }
+        }
+        let ps = src.join(PLUGIN_STATE_DIR);
+        if let Ok(rd) = fs::read_dir(&ps) {
+            for e in rd.flatten() {
+                let to = dst.join(PLUGIN_STATE_DIR).join(e.file_name());
+                fs::copy(e.path(), &to).map_err(io(&to))?;
+            }
+        }
+    }
+    save_project_dir(dst, p)
+}
+
+/// Migrate an older manifest to the current schema, one version at a time, on a copy.
+/// Returns the migrated JSON and the version it started from. v1 is the first schema, so
+/// anything older is treated as v1 with defaults (documented); the hook is where future
+/// steps go.
+pub fn migrate_json(bytes: &[u8]) -> Result<(serde_json::Value, u32), PersistError> {
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| PersistError::Json(e.to_string()))?;
+    let from = v.get("schema_version").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    if from > crate::SCHEMA_VERSION {
+        return Err(ValidationError::UnsupportedSchema { found: from, supported: crate::SCHEMA_VERSION }.into());
+    }
+    let mut version = from;
+    while version < crate::SCHEMA_VERSION {
+        // v0 → v1: the pre-release shape is v1 without the explicit version/revision fields
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("schema_version".into(), serde_json::json!(version + 1));
+            obj.entry("revision").or_insert(serde_json::json!(0));
+        }
+        version += 1;
+    }
+    Ok((v, from))
 }
 
 #[cfg(test)]

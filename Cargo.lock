@@ -3537,6 +3537,7 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "hound",
  "image",
  "log",
  "rawdawg-audio-engine",
@@ -3655,6 +3656,7 @@ dependencies = [
 name = "rawdawg-project"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "midly",
  "proptest",
  "rawdawg-transport",

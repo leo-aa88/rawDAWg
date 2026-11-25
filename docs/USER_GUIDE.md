@@ -76,12 +76,7 @@ Open **Settings › Input (recording)**, tick *Open an input device*, choose the
 
 ## Projects
 
-A project is a folder ending in `.rawdawg` containing `project.json`, `assets/`, `plugin-state/`, `recovery/` and `cache/`. Saving is atomic: the previous `project.json` is kept in `recovery/project.previous.json`. The fixture project `fixtures/demo.rawdawg` renders a one-bar motif:
-
-```sh
-cargo xtask fixtures
-cargo xtask render --project fixtures/demo.rawdawg --output target/verification/demo.wav
-```
+A project is a folder ending in `.rawdawg` with `project.json` and the media you imported (copied in, named by content). **File › New…** starts an empty project in a working folder; **Save As…** writes a complete, independent copy to the folder you type (assets included, the previous folder stays as it was); **Open…** takes a folder or its `project.json` and lists recent projects; **Ctrl+S** saves in place. While you have unsaved changes rawDAWg autosaves every two minutes into the project's `recovery` folder; if it ever stops unexpectedly, the next open offers to recover those changes (or keep the saved version, or discard the autosaves). A project opened in two places at once is read-only in the second until you take over the lock. If a sample file is missing from the folder the browser says so and lets you relink it: the same file restores it, a different file replaces it everywhere (undoable). Closing with unsaved changes asks whether to save.
 
 ## Plugins
 

@@ -40,3 +40,6 @@ default = []
 jack = ["rawdawg-audio-io/jack"]
 pipewire = ["rawdawg-audio-io/pipewire"]
 asio = ["rawdawg-audio-io/asio"]
+
+[dev-dependencies]
+hound = { workspace = true }

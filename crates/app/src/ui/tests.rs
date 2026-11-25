@@ -540,9 +540,9 @@ fn browser_search_filters_and_favorites_sort_first_and_effects_add_to_the_select
     assert!(!super::browser_matches("delay", &["Reverb"]));
     let mut h = Harness::new(Some("../../fixtures/demo-sampler.rawdawg"));
     let asset = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| a.id.to_string()).unwrap();
-    super::toggle_favorite(&mut h.app.prefs, &asset);
+    h.app.toggle_favorite(&asset);
     assert!(h.app.prefs.favorites.contains(&asset));
-    super::toggle_favorite(&mut h.app.prefs, &asset);
+    h.app.toggle_favorite(&asset);
     assert!(!h.app.prefs.favorites.contains(&asset));
     // the browser draws with a search term without panicking and the effect list adds inserts
     h.app.browser_search = "verb".into();
@@ -557,4 +557,94 @@ fn browser_search_filters_and_favorites_sort_first_and_effects_add_to_the_select
     let id = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| a.id.clone()).unwrap();
     h.app.preview_asset(&id);
     assert!(h.app.plan_error.is_none());
+}
+
+#[test]
+fn projects_save_as_autosave_recover_lock_and_relink() {
+    use rawdawg_project::{Command, Note};
+    use rawdawg_types::NoteId;
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // new project → Save As creates the folder, locks it and clears the dirty flag
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    assert!(h.app.project_path.is_none());
+    let dir = root.join("Song.rawdawg");
+    h.app.save_project_as(dir.clone());
+    assert_eq!(h.app.project_path.as_deref(), Some(dir.as_path()));
+    assert!(dir.join("project.json").is_file() && dir.join("recovery/lock.json").is_file());
+    assert!(!h.app.history.is_dirty());
+    assert!(h.app.files.error.is_none(), "{:?}", h.app.files.error);
+    // an edit makes it dirty; an autosave records it without touching project.json
+    let pid = h.app.project.patterns[0].id;
+    let cid = h.app.project.channels[0].id;
+    h.app.apply(Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![Note { id: NoteId::new(), tick: Tick(0), duration_ticks: Tick(480), pitch: 64, velocity: 0.7, channel: 0 }],
+    });
+    assert!(h.app.history.is_dirty());
+    h.app.autosave_now(&dir);
+    assert!(h.app.files.last_autosave_note.as_deref().is_some_and(|n| n.starts_with("Autosaved revision")), "{:?}", h.app.files.last_autosave_note);
+    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().patterns[0].lanes[0].notes.len(), 0, "saved manifest unchanged by the autosave");
+    // "crash": a second app opens the folder → the lock from the first instance is ours (same pid → not live), recovery offered
+    drop(h);
+    let mut h2 = Harness::new(None);
+    h2.app.open_project_checked(dir.clone());
+    assert!(h2.app.files.read_only.is_none(), "{:?}", h2.app.files.read_only);
+    assert_eq!(h2.app.files.recovery.len(), 1, "one newer autosave");
+    let cand = h2.app.files.recovery[0].clone();
+    h2.app.recover_from(&cand);
+    assert_eq!(h2.app.project.patterns[0].lanes[0].notes.len(), 1, "recovered the unsaved note");
+    assert!(h2.app.history.is_dirty(), "recovered state must be saved explicitly");
+    h2.app.save_project_checked();
+    assert!(!h2.app.history.is_dirty());
+    assert!(rawdawg_project::recovery_candidates(&dir).is_empty(), "autosaves cleared after a save");
+    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().revision, h2.app.history.revision());
+    // a foreign live lock makes the project read-only; taking over enables saving
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let foreign = rawdawg_project::lock::LockInfo { pid: 1, host: "elsewhere".into(), acquired_unix_ms: now };
+    drop(h2);
+    std::fs::write(dir.join("recovery/lock.json"), serde_json::to_vec(&foreign).unwrap()).unwrap();
+    let mut h3 = Harness::new(None);
+    h3.app.open_project_checked(dir.clone());
+    assert!(h3.app.files.read_only.is_some());
+    h3.app.apply(Command::RenameProject { name: "renamed".into() });
+    h3.app.save_project_checked();
+    assert!(h3.app.status_line.starts_with("Read-only"), "{}", h3.app.status_line);
+    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().name, "Untitled", "not written while read-only");
+    h3.app.take_over_lock();
+    assert!(h3.app.files.read_only.is_none());
+    h3.app.save_project_checked();
+    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().name, "renamed");
+    // relink: import a sample, delete its file → missing; relinking the same file restores it
+    let wav = root.join("tone.wav");
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+    for i in 0..4800 {
+        w.write_sample(((i % 100) as i16) * 100).unwrap();
+    }
+    w.finalize().unwrap();
+    let id = h3.app.import_asset_only(&wav).unwrap();
+    let asset = h3.app.project.assets.iter().find(|a| a.id.to_string() == id).cloned().unwrap();
+    assert!(!h3.app.asset_is_missing(&asset));
+    std::fs::remove_file(dir.join(&asset.path)).unwrap();
+    assert!(h3.app.asset_is_missing(&asset));
+    h3.app.relink_asset(&asset.id, &wav);
+    assert!(!h3.app.asset_is_missing(&asset), "same content restored the file");
+    assert!(h3.app.status_line.contains("same content"), "{}", h3.app.status_line);
+    // relinking with different content replaces the asset (undoable)
+    let other = root.join("other.wav");
+    let mut w = hound::WavWriter::create(&other, spec).unwrap();
+    for i in 0..4800 {
+        w.write_sample(((i % 50) as i16) * 100).unwrap();
+    }
+    w.finalize().unwrap();
+    h3.app.relink_asset(&asset.id, &other);
+    assert!(h3.app.project.assets.iter().all(|a| a.id != asset.id), "old id replaced");
+    assert!(h3.app.status_line.contains("Replaced"), "{}", h3.app.status_line);
+    h3.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h3.app.project.assets.iter().any(|a| a.id == asset.id), "undo restores the original asset entry");
+    let _ = std::fs::remove_dir_all(&root);
 }

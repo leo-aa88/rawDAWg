@@ -12,6 +12,7 @@ mod mixer;
 mod piano_roll;
 mod playlist;
 mod presets;
+mod project_files;
 mod recording;
 mod sequencer;
 mod settings;
@@ -152,6 +153,7 @@ pub(crate) struct App {
     pub selected_channel: Option<ChannelId>,
     pub show_settings: bool,
     pub(crate) export: export::ExportState,
+    pub(crate) files: project_files::ProjectFilesState,
     /// Browser search text (filters samples and effects).
     pub browser_search: String,
     /// Assets handed to the engine for preview: held here until the preview ended so the
@@ -238,6 +240,7 @@ impl App {
             }
         }
         let selected_channel = project.channels.first().map(|c| c.id);
+        let opened_dir = project_path.clone();
         let mut app = Self {
             project,
             history: History::new(),
@@ -257,6 +260,7 @@ impl App {
             selected_channel,
             show_settings: false,
             export: export::ExportState::default(),
+            files: project_files::ProjectFilesState::default(),
             browser_search: String::new(),
             preview_held: Vec::new(),
             stream_worker: None,
@@ -329,6 +333,10 @@ impl App {
                     app.status_line = format!("Unknown effect {type_id}");
                 }
             }
+            Some("open-dialog") => {
+                app.files.path_input = app.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                app.files.dialog = Some(project_files::FileDialog::Open);
+            }
             Some("settings") => {
                 app.show_settings = true;
                 app.prefs.input_enabled = true;
@@ -350,6 +358,15 @@ impl App {
             }
             Some(other) => app.status_line = format!("Unknown --ui-preset {other}"),
             None => {}
+        }
+        if let Some(dir) = opened_dir {
+            // the constructor already loaded the project; add the lock and the recovery check
+            match rawdawg_project::lock::ProjectLock::acquire(&dir, false) {
+                Ok(l) => app.files.lock = Some(l),
+                Err(e) => app.files.read_only = Some(e.to_string()),
+            }
+            app.files.recovery = rawdawg_project::recovery_candidates(&dir);
+            app.files.last_autosave = Some(std::time::Instant::now());
         }
         app
     }
@@ -406,6 +423,15 @@ impl App {
 
     /// Record that the live processor already holds `state` (applied through live
     /// events or table handoff), so the next recompile carries it over.
+    /// Persist preferences unless this is a headless test instance.
+    pub(crate) fn save_prefs(&self) {
+        if self.persist_prefs
+            && let Err(e) = self.prefs.save()
+        {
+            log::warn!("could not save preferences: {e}");
+        }
+    }
+
     pub(crate) fn mark_live_state(&mut self, instance_id: rawdawg_types::InstanceId, type_id: &str, state: &serde_json::Value) {
         self.live_fingerprints.insert(instance_id, rawdawg_audio_engine::fingerprint_state(type_id, state));
     }
@@ -843,9 +869,7 @@ impl App {
                     self.prefs.audio_device_id = req.device_id.clone();
                     self.prefs.sample_rate_hz = req.sample_rate_hz;
                     self.prefs.buffer_frames = req.buffer_frames;
-                    if let Err(e) = self.prefs.save() {
-                        log::warn!("could not save preferences: {e}");
-                    }
+                    self.save_prefs();
                 }
                 self.recompile();
             }
@@ -1043,7 +1067,7 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui.small_button(if fav { "fav" } else { "+fav" }).on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites (listed first)" }).clicked() {
-                        toggle_favorite(&mut self.prefs, fx.type_id);
+                        self.toggle_favorite(fx.type_id);
                     }
                     if ui.button(fx.name).on_hover_text(fx.description).clicked() {
                         let mut inst = rawdawg_project::Instance::native(fx.type_id, serde_json::Value::Null);
@@ -1083,7 +1107,7 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     if ui.small_button(if fav { "fav" } else { "+fav" }).on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites (listed first)" }).clicked() {
-                        toggle_favorite(&mut self.prefs, &id.to_string());
+                        self.toggle_favorite(&id.to_string());
                     }
                     let can_play = matches!(self.audio, AudioState::Running(_));
                     if previewing {
@@ -1097,8 +1121,12 @@ impl App {
                     {
                         self.preview_asset(&id);
                     }
+                    let missing = self.project.assets.iter().find(|a| a.id == id).is_some_and(|a| self.asset_is_missing(a));
+                    if missing && ui.small_button("relink…").on_hover_text("The file is missing from the project folder").clicked() {
+                        self.files.relink = Some((id.clone(), String::new()));
+                    }
                     let armed = self.playlist.place_asset.as_ref() == Some(&id);
-                    if ui.selectable_label(armed, &name).on_hover_text("Arm for placement in the playlist").clicked() {
+                    if ui.selectable_label(armed, if missing { format!("{name} (missing)") } else { name.clone() }).on_hover_text("Arm for placement in the playlist").clicked() {
                         self.playlist.place_asset = if armed { None } else { Some(id.clone()) };
                         if !armed {
                             self.editor_view = EditorView::Rack;
@@ -1124,28 +1152,13 @@ impl App {
                 self.project_path = Some(path.clone());
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
                 self.prefs.remember_project(path.clone());
-                let _ = self.prefs.save();
+                self.save_prefs();
                 self.status_line = format!("Opened {}", path.display());
                 self.rebuild_mirrors();
                 self.recompile();
                 self.recover_takes();
             }
             Err(e) => self.status_line = format!("Could not open {}: {e}", path.display()),
-        }
-    }
-
-    pub(crate) fn save_project(&mut self) {
-        let Some(path) = self.project_path.clone() else {
-            self.status_line = "Save As is not available yet (M6); use --open to work on a project folder".into();
-            return;
-        };
-        let revision = self.history.revision();
-        match rawdawg_project::save_project_dir(&path, &self.project) {
-            Ok(()) => {
-                self.history.mark_saved_at(revision);
-                self.status_line = format!("Saved {}", path.display());
-            }
-            Err(e) => self.status_line = format!("Save failed: {e}"),
         }
     }
 
@@ -1317,15 +1330,32 @@ impl App {
     fn menu(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
-                if ui.add_enabled(self.project_path.is_some(), egui::Button::new("Save (Ctrl+S)")).clicked() {
-                    self.save_project();
+                if ui.button("New…").clicked() {
+                    self.files.dialog = Some(project_files::FileDialog::New);
                     ui.close();
+                }
+                if ui.button("Open…").clicked() {
+                    self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    self.files.dialog = Some(project_files::FileDialog::Open);
+                    ui.close();
+                }
+                if ui.add_enabled(self.files.read_only.is_none(), egui::Button::new("Save (Ctrl+S)")).clicked() {
+                    self.save_project_checked();
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    self.files.dialog = Some(project_files::FileDialog::SaveAs);
+                    ui.close();
+                }
+                if let Some(n) = &self.files.last_autosave_note {
+                    ui.label(egui::RichText::new(n).color(theme::TEXT_SECONDARY).small());
                 }
                 if ui.button("Export…").on_hover_text("Render to WAV/FLAC (and stems) or a MIDI file with the playback engine").clicked() {
                     self.export.open = true;
                     ui.close();
                 }
-                ui.label(egui::RichText::new("New / Open / Save As dialogs arrive in M6; use --open <folder>").color(theme::TEXT_SECONDARY));
+                ui.label(egui::RichText::new("Projects are folders ending in .rawdawg; autosaves every 2 min while unsaved").color(theme::TEXT_SECONDARY).small());
             });
             ui.menu_button("Edit", |ui| {
                 let undo_label = self.history.undo_label().unwrap_or("Undo");
@@ -1442,8 +1472,9 @@ impl App {
     pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
-            self.save_project();
+            self.save_project_checked();
         }
+        self.poll_project_files(ctx);
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();
@@ -1548,6 +1579,7 @@ impl App {
         if self.export.open {
             export::show(self, ui.ctx());
         }
+        project_files::show(self, ui.ctx());
     }
 
     fn editor_contents(&mut self, ui: &mut egui::Ui) {
@@ -1591,11 +1623,13 @@ pub(crate) fn browser_matches(needle: &str, fields: &[&str]) -> bool {
     needle.is_empty() || fields.iter().any(|f| f.to_lowercase().contains(needle))
 }
 
-pub(crate) fn toggle_favorite(prefs: &mut crate::prefs::Preferences, key: &str) {
-    if let Some(i) = prefs.favorites.iter().position(|x| x == key) {
-        prefs.favorites.remove(i);
-    } else {
-        prefs.favorites.push(key.to_owned());
+impl App {
+    pub(crate) fn toggle_favorite(&mut self, key: &str) {
+        if let Some(i) = self.prefs.favorites.iter().position(|x| x == key) {
+            self.prefs.favorites.remove(i);
+        } else {
+            self.prefs.favorites.push(key.to_owned());
+        }
+        self.save_prefs();
     }
-    let _ = prefs.save();
 }

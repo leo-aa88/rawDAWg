@@ -33,6 +33,10 @@ pub struct Project {
     /// Which pattern the rack/piano roll currently show and pattern mode plays.
     #[serde(default)]
     pub selected_pattern: Option<PatternId>,
+    /// Edit revision written by the last save (autosaves carry theirs; a newer autosave
+    /// than the saved manifest means a recovery candidate).
+    #[serde(default)]
+    pub revision: u64,
     /// Unknown/forward-compatible fields are preserved here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, Value>,
@@ -501,6 +505,7 @@ impl Project {
             midi_mappings: vec![],
             r#loop: None,
             selected_pattern: Some(pattern_id),
+            revision: 0,
             extensions: BTreeMap::new(),
         }
     }
