@@ -54,6 +54,12 @@ Tick **Advanced** in the synth panel and open **Modular graph**. The **voice gra
 
 **Automation**: right-click any parameter → "Create automation clip". Curves live on an Automation track and play in Song mode; the Automation view edits points (click adds, drag moves, right-click deletes; per point Linear or Step) in the parameter's own units. Modes: Read plays, Touch writes while you hold a control during playback, Write latches the last value until you stop. The morph pad's "Write gesture as automation" bakes a recorded XY movement into curves. **MIDI learn** is in the same context menu: pick it, move a controller, done.
 
+## Mixer and effects
+
+**Mixer (F9)**: the master is pinned on the left, other channels scroll. Each strip has mute, solo, pan, a fader with a dB readout (double-click resets), stereo meters with peak hold and a red clip bar (click to reset) and an output selector; `+ Bus` adds a channel. Pick a strip to edit its **inserts** (`+ Add effect`, then search; bypass, wet/dry, up/down, remove; the reported latency is shown and compensated automatically so parallel paths stay aligned) and its **sends** (target, level, pre/post-fader, sidechain). Every channel in the rack chooses its mixer channel next to its name. The output latency created by effects is shown at the top of the mixer.
+
+**Effects**: click an insert to open its editor. Each effect has presets, On/Bypassed, a Reset button, simple controls and an Advanced numeric view; right-click any control for MIDI learn or an automation clip. The **Parametric EQ** shows its response: click the plot to add a bell, drag a band to change frequency and gain, use the wheel over a band for Q, right-click a band to remove it, and choose each band's type below. The **Stereo** effect handles gain, pan, balance, width (mid/side), mono, channel swap and phase, and shows the stereo correlation.
+
 ## Projects
 
 A project is a folder ending in `.rawdawg` containing `project.json`, `assets/`, `plugin-state/`, `recovery/` and `cache/`. Saving is atomic: the previous `project.json` is kept in `recovery/project.previous.json`. The fixture project `fixtures/demo.rawdawg` renders a one-bar motif:

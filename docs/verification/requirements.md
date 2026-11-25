@@ -6,17 +6,17 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 
 | ID | Status | Milestone | Evidence / notes |
 |---|---|---|---|
-| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 233 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
+| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 244 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
 | PLAT-02 | PARTIAL | M0/M1 | CPAL enumeration, pure negotiation policy with fake-device tests (stereo/f32 preference, nearest-supported hints), explicit device/rate/buffer controls in Settings with requested vs actual, rate-limited error reporting, automatic one-time fallback to the device buffer (preferences untouched), no-device/failed states with Retry. Evidence: `rawdawg --audio-smoke` → ALSA default 48 kHz F32, 0 xruns (WSLg PulseAudio bridge, **not** real hardware; the bridge later wedged, see PROGRESS.md). Real-device matrix: BLOCKED (HW-01). |
 | PLAT-03 | PARTIAL | M0 | Dark-only visuals forced every frame (`crates/app/src/theme.rs`), no theme toggle anywhere. Manual screenshot verification: BLOCKED (GUI-01). |
 | PLAT-04 | NOT RUN | M8 | `cargo xtask package` exists and refuses with an explicit message; no packaging yet. |
 | PLAT-05 | PASS (design) | M0 | No network, account or telemetry code; `deny.toml` bans `openssl-sys`; all operation offline. Re-verified at each milestone. |
 | PLAT-06 | PASS | M0 | No JUCE/external DAW engine/webview in the graph (`cargo deny check bans`; `deny.toml` bans `juce`, `wry`, `tauri`, `webview2-com`). Custom DSP in `crates/dsp`, `crates/synthesizer`. |
 | CORE-01 | PARTIAL | M1/M3 | Play/stop/pause/seek, pattern/song mode and loop toggles, loop range, tempo map with step changes and time-signature map editable as markers (`SetTempoMap`/`SetMeterMap`), bar/beat ruler, metronome, sample-accurate scheduling (`crates/transport`, engine tests, HL-10). Count-in: open (recording slice). |
-| CORE-02 | PARTIAL | M3 | Rack: add (import/instrument), delete, rename, mute/solo, gain/pan, step rows with adjustable length/step size, velocity/pitch per step, off-grid markers; headless UI input tests click/paint steps (`ui/tests.rs`), E2E-02. Reorder/duplicate channels and mixer assignment UI: open (M4). |
+| CORE-02 | PARTIAL | M3/M4 | Rack: add (import/instrument), delete, rename, mute/solo, gain/pan, mixer assignment, step rows with adjustable length/step size, velocity/pitch per step, off-grid markers; headless UI input tests; E2E-02. Reorder/duplicate channels: open. |
 | CORE-03 | PASS (automated incl. UI input tests; listening/feel manual open) | M3 | Keyboard ruler, grid, draw/select/move/resize/delete, box selection, duplicate, clipboard, snap incl. triplets, transpose, velocity lane, scale highlight/snap, chord insertion, quantize with strength + preview. `ui/tests.rs` drives the real layout with synthesized mouse/keys; helper unit tests; E2E-02. |
 | CORE-04 | PARTIAL | M3 | Tracks, pattern clips (paint/move/copy/split/trim/resize/loop/make unique/mute), automation clips, track mute/solo, zoom/scroll, loop range; UI input test paints/deletes clips; E2E-02 covers repeats, make unique, trim, tempo change, loop. Audio clip playback, clip gain/fades: M5. |
-| CORE-05 | PARTIAL | M1 | Mixer channels, routing order, master, solo logic, master protection limiter (`PeakLimiter`). Missing: inserts, sends, meters UI, latency compensation (M4). |
+| CORE-05 | PARTIAL | M4 | Channels/buses/master, gain/pan/mute/solo, peak-hold meters with clip indicators, insert chains (reorder/bypass/mix), pre/post sends, sidechain inputs, parallel paths, longest-path latency compensation (engine tests: alignment within one frame, bypass alignment, send semantics), feedback rejected by validation (sends and outputs are DAG edges). Open: insert drag-reorder, GUI-01 manual. Screenshot `m4-mixer.png`. |
 | CORE-06 | NOT RUN | M3 | Browser panel lists instruments/devices only. |
 | CORE-07 | PARTIAL | M0/M3 | Shared undo/redo for all persistent edits incl. gestures (move/resize/velocity/quantize/automation previews), mutations, routing; exact undo verified in tests and E2E-02. Save/open; new/save-as, dirty status and autosave/recovery: M6. |
 | CORE-08 | PARTIAL | M3 | Curves with step/linear points, editor, automation clips, song-mode playback with 64-frame sampling and chase (engine tests, HL-11), touch/write capture of mouse parameter gestures, MIDI learn, morph gesture → automation. Open: mixer/effect targets (M4), capture of MIDI-driven changes, pattern-mode automation. |
@@ -43,7 +43,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | DATA-01 | PARTIAL | M0 | Schema v1 structs, validation (duplicates, references, limits, traversal, cycles), atomic save with previous-manifest backup, size/nesting caps, newer-schema rejection: `crates/project` tests, HL-06. Assets/recovery/locking: M6. |
 | DATA-02 | PARTIAL | M0 | Deterministic renders (HL-05), save/load render equivalence (HL-06), synth state round trip. Cross-OS comparison: NOT RUN. |
 | QUAL-01 | PARTIAL | M0/M1 | Zero allocations on owned render path under traffic (`render_block_is_allocation_free_under_traffic`, `process_path_is_allocation_free`), variable blocks 32…2048 incl. odd sizes, six sample rates (HL-03/HL-04), f32 processing, i128 exact timing. Full stress (30 min, RSS) : M8. |
-| QUAL-02 | PARTIAL | M0/M1 | Bandlimiting ≥35 dB (ADR 0003), smoothing, NaN/Inf sanitize + counters, master lookahead limiter with explicit unprotected offline option. Oversampled nonlinearities, DC blocking on effects: M4. |
+| QUAL-02 | PARTIAL | M0/M1/M4 | Bandlimiting at least 35 dB (ADR 0003), smoothing (synth + effect params), NaN/Inf sanitize + counters per channel and per insert, master lookahead limiter with explicit unprotected offline option and a mixer toggle, true bypass with latency alignment, stable biquads under random parameters (T-FX). Oversampled nonlinearities, DC blocking: distortion slice. |
 | QUAL-03 | PARTIAL | M0 | 145 automated tests; `cargo xtask verify` report (`target/verification/verify-all.json`); CI workflow for Ubuntu 24.04 + Windows 2022 defined, NOT RUN yet; `cargo deny` licenses pass. |
 | QUAL-04 | NOT RUN | M8 | |
 
@@ -55,7 +55,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | T-TIME | PARTIAL (PASS: beat/bar frames, tempo changes, 1 h, half-open blocks, rounding oracle, loop/seek/stop) | `crates/transport`, `crates/audio-engine/tests/engine.rs` |
 | T-OSC | PASS for implemented oscillators (A4 ±0.5 Hz at six rates, alias ≥35 dB, continuity, DC, seam) | `crates/dsp/src/{oscillator,wavetable}.rs` |
 | T-VOICE | PARTIAL (PASS: polyphony, stealing, legato, sustain, source isolation, release, determinism) | `crates/synthesizer/tests/synth.rs` |
-| T-GRAPH | PARTIAL | Synth graph part PASS: type mismatch and instant cycles rejected, explicit delayed feedback only, deterministic topology, per-voice vs global modulation, invalid expression rejection and bounded stack/instruction counts (`tests/graph.rs`). Mixer part (summed impulse with latency compensation, pre/post/sidechain, bypass alignment): M4. |
+| T-GRAPH | PARTIAL | Synth graph part PASS (`tests/graph.rs`); mixer part PASS for summed impulse alignment within 1 frame, bypass alignment, pre/post/sidechain sends (`crates/audio-engine/tests/engine.rs`). More effects extend the cases. |
 | T-DATA | PARTIAL (round trip, malformed/newer schema, nesting bomb, atomic save) | `crates/project/src/persist.rs` |
 | T-EXPORT | PARTIAL (WAV formats, sample counts, content) | `crates/audio-engine/tests/engine.rs` |
 | T-PLUGIN | PARTIAL (ABI lifecycle, process, params, state through built modules) | `crates/plugin-clap/tests`, `crates/plugin-vst3/tests` |
@@ -65,7 +65,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | T-MUTATE | PASS (determinism, chaos 0, locks, 1000 seeds valid/finite, ≥90 % perceptible, descendants, breed) | `crates/synthesizer/src/mutate.rs` |
 | T-MORPH | PARTIAL (corners exact, weights sum 1, smooth midpoints, incompatible reported; crossfade/record-replay open) | `crates/synthesizer/src/morph.rs` |
 | T-SAMPLER | PASS (bounds, loop, pitch/duration, rate conversion, SF2 zones/bank/loop/warnings/malformed) | `crates/sampler/tests/sampler.rs` |
-| T-FX | NOT RUN (M4) | |
+| T-FX | PARTIAL (EQ gain/response/null/stability/state/presets, stereo width/mono/pan/correlation, allocation-free) | `crates/effects/tests/effects.rs`, `crates/dsp/src/biquad.rs` |
 
 ## Manual / platform gates currently open
 
