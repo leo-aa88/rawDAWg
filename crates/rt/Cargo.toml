@@ -1,0 +1,17 @@
+[package]
+name = "rawdawg-rt"
+description = "rawDAWg real-time ownership primitives: bounded queues, snapshot handoff, retirement and allocation guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtrb = { workspace = true }
+
+[features]
+default = []
+# Enables the instrumented global allocator that counts/aborts allocations while
+# a thread-local real-time flag is set. Used by T-RT tests and the bench harness.
+alloc-guard = []

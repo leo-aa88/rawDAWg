@@ -1,0 +1,19 @@
+[package]
+name = "rawdawg-dsp"
+description = "rawDAWg processing contract, buffers and custom DSP primitives (oscillators, envelopes, filters, smoothing, deterministic RNG)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+realfft = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

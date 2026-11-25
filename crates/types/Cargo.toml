@@ -1,0 +1,17 @@
+[package]
+name = "rawdawg-types"
+description = "rawDAWg core identifiers, units, events and parameter descriptors (no I/O, no UI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }

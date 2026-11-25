@@ -1,0 +1,20 @@
+[package]
+name = "rawdawg-plugin-vst3"
+description = "rawDAWg VST3 export: thin COM adapter over native processors (M0 ABI spike: gain effect)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "rawdawg_vst3"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-dsp = { path = "../dsp" }
+vst3 = { workspace = true }
+
+[dev-dependencies]
+libloading = { workspace = true }

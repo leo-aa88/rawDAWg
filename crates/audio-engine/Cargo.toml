@@ -1,0 +1,24 @@
+[package]
+name = "rawdawg-audio-engine"
+description = "rawDAWg real-time render plan, transport scheduler and offline renderer (no OS devices, no GUI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-transport = { path = "../transport" }
+rawdawg-rt = { path = "../rt" }
+rawdawg-dsp = { path = "../dsp" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-project = { path = "../project" }
+hound = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rawdawg-rt = { path = "../rt", features = ["alloc-guard"] }

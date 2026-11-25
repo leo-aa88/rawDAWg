@@ -1,0 +1,38 @@
+[package]
+name = "rawdawg"
+description = "rawDAWg — Less thinking. More noise. Native experimental DAW."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "rawdawg"
+
+[[bin]]
+name = "rawdawg"
+path = "src/main.rs"
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-transport = { path = "../transport" }
+rawdawg-rt = { path = "../rt" }
+rawdawg-dsp = { path = "../dsp" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-project = { path = "../project" }
+rawdawg-audio-engine = { path = "../audio-engine" }
+rawdawg-audio-io = { path = "../audio-io" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+
+[features]
+default = []
+jack = ["rawdawg-audio-io/jack"]
+pipewire = ["rawdawg-audio-io/pipewire"]
+asio = ["rawdawg-audio-io/asio"]
