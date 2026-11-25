@@ -29,15 +29,25 @@ fn built_vst3_module() -> PathBuf {
     p
 }
 
-/// A standard `.vst3` bundle built from the module (what users install).
+/// A standard `.vst3` bundle built from the module (what users install). Built once per
+/// process and written through a temp name + rename: tests run in parallel threads and must
+/// never `dlopen` a file another thread is still copying.
 fn bundle_dir() -> PathBuf {
-    let module = built_vst3_module();
-    let base = std::env::temp_dir().join(format!("rawdawg-vst3host-{}", std::process::id()));
-    let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
-    let dir = base.join("rawDAWg.vst3").join("Contents").join(arch);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(&module, dir.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" })).unwrap();
-    base.join("rawDAWg.vst3")
+    static BUNDLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUNDLE
+        .get_or_init(|| {
+            let module = built_vst3_module();
+            let base = std::env::temp_dir().join(format!("rawdawg-vst3host-{}", std::process::id()));
+            let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
+            let dir = base.join("rawDAWg.vst3").join("Contents").join(arch);
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" });
+            let tmp = dir.join("partial.tmp");
+            std::fs::copy(&module, &tmp).unwrap();
+            std::fs::rename(&tmp, &target).unwrap();
+            base.join("rawDAWg.vst3")
+        })
+        .clone()
 }
 
 struct Fixture {

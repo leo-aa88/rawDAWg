@@ -7,6 +7,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const PROJECT_FILE: &str = "project.json";
+/// Fixed-name marker written into every saved project folder so desktops can associate a
+/// *file* with rawDAWg (folders cannot be associated by suffix). Opening it resolves to the
+/// sibling `project.json`; its content is informational only and never read as a path.
+pub const PROJECT_MARKER: &str = "project.rawdawg";
+const MARKER_TEXT: &str = "rawDAWg project. Open this file (or the folder) with rawDAWg; the project itself is project.json next to it.\n";
 pub const ASSETS_DIR: &str = "assets/sha256";
 pub const PLUGIN_STATE_DIR: &str = "plugin-state";
 pub const RECOVERY_DIR: &str = "recovery";
@@ -41,9 +46,10 @@ pub fn resolve_project_dir(path: &Path) -> Result<PathBuf, PersistError> {
         }
         return Err(PersistError::NotAProject(path.to_path_buf()));
     }
-    if path.file_name().is_some_and(|n| n == PROJECT_FILE)
+    if path.file_name().is_some_and(|n| n == PROJECT_FILE || n == PROJECT_MARKER)
         && let Some(parent) = path.parent()
         && path.is_file()
+        && parent.join(PROJECT_FILE).is_file()
     {
         return Ok(parent.to_path_buf());
     }
@@ -127,6 +133,11 @@ pub fn save_project_dir(dir: &Path, p: &Project) -> Result<(), PersistError> {
     if let Err(e) = fs::rename(&tmp, &target) {
         let _ = fs::remove_file(&tmp);
         return Err(PersistError::Io { path: target, source: e });
+    }
+    // association marker (best effort: a read-only marker never fails the save)
+    let marker = dir.join(PROJECT_MARKER);
+    if !marker.is_file() {
+        let _ = fs::write(&marker, MARKER_TEXT);
     }
     #[cfg(unix)]
     {

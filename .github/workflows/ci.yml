@@ -53,6 +53,28 @@ jobs:
         run: cargo xtask verify --suite plugins
       - name: Headless render
         run: cargo xtask render --project fixtures/demo.rawdawg --output target/verification/demo.wav
+      - name: Package (deb)
+        if: runner.os == 'Linux'
+        run: cargo xtask package --format deb
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Package (msi + portable)
+        if: runner.os == 'Windows'
+        run: |
+          cargo xtask package --format msi
+          cargo xtask package --format portable
+      - name: Upload packages (unsigned, CI evidence only)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-${{ matrix.os }}
+          path: |
+            target/package/*.deb
+            target/package/*.msi
+            target/package/*.zip
+            target/package/SHA256SUMS
+            target/package/lintian.txt
+          if-no-files-found: warn
       - name: Upload verification evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

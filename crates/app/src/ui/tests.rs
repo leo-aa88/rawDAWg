@@ -815,3 +815,46 @@ fn hosted_plugins_are_added_from_the_catalog_edited_through_mirrors_and_shown_in
     assert!(!h.app.other_mirrors.contains_key(&ext.id));
     assert!(h.app.plugin_host.unavailable_reason(h.app.project.instance(ext.id).unwrap()).is_some_and(|r| r.contains("safe mode")));
 }
+
+#[test]
+fn open_accepts_preset_files_and_the_project_marker() {
+    let dir = std::env::temp_dir().join(format!("rawdawg-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // synth preset: loads onto the synth channel of a fresh project
+    let mut patch = rawdawg_synthesizer::presets::factory_presets()[3].patch.clone();
+    patch.name = "Opened Sound".into();
+    let synth_file = dir.join("Opened Sound.rawdawgpreset");
+    rawdawg_project::preset::write_preset(&synth_file, &rawdawg_project::preset::PresetManifest::new_synth(&patch.name, &patch, &[]), &[]).unwrap();
+    let h = Harness::new(Some(synth_file.to_str().unwrap()));
+    assert!(h.app.status_line.contains("Opened Sound"), "{}", h.app.status_line);
+    assert!(h.app.project_path.is_none(), "a preset opens into a new, unsaved project");
+    assert_eq!(h.app.project.channels[0].instrument.state["name"], "Opened Sound");
+    // effect preset: becomes an insert on the master, undoable
+    let reverb_state = rawdawg_effects::preset_state(rawdawg_effects::reverb::TYPE_ID, &rawdawg_effects::presets(rawdawg_effects::reverb::TYPE_ID)[0]).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&reverb_state).unwrap();
+    let fx_file = dir.join("Hall.rawdawgpreset");
+    rawdawg_project::preset::write_preset(&fx_file, &rawdawg_project::preset::PresetManifest::new_effect("Hall", rawdawg_effects::reverb::TYPE_ID, state.clone()), &[]).unwrap();
+    let mut h = Harness::new(Some(fx_file.to_str().unwrap()));
+    let master = h.app.project.mixer.master_id;
+    let inserts = h.app.project.mixer_channel(master).unwrap().inserts.clone();
+    assert_eq!(inserts.len(), 1, "{}", h.app.status_line);
+    assert_eq!(inserts[0].type_id.as_str(), rawdawg_effects::reverb::TYPE_ID);
+    assert_eq!(inserts[0].state, state);
+    assert_eq!(h.app.editor_view, EditorView::Effect);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h.app.project.mixer_channel(master).unwrap().inserts.is_empty());
+    // a broken preset reports and leaves the default project untouched
+    let bad = dir.join("Broken.rawdawgpreset");
+    std::fs::write(&bad, b"not a zip").unwrap();
+    let h = Harness::new(Some(bad.to_str().unwrap()));
+    assert!(h.app.status_line.contains("Could not open preset"), "{}", h.app.status_line);
+    // the project marker opens the folder it sits in
+    let proj = dir.join("Song.rawdawg");
+    let p = rawdawg_project::Project::new_default("Marker Song", serde_json::json!({}));
+    rawdawg_project::persist::save_project_dir(&proj, &p).unwrap();
+    let marker = proj.join(rawdawg_project::persist::PROJECT_MARKER);
+    let h = Harness::new(Some(marker.to_str().unwrap()));
+    assert_eq!(h.app.project.project_id, p.project_id, "{}", h.app.status_line);
+    let _ = std::fs::remove_dir_all(&dir);
+}

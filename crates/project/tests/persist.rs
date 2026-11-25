@@ -241,3 +241,25 @@ fn older_manifests_are_migrated_in_memory_and_newer_ones_refused() {
     v["schema_version"] = serde_json::json!(99);
     assert!(rawdawg_project::persist::parse_project(&serde_json::to_vec(&v).unwrap()).is_err());
 }
+
+#[test]
+fn saved_projects_carry_an_association_marker_that_resolves_to_the_folder() {
+    let dir = std::env::temp_dir().join(format!("rawdawg-marker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let proj = dir.join("Song.rawdawg");
+    let p = rawdawg_project::Project::new_default("Song", serde_json::json!({}));
+    rawdawg_project::persist::save_project_dir(&proj, &p).unwrap();
+    let marker = proj.join(rawdawg_project::persist::PROJECT_MARKER);
+    assert!(marker.is_file(), "save writes project.rawdawg");
+    assert_eq!(rawdawg_project::persist::resolve_project_dir(&marker).unwrap(), proj);
+    assert_eq!(rawdawg_project::load_project_dir(&marker).unwrap().project_id, p.project_id, "opening the marker opens the project");
+    // a stray file with the marker name but no sibling project.json is not a project
+    let stray = dir.join("elsewhere");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join(rawdawg_project::persist::PROJECT_MARKER), "x").unwrap();
+    assert!(rawdawg_project::persist::resolve_project_dir(&stray.join(rawdawg_project::persist::PROJECT_MARKER)).is_err());
+    // any other file name is rejected
+    std::fs::write(proj.join("other.rawdawg"), "x").unwrap();
+    assert!(rawdawg_project::persist::resolve_project_dir(&proj.join("other.rawdawg")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- rawDAWg Windows installer (WiX v4/v5). Built by `cargo xtask package` (format msi), which passes
+     the Payload and Version preprocessor variables. Unsigned: signing and the legal publisher
+     identity are owner decisions (CLAUDE.md). Per-machine install under Program Files; user
+     projects and preferences are never touched by install or uninstall. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="rawDAWg" Manufacturer="rawDAWg" Version="$(var.Version)" UpgradeCode="7A57D4A6-0A01-4B00-9F2C-B0A53E110001" Language="1033" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of rawDAWg is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="rawdawg.ico" SourceFile="$(var.Payload)\rawdawg.ico" />
+    <Property Id="ARPPRODUCTICON" Value="rawdawg.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/leonardo-aa/rawDAWg" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="rawDAWg">
+        <Directory Id="DocsFolder" Name="docs" />
+        <Directory Id="DemosFolder" Name="demos" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonFilesFolder">
+      <Directory Id="ClapFolder" Name="CLAP" />
+      <Directory Id="Vst3Folder" Name="VST3">
+        <Directory Id="Vst3Bundle" Name="rawDAWg.vst3">
+          <Directory Id="Vst3Contents" Name="Contents">
+            <Directory Id="Vst3Arch" Name="x86_64-win" />
+            <Directory Id="Vst3Resources" Name="Resources" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="App" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="7A57D4A6-0A02-4B00-9F2C-B0A53E110002">
+        <File Id="rawdawg.exe" Source="$(var.Payload)\rawdawg.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="rawDAWg" Description="Less thinking. More noise." WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="rawdawg.ico" />
+        </File>
+        <!-- Presets open (import) in rawDAWg; projects open through the project.rawdawg marker
+             file every saved project folder carries (folders cannot be associated by suffix). -->
+        <ProgId Id="rawDAWg.Preset" Description="rawDAWg preset" Icon="rawdawg.ico">
+          <Extension Id="rawdawgpreset" ContentType="application/x-rawdawg-preset">
+            <Verb Id="open" Command="Open" TargetFile="rawdawg.exe" Argument="--open &quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+        <ProgId Id="rawDAWg.Project" Description="rawDAWg project" Icon="rawdawg.ico">
+          <Extension Id="rawdawg" ContentType="application/x-rawdawg-project">
+            <Verb Id="open" Command="Open" TargetFile="rawdawg.exe" Argument="--open &quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+      </Component>
+      <Component Id="IconFileComponent" Guid="7A57D4A6-0A03-4B00-9F2C-B0A53E110003">
+        <File Source="$(var.Payload)\rawdawg.ico" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="Docs" Directory="DocsFolder">
+      <Component Guid="7A57D4A6-0A04-4B00-9F2C-B0A53E110004">
+        <File Source="$(var.Payload)\docs\LICENSE" />
+        <File Source="$(var.Payload)\docs\USER_GUIDE.md" />
+        <File Source="$(var.Payload)\docs\README.md" />
+        <File Source="$(var.Payload)\docs\THIRD-PARTY-LICENSES.txt" />
+        <File Source="$(var.Payload)\docs\sbom.cdx.json" />
+      </Component>
+    </ComponentGroup>
+    <ComponentGroup Id="Demos" Directory="DemosFolder">
+      <Files Include="$(var.Payload)\demos\**" />
+    </ComponentGroup>
+    <ComponentGroup Id="Plugins">
+      <Component Directory="ClapFolder" Guid="7A57D4A6-0A05-4B00-9F2C-B0A53E110005">
+        <File Source="$(var.Payload)\plugins\CLAP\rawDAWg.clap" />
+      </Component>
+      <Component Directory="Vst3Arch" Guid="7A57D4A6-0A06-4B00-9F2C-B0A53E110006">
+        <File Source="$(var.Payload)\plugins\VST3\rawDAWg.vst3\Contents\x86_64-win\rawDAWg.vst3" />
+      </Component>
+      <Component Directory="Vst3Resources" Guid="7A57D4A6-0A07-4B00-9F2C-B0A53E110007">
+        <File Source="$(var.Payload)\plugins\VST3\rawDAWg.vst3\Contents\Resources\moduleinfo.json" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="rawDAWg" Level="1">
+      <ComponentGroupRef Id="App" />
+      <ComponentGroupRef Id="Docs" />
+      <ComponentGroupRef Id="Demos" />
+    </Feature>
+    <Feature Id="PluginExports" Title="rawDAWg CLAP and VST3 plugins for other hosts" Level="1">
+      <ComponentGroupRef Id="Plugins" />
+    </Feature>
+  </Package>
+</Wix>

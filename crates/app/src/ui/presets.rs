@@ -2,9 +2,10 @@
 //! per-user data dir, audition on click (live preview), save / rename /
 //! favorite, import/export as `.rawdawgpreset`.
 
-use super::App;
+use super::{App, EditorView};
 use crate::theme;
 use rawdawg_dsp::processor::Processor;
+use rawdawg_project::Command;
 use rawdawg_synthesizer::Patch;
 use rawdawg_synthesizer::presets::{Character, factory_presets};
 use rawdawg_types::InstanceId;
@@ -258,5 +259,72 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
                 cancel_preview(app);
             }
         });
+    }
+}
+
+impl App {
+    /// Import a `.rawdawgpreset` file (`rawdawg --open Sound.rawdawgpreset`, file association):
+    /// synth patches load onto the selected synth channel (or the first one), effect presets
+    /// become an insert on the selected mixer channel (or the master), rack presets add their
+    /// whole chain there. Every change is one undoable step.
+    pub(crate) fn import_preset_file(&mut self, path: &std::path::Path) {
+        let file = match rawdawg_project::preset::read_preset(path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.status_line = format!("Could not open preset {}: {e}", path.display());
+                return;
+            }
+        };
+        let m = &file.manifest;
+        let asset_note = if file.assets.is_empty() { String::new() } else { format!(" ({} embedded asset(s) not imported; relink them in the panel)", file.assets.len()) };
+        let target_mixer = self.mixer.selected.unwrap_or(self.project.mixer.master_id);
+        match m.kind.as_str() {
+            "synth" => {
+                let patch = match Patch::from_json(&serde_json::to_vec(&m.state).unwrap_or_default()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.status_line = format!("Preset {} is not a valid synth patch: {e}", path.display());
+                        return;
+                    }
+                };
+                let synth = rawdawg_types::ids::native_types::SYNTH;
+                let selected = self.selected_channel.and_then(|id| self.project.channels.iter().find(|c| c.id == id && c.instrument.type_id.as_str() == synth));
+                let Some(instance) = selected.or_else(|| self.project.channels.iter().find(|c| c.instrument.type_id.as_str() == synth)).map(|c| c.instrument.id) else {
+                    self.status_line = "No rawDAWg Synth channel to load the preset onto".to_owned();
+                    return;
+                };
+                if !self.synth_mirrors.contains_key(&instance) {
+                    self.rebuild_mirrors();
+                }
+                load(self, instance, &patch);
+                self.editor_view = EditorView::Synth;
+                self.status_line = format!("Loaded synth preset “{}”{asset_note}", m.name);
+            }
+            "effect" => {
+                let Some(info) = rawdawg_effects::info(&m.type_id).filter(|i| i.listed) else {
+                    self.status_line = format!("Preset {} is for an unknown effect ({})", path.display(), m.type_id);
+                    return;
+                };
+                let mut inst = rawdawg_project::Instance::native(info.type_id, m.state.clone());
+                inst.display_name = info.name.to_owned();
+                let iid = inst.id;
+                self.apply(Command::AddInsert { mixer_id: target_mixer, instance: inst, index: None });
+                self.effect_editor = Some(iid);
+                self.editor_view = EditorView::Effect;
+                self.status_line = format!("Added effect preset “{}”{asset_note}", m.name);
+            }
+            "rack" => {
+                let inserts = m.rack_inserts();
+                if inserts.is_empty() {
+                    self.status_line = format!("Rack preset {} has no effects", path.display());
+                    return;
+                }
+                let n = inserts.len();
+                self.apply(Command::Batch { commands: inserts.into_iter().map(|instance| Command::AddInsert { mixer_id: target_mixer, instance, index: None }).collect() });
+                self.editor_view = EditorView::Mixer;
+                self.status_line = format!("Added rack preset “{}” ({n} effects){asset_note}", m.name);
+            }
+            other => self.status_line = format!("Presets of kind “{other}” cannot be opened here"),
+        }
     }
 }

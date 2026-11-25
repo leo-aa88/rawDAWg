@@ -10,7 +10,8 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "rawdawg", version, about = "rawDAWg — Less thinking. More noise.", long_about = None)]
 pub struct Args {
-    /// Open a project folder (or its project.json) in the GUI.
+    /// Open a project folder (or its project.json) in the GUI, or import a `.rawdawgpreset`
+    /// file into a new project (synth patch onto the synth channel, effect/rack onto the master).
     #[arg(long, value_name = "PATH")]
     pub open: Option<PathBuf>,
 

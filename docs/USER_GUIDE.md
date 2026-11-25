@@ -97,6 +97,14 @@ Third-party plugins run inside rawDAWg as native code: the scanner isolation is 
 
 Validation with `clap-validator`, the VST3 validator and independent hosts is tracked as open gates in `PROGRESS.md`.
 
+## Installing
+
+- **Ubuntu 24.04**: `sudo dpkg -i rawdawg-<version>-x86_64.deb` (dependencies: libasound2, glibc). Installs `rawdawg`, a desktop entry that opens projects (double-click the `project.rawdawg` file inside a project folder) and `.rawdawgpreset` presets (double-click imports the sound into a new project), and the rawDAWg CLAP/VST3 plugins into `/usr/lib/clap` and `/usr/lib/vst3` for other hosts. `sudo apt remove rawdawg` keeps your projects and preferences.
+- **Windows 11**: run `rawdawg-<version>-x86_64.msi` (per-machine, unsigned: Windows will warn), or unzip the portable build and run `rawdawg.exe` from the folder. The installer registers `.rawdawg` (the `project.rawdawg` marker in each project folder) and `.rawdawgpreset`, and puts the plugins into the common CLAP/VST3 folders.
+- **From source**: see `README.md` (pinned toolchain, `cargo build --workspace --release --locked`).
+
+A project is a folder (`Song.rawdawg/`); every save writes a small `project.rawdawg` marker into it, and that file is what the desktop opens. **File › Open**, the recent-projects list and `rawdawg --open <folder>` work too. rawDAWg works offline; nothing phones home.
+
 ## Help
 
 **Help › User guide (offline)** shows this guide inside the app.

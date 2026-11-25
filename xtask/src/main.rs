@@ -10,6 +10,7 @@ use std::process::Command;
 use std::time::Instant;
 
 mod fixtures;
+mod package;
 mod verify;
 
 #[derive(Parser)]
@@ -126,20 +127,18 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn package(root: &Path, format: PackageFormat) -> anyhow::Result<()> {
-    match format {
-        PackageFormat::Deb => {
-            if !cfg!(target_os = "linux") {
-                bail!("deb packaging runs on Ubuntu only");
-            }
-            // M8 deliverable: native .deb via cargo-deb / dpkg tooling with desktop entry,
-            // MIME association and dependency declarations. Not implemented at this milestone.
-            bail!("deb packaging is scheduled for M8 and is not implemented yet (see PROGRESS.md); root {}", root.display());
-        }
-        PackageFormat::Msi | PackageFormat::Portable => {
-            if !cfg!(target_os = "windows") {
-                bail!("{format:?} packaging runs on Windows only");
-            }
-            bail!("{format:?} packaging is scheduled for M8 and is not implemented yet (see PROGRESS.md)");
-        }
+    let f = match format {
+        PackageFormat::Deb => package::Format::Deb,
+        PackageFormat::Msi => package::Format::Msi,
+        PackageFormat::Portable => package::Format::Portable,
+    };
+    let produced = package::package(root, f)?;
+    for a in &produced.artifacts {
+        println!("artifact: {}", a.display());
     }
+    println!("staging: {}", produced.staging.display());
+    for w in &produced.warnings {
+        println!("warning: {w}");
+    }
+    Ok(())
 }

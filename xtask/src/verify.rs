@@ -1079,13 +1079,66 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             }
             Ok((
                 format!(
-                    "catalog {}: 17 plugins, broken module quarantined (load failed), hang quarantined (timeout 1 s), hosted delay/synth renders equal native, safe mode stand-ins",
+                    "catalog {}: 17 CLAP + 17 VST3 plugins (bundle), broken module quarantined (load failed), hang quarantined (timeout 1 s), hosted CLAP and VST3 delay/synth renders equal native, safe mode stand-ins",
                     catalog.display()
                 ),
                 Some(base.display().to_string()),
             ))
         },
     ));
+    checks.push(if cfg!(target_os = "linux") {
+        check(
+            "E2E-08 (headless subset) build the Ubuntu deb, inspect its layout, validate the desktop entry, launch the packaged binary offline for a headless render; no forbidden formats",
+            &["PLAT-04", "QUAL-03", "E2E-08"],
+            || {
+                let produced = crate::package::package_deb(root)?;
+                let deb = produced.artifacts.iter().find(|a| a.extension().is_some_and(|e| e == "deb")).ok_or_else(|| anyhow::anyhow!("no .deb produced"))?.clone();
+                let listing = Command::new("dpkg-deb").arg("-c").arg(&deb).output()?;
+                let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+                for required in ["./usr/bin/rawdawg", "./usr/lib/clap/rawDAWg.clap", "./usr/lib/vst3/rawDAWg.vst3/Contents/x86_64-linux/rawDAWg.so", "./usr/lib/vst3/rawDAWg.vst3/Contents/Resources/moduleinfo.json", "./usr/share/applications/rawdawg.desktop", "./usr/share/mime/packages/rawdawg.xml", "./usr/share/icons/hicolor/256x256/apps/rawdawg.png", "./usr/share/doc/rawdawg/THIRD-PARTY-LICENSES.txt", "./usr/share/doc/rawdawg/sbom.cdx.json", "./usr/share/doc/rawdawg/copyright", "./usr/share/doc/rawdawg/USER_GUIDE.md", "./usr/share/rawdawg/demos/demo-song.rawdawg/project.json"] {
+                    if !listing.contains(required) {
+                        bail!("{required} missing from the deb");
+                    }
+                }
+                let info = Command::new("dpkg-deb").arg("-f").arg(&deb).output()?;
+                let info = String::from_utf8_lossy(&info.stdout).into_owned();
+                if !info.contains("Package: rawdawg") || !info.contains("Architecture: amd64") || !info.contains("Depends: libc6") {
+                    bail!("control file unexpected:\n{info}");
+                }
+                let base = out.join("e2e-08");
+                let _ = std::fs::remove_dir_all(&base);
+                std::fs::create_dir_all(&base)?;
+                let status = Command::new("dpkg-deb").arg("-x").arg(&deb).arg(&base).status()?;
+                if !status.success() {
+                    bail!("dpkg-deb -x failed");
+                }
+                // offline launch of the packaged binary: headless render of the packaged demo project
+                let exe = base.join("usr/bin/rawdawg");
+                let demo = base.join("usr/share/rawdawg/demos/demo-song.rawdawg");
+                let wav = base.join("packaged-render.wav");
+                let o = Command::new(&exe).args(["--headless-render"]).arg(&demo).arg("--output").arg(&wav).args(["--mode", "song"]).env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY").output()?;
+                if !o.status.success() {
+                    bail!("packaged binary failed to render: {}", String::from_utf8_lossy(&o.stderr));
+                }
+                let frames = hound::WavReader::open(&wav)?.duration();
+                if frames == 0 {
+                    bail!("packaged render is empty");
+                }
+                let sums = std::fs::read_to_string(root.join("target/package/SHA256SUMS"))?;
+                if !sums.contains(deb.file_name().unwrap().to_str().unwrap()) {
+                    bail!("SHA256SUMS does not list the deb");
+                }
+                let forbidden: Vec<String> = std::fs::read_dir(root.join("target/package"))?.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).filter(|n| n.ends_with(".appimage") || n.ends_with(".snap") || n.ends_with(".flatpak")).collect();
+                if !forbidden.is_empty() {
+                    bail!("forbidden distribution formats produced: {forbidden:?}");
+                }
+                let warn = if produced.warnings.is_empty() { String::new() } else { format!("; {}", produced.warnings.join("; ")) };
+                Ok((format!("{} ({} bytes): layout, control, desktop entry validated, packaged binary rendered {frames} frames offline{warn}; install/uninstall in a clean machine: BLOCKED (needs root)", deb.file_name().unwrap().to_string_lossy(), deb.metadata()?.len()), Some(base.display().to_string())))
+            },
+        )
+    } else {
+        blocked("E2E-08 (headless subset) Ubuntu deb build and inspection", &["PLAT-04", "E2E-08"], "runs on Ubuntu; Windows MSI/portable are built by `cargo xtask package --format msi|portable` on Windows (NOT RUN here)")
+    });
     let validator = which("clap-validator");
     checks.push(match validator {
         Some(path) => check("PL-03 clap-validator on exported CLAP", &["PLUG-03", "T-PLUGIN"], || {
@@ -1108,12 +1161,12 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
     checks.push(blocked(
         "PL-04 VST3 SDK validator on exported VST3",
         &["PLUG-03", "T-PLUGIN"],
-        "Steinberg validator requires the VST3 SDK build; scheduled for M7 with bundle layout",
+        "Steinberg validator needs the VST3 SDK build (not on this machine); run it on target/verification/bundles/rawDAWg.vst3 and record the SDK version",
     ));
     checks.push(blocked(
         "PL-05 independent host test (CLAP/VST3)",
         &["PLUG-01", "PLUG-02", "E2E-07"],
-        "manual gate: load exported plugins in an independent host on Windows and Ubuntu (M7)",
+        "manual gate: load target/verification/bundles/rawDAWg.{clap,vst3} in an independent host on Windows and Ubuntu, and host an independent CLAP/VST3 instrument and effect in rawDAWg",
     ));
     checks
 }

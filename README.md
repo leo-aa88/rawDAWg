@@ -24,6 +24,14 @@ cargo run --release -p rawdawg
 
 See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the CLI and keyboard map, [`docs/TESTING.md`](docs/TESTING.md) for acceptance gates and [`docs/verification/requirements.md`](docs/verification/requirements.md) for the live evidence table.
 
+## Install
+
+Native packages only (no AppImage, Snap or Flatpak): `cargo xtask package --format deb` on Ubuntu
+24.04 (`dpkg-deb`), `--format msi` / `--format portable` on Windows 11 (WiX v5 CLI / PowerShell).
+Each package carries `rawdawg`, the CLAP module and the VST3 bundle (installed into the system
+plugin folders), the user guide, license notices and a CycloneDX SBOM; see `packaging/README.md`.
+Packages are unsigned until the owner decides on signing and a legal publisher identity.
+
 ## License
 
 The repository carries the `LICENSE` file placed by the owner (AGPL-3.0). The final application license, legal publisher identity and signing are owner decisions; no public distribution is authorized by this repository state.

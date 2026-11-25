@@ -200,7 +200,10 @@ impl App {
         theme::apply(ctx);
         let limits = EngineLimits::DEFAULT;
         let mut prefs = prefs;
-        let (project, project_path, mut status_line) = match &opts.open {
+        // a preset file opens the default project and is imported once the app is built
+        let preset_to_import = opts.open.clone().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rawdawgpreset")));
+        let project_to_open = opts.open.clone().filter(|_| preset_to_import.is_none());
+        let (project, project_path, mut status_line) = match &project_to_open {
             Some(p) => match rawdawg_project::load_project_dir(p) {
                 Ok(proj) => {
                     prefs.remember_project(p.clone());
@@ -308,6 +311,9 @@ impl App {
         };
         app.rebuild_mirrors();
         app.recompile();
+        if let Some(path) = &preset_to_import {
+            app.import_preset_file(path);
+        }
         match opts.ui_preset.as_deref() {
             Some("advanced") => app.synth_panel.advanced = true,
             Some("rack") => app.editor_view = EditorView::Rack,
