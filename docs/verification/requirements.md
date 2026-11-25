@@ -24,12 +24,17 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | IO-02 | PARTIAL | M1 | Typing keyboard (Z–/ map, octave ±, velocity, no capture in text fields or with Ctrl/Alt, release on focus loss/disable, OS repeat ignored, release uses original pitch) and on-screen piano (click/drag, Mouse source). Screenshot evidence `docs/verification/screenshots/m1-wslg-1440x900.png`; interactive verification: BLOCKED (GUI-01). |
 | IO-03 | NOT RUN | M3 | |
 | IO-04 | NOT RUN | M5 | |
-| IO-05 | NOT RUN | M2/M5 | |
+| IO-05 | PARTIAL | M2 | WAV/FLAC/MP3 decode and SF2 import into the project with explicit unsupported-file errors; originals never modified. SMF import: M5. |
 | IO-06 | PARTIAL | M0/M1 | Headless WAV export (16/24-bit PCM with TPDF dither for 16, 32-bit float), same engine as playback, no normalization, range/tail options: `wav_export_round_trips_sample_count_and_content`, `rawdawg --headless-render`. FLAC/MIDI/stems/progress: M5. |
-| SYN-01 | PARTIAL | M1 | Layers (1–4) of bandlimited basic waves or an editable wavetable cycle, per-layer level/pan/tune/phase, ADSR amp + filter envelopes, SVF filter with key tracking. Tests: `crates/synthesizer/tests/synth.rs`, `crates/dsp`. Missing: FM/PM, additive, granular, physical model, unison, LFOs/modulation (M2). |
-| SYN-02 | PARTIAL | M0 | Wavetable pipeline (cycle → DC removal → FFT → harmonic truncation → mips → Hermite playback) implemented and tested (`crates/dsp/src/wavetable.rs`). Brushes, canvas and live handoff: M2. |
-| SYN-03..08 | NOT RUN | M2 | Deterministic RNG framework (`chacha8-v1`) in place. |
-| SYN-09 | NOT RUN | M2 | |
+| SYN-01 | PASS (automated) | M2 | Wavetable (2–16 motion frames), subtractive basics, FM/PM 4-op, additive (≤128 partials, detuned bank), granular, plucked string; 1–4 layers, unison 1–8, level/pan/tuning/phase, amp+filter envelopes, SVF, 4 LFOs, 16-route matrix. Tests: `crates/synthesizer/src/generators.rs`, `tests/synth.rs` (pitch per generator, unison, vibrato/mod wheel, allocation-free). Listening evaluation: manual, open. |
+| SYN-02 | PASS (automated) | M2 | Canvas edits the stored cycle (not a scope); Draw/Deform/Smooth/Sharpen/Stretch/Distort/Noise on circular indices with seam wrap, radius/strength/wheel; live table handoff with 8 ms crossfade and no retrigger; separate live scope. Tests: `sculpt.rs` (T-SCULPT), `tests/synth.rs::live_table_update_*`. Interactive p95 ≤50 ms latency measurement: NOT RUN (needs display+device session). |
+| SYN-03 | PASS (automated) | M2 | Randomize button + Chaos + Locks (categories/per-param, defaults safety/pitch/routing), deterministic seed, bounded attempts with audition validation, chaos 0 identity, undo exact. Tests: `mutate.rs`. |
+| SYN-04 | PASS (automated) | M2 | 3×3 deterministic descendants per (parent, seed, generation, index), cached thumbnails/tags, click previews live, Use/Cancel/Favorite/Compare parent, history back/forward, Breed two. Tests: descendants distinct/deterministic, breed locks. |
+| SYN-05 | PARTIAL | M2 | Four-corner bilinear morph for compatible structures (normalized-domain params, time-domain waveforms, heaviest-corner discrete), live updates, freeze, gesture points recorded. Tests: corners exact, midpoints smooth. Incompatible-topology crossfade and automation lanes: open. |
+| SYN-06 | PARTIAL | M2 | Spectrum tab paints harmonic magnitudes (±0.5 dB verified), erase, dB view; motion frames modelled and modulatable (`Motion Morph` preset). Phase lane and frame editor UI: open. |
+| SYN-07 | NOT RUN | M2 | Modular graph editor and expression nodes not started. |
+| SYN-08 | PASS (automated) | M2 | 29 original presets across all characters (9 unusual), browser with search/favorites/audition, save/rename via save-as, `.rawdawgpreset` import/export with validation. Tests: `presets.rs`, `project/src/preset.rs`. |
+| SYN-09 | PASS (automated) | M2 | Sampler (one-shot/loop, root pitch, start/end, loop crossfade, ADSR, polyphony) and SF2 player (bank/program, key/vel zones, global zones, loops, envelope, generators list, warnings) with symphonia decode and content-addressed import; drag/drop and path import create channels. Tests: `crates/sampler/tests`, HL-08. |
 | SYN-10 | PARTIAL | M1 | Voice allocation (idle → oldest released → oldest active), stealing with preallocated fade tails (click bound tested), poly/mono/legato, tuning, pitch bend, sustain per source/channel, no hanging notes after release, all-notes-off/reset. Per-note expression: M2. |
 | FX-01..03 | NOT RUN | M4 | |
 | PLUG-01 | PARTIAL | M0 | Real CLAP module (`librawdawg_clap.so`, id `rawdawg.synth`, name `rawDAWg Synth`) wrapping the flagship synth: note ports, stereo out, params, state. Host round trip through the built library renders 440 Hz and round-trips state (`crates/plugin-clap/tests`). VST3 module (`librawdawg_vst3.so`) exports `GetPluginFactory` with a gain effect exercising component/processor/controller/state paths (`crates/plugin-vst3/tests`). Windows binaries: NOT RUN. Effects export, GUI, validators: M7. |
@@ -56,7 +61,11 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | T-PLUGIN | PARTIAL (ABI lifecycle, process, params, state through built modules) | `crates/plugin-clap/tests`, `crates/plugin-vst3/tests` |
 | T-IO | PARTIAL (fake-device negotiation across formats/channels/rates, nearest-supported reporting, queue saturation counters, enumeration never panics, edge conversion saturation) | `crates/audio-io`, `crates/rt` |
 | T-MIDI | PARTIAL (byte parser: running status, velocity-0 off, FIFO identity, SysEx/realtime, controllers; disconnect release) | `crates/midi` |
-| T-SCULPT, T-MUTATE, T-MORPH, T-FX, T-SAMPLER | NOT RUN | later milestones |
+| T-SCULPT | PASS (brush locality/seam/determinism, +6 dB harmonic ±0.5 dB, live update without retrigger) | `crates/synthesizer/src/sculpt.rs`, `tests/synth.rs` |
+| T-MUTATE | PASS (determinism, chaos 0, locks, 1000 seeds valid/finite, ≥90 % perceptible, descendants, breed) | `crates/synthesizer/src/mutate.rs` |
+| T-MORPH | PARTIAL (corners exact, weights sum 1, smooth midpoints, incompatible reported; crossfade/record-replay open) | `crates/synthesizer/src/morph.rs` |
+| T-SAMPLER | PASS (bounds, loop, pitch/duration, rate conversion, SF2 zones/bank/loop/warnings/malformed) | `crates/sampler/tests/sampler.rs` |
+| T-FX | NOT RUN (M4) | |
 
 ## Manual / platform gates currently open
 

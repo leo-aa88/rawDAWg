@@ -186,6 +186,8 @@ impl App {
 
     /// Recreate main-thread synth mirrors from the project's instrument states.
     pub(crate) fn rebuild_mirrors(&mut self) {
+        // assets must resolve even when no audio device is open (editing/offline mode)
+        self.assets.sync(self.project_path.clone(), &self.project);
         self.synth_mirrors.clear();
         self.other_mirrors.clear();
         for c in &self.project.channels {

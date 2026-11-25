@@ -4,7 +4,7 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 
 ## Current state
 
-- **Milestone:** M0 (bootstrap and risk reduction) **complete** on Ubuntu; M1 (audio engine and first playable instrument) **implemented** — engine, synth, typing/MIDI/on-screen keyboards, synth parameter editing with gesture undo, audio/MIDI settings, headless render. M1's hardware gates (real audio device, physical MIDI keyboard) remain open; see "Open gates".
+- **Milestone:** M0 complete; M1 implemented (hardware gates open); **M2 (flagship experimental synth) in progress** — sculpting canvas with live table handoff, all six generator types, unison, LFOs/mod matrix, randomize/chaos/locks, evolution/breed, XY morph (compatible structures), factory presets + `.rawdawgpreset`, sampler and SF2. Remaining M2 items: modular graph editor with bounded expression nodes (SYN-07), motion-frame editor UI (model and playback exist), incompatible-topology morph crossfade, gesture-to-automation recording (M3 lanes). See "M2 additions" and "Open gates".
 - **Environment used:** Ubuntu 22.04 (WSL2, WSLg), Rust 1.99.0, 16 cores. Audio output available through WSLg's PulseAudio bridge via ALSA (`Default Audio Device`), which is *not* a real Ubuntu desktop/hardware device. No Windows machine, no display screenshots captured, no MIDI hardware, no independent plugin hosts or validators installed.
 - **Build label:** intermediate build; not a release candidate.
 
@@ -26,6 +26,19 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 | `./target/release/rawdawg --audio-smoke` | ALSA default 48 kHz F32, 132 callbacks, 0 xruns, max callback 0.207 ms, peak 0.154 |
 | `./target/release/rawdawg --headless-render fixtures/demo.rawdawg --output … --format pcm24` | 144000 frames, peak 0.340, 0 clipped, ~230× realtime |
 | `cargo xtask package --format deb` | refuses: scheduled for M8 |
+
+## M2 additions (2026-11-25)
+
+Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), clippy clean, `cargo xtask verify --suite headless` HL-01…HL-08 PASS.
+
+- Processor carry-over across plan swaps (`Processor::migrate_from`, fingerprinted instance states): parameter edits, gain/pan previews and preset loads never cut held notes unless the structure changes.
+- Live wavetable handoff: bounded table queue into running voices, 8 ms crossfade, retirement off-thread, stale builds ignored. Waveform canvas with seven brushes (circular indices, seam wrap, radius/strength, wheel), spectrum painting (±0.5 dB verified), live output scope, one undo entry per stroke.
+- Generators: FM/PM (4 operators, four algorithms, explicit one-sample feedback), additive (harmonic via table, detuned bank ≤32 partials, stretch), granular (phase-coherent playhead, 8 grains/voice bounded, windows), plucked string (Karplus–Strong, fractional delay, loop-filter group-delay compensation), wavetable motion frames (2–16, position modulatable), unison 1–8 with detune/spread and 1/√n gain.
+- Modulation: 4 LFOs (5 shapes, Hz or beat-synced, global or per-voice), 16-route matrix (11 sources incl. mod wheel/aftertouch/random, 13 targets), control-rate evaluation every 16 samples. 238 stable parameter descriptors.
+- Randomize/Chaos/Locks (categories + per-parameter, defaults keep root pitch/safety/routing), bounded audition validation (silent/non-finite/too-loud rejected, chaos back-off), 3×3 evolution with history/favorites/compare, breeding, XY morph pad with live updates and freeze; T-MUTATE/T-MORPH tests (determinism, 1000 seeds, ≥90 % perceptible difference, locks, corner exactness, smooth midpoints, incompatible reported).
+- 29 original factory presets (9 unusual) across all eight characters, tested audible/finite/pairwise distinct; `.rawdawgpreset` ZIP format with manifest/assets, traversal/symlink/bomb protection; preset browser (search, character, favorites, preview/load, save, import/export).
+- Sampler (`native.sampler`) and SoundFont player (`native.sf2`) with symphonia decoding, content-addressed asset import, engine asset cache with surfaced problems, SF2 parser with explicit supported-generator list and warnings; T-SAMPLER tests; demo-sampler fixture and HL-08.
+- Evidence screenshots: `docs/verification/screenshots/m2-*.png` (self-captured under WSLg).
 
 ## M1 additions (2026-11-25)
 
@@ -80,10 +93,9 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 
 ## Next action
 
-M2 — flagship experimental synth, in vertical slices:
-1. Live wavetable handoff: editable cycle → off-thread table build → bounded handoff into the running synth voices (crossfade, no retrigger); carry processor state across plan swaps by instance id so edits never cut held notes.
-2. Waveform canvas with Draw/Deform/Smooth/Sharpen/Stretch/Distort/Noise brushes (circular indices, seam wrap, radius/strength), gesture-granular undo, live scope; T-SCULPT tests.
-3. Spectral painting (harmonic magnitudes, optional phase) and motion frames (2–16 keyframes, position morph).
-4. Remaining generators (FM/PM, additive, granular, plucked string), unison, LFOs/modulation matrix; graph compiler + bounded expression nodes.
-5. Randomize/Chaos/locks, evolution 3×3 with cached auditions, breed, XY morph; factory presets and preset browser; sampler and SF2.
-Known M1 limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement with the stream clock arrives with recording in M3); gain/pan previews recompile the plan and restart processors (fixed by item 1).
+M2 remainder, then M3:
+1. SYN-07: typed modular graph (per-voice then global), compiler with port/cycle/cost checks, explicit delayed feedback, bounded expression nodes (parser → bytecode, 256 instructions / 64 slots), advanced graph editor; T-GRAPH tests.
+2. Motion-frame editor (add/remove/reorder frames, position scrub) on the canvas; incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission.
+3. M2 gate pass: run the T-OSC/VOICE/SCULPT/MUTATE/MORPH/GRAPH/SAMPLER subsets, update the evidence table, commit the checkpoint.
+4. M3: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
+Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).
