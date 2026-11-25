@@ -9,6 +9,7 @@ pub mod delay;
 pub mod distortion;
 pub mod dynamics;
 pub mod eq;
+pub mod modulation;
 pub mod oversample;
 pub mod reverb;
 pub mod stereo;
@@ -35,7 +36,7 @@ const fn entry(type_id: &'static str, name: &'static str, family: &'static str, 
 }
 
 /// Every effect the menus offer. [`make_effect`] must accept each entry (tested).
-pub static CATALOG: [EffectInfo; 11] = [
+pub static CATALOG: [EffectInfo; 14] = [
     entry(eq::TYPE_ID, eq::DISPLAY_NAME, "EQ", "8-band parametric equalizer with draggable bands and a response plot", false),
     entry(dynamics::compressor::TYPE_ID, dynamics::compressor::DISPLAY_NAME, "Dynamics", "RMS/peak compressor with sidechain input, knee and gain-reduction meter", true),
     entry(dynamics::limiter::TYPE_ID, dynamics::limiter::DISPLAY_NAME, "Dynamics", "True-peak lookahead limiter with ceiling, release and dBTP meter", false),
@@ -43,6 +44,9 @@ pub static CATALOG: [EffectInfo; 11] = [
     entry(distortion::single::TYPE_ID, distortion::single::DISPLAY_NAME, "Distortion", "Tube, tape, soft/hard clip, wavefolder and bitcrusher with oversampling and tone", true),
     entry(distortion::multiband::TYPE_ID, distortion::multiband::DISPLAY_NAME, "Distortion", "Four Linkwitz-Riley bands with drive, mix and gain painted per band", true),
     entry(delay::TYPE_ID, delay::DISPLAY_NAME, "Delay", "Stereo, ping-pong, tape, multitap and reverse delay with tempo sync", true),
+    entry(modulation::chorus::TYPE_ID, modulation::chorus::DISPLAY_NAME, "Modulation", "Up to four interpolated delay voices with stereo spread and tempo sync", true),
+    entry(modulation::flanger::TYPE_ID, modulation::flanger::DISPLAY_NAME, "Modulation", "Short modulated comb with bounded positive or negative feedback", true),
+    entry(modulation::phaser::TYPE_ID, modulation::phaser::DISPLAY_NAME, "Modulation", "2 to 12 all-pass stages swept around a centre frequency with feedback", true),
     entry(reverb::TYPE_ID, reverb::DISPLAY_NAME, "Reverb", "Room, hall, cathedral, plate, spring and shimmer with a decay-shape editor", true),
     entry(convolution::TYPE_ID, convolution::DISPLAY_NAME, "Reverb", "Partitioned convolution with impulse responses from the project's samples", true),
     entry(stereo::TYPE_ID, stereo::DISPLAY_NAME, "Stereo", "Gain, pan, balance, width, mono and phase with a correlation meter", false),
@@ -58,6 +62,9 @@ pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Proces
     let mut p: Box<dyn Processor> = match type_id {
         eq::TYPE_ID => Box::new(eq::ParametricEq::new()),
         delay::TYPE_ID => Box::new(delay::Delay::new()),
+        modulation::chorus::TYPE_ID => Box::new(modulation::chorus::Chorus::new()),
+        modulation::flanger::TYPE_ID => Box::new(modulation::flanger::Flanger::new()),
+        modulation::phaser::TYPE_ID => Box::new(modulation::phaser::Phaser::new()),
         reverb::TYPE_ID => Box::new(reverb::Reverb::new()),
         distortion::single::TYPE_ID => Box::new(distortion::single::Distortion::new()),
         distortion::multiband::TYPE_ID => Box::new(distortion::multiband::Multiband::new()),
@@ -82,6 +89,9 @@ pub fn presets(type_id: &str) -> &'static [Preset] {
     match type_id {
         eq::TYPE_ID => &eq::PRESETS,
         delay::TYPE_ID => &delay::PRESETS,
+        modulation::chorus::TYPE_ID => &modulation::chorus::PRESETS,
+        modulation::flanger::TYPE_ID => &modulation::flanger::PRESETS,
+        modulation::phaser::TYPE_ID => &modulation::phaser::PRESETS,
         reverb::TYPE_ID => &reverb::PRESETS,
         distortion::single::TYPE_ID => &distortion::single::PRESETS,
         distortion::multiband::TYPE_ID => &distortion::multiband::PRESETS,

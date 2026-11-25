@@ -42,7 +42,7 @@ pub const fn tap_param(tap: usize, offset: u32) -> u32 {
 pub const MODE_LABELS: [&str; 5] = ["Stereo", "Ping-pong", "Tape", "Multitap", "Reverse"];
 /// Sync divisions in quarter notes: off, 1/32, 1/16T, 1/16, 1/8T, 1/16., 1/8, 1/4T, 1/8., 1/4, 1/2T, 1/4., 1/2, 1/1.
 pub const SYNC_LABELS: [&str; 14] = ["Off (ms)", "1/32", "1/16T", "1/16", "1/8T", "1/16.", "1/8", "1/4T", "1/8.", "1/4", "1/2T", "1/4.", "1/2", "1/1"];
-const SYNC_QUARTERS: [f32; 14] = [0.0, 0.125, 1.0 / 6.0, 0.25, 1.0 / 3.0, 0.375, 0.5, 2.0 / 3.0, 0.75, 1.0, 4.0 / 3.0, 1.5, 2.0, 4.0];
+pub const SYNC_QUARTERS: [f32; 14] = [0.0, 0.125, 1.0 / 6.0, 0.25, 1.0 / 3.0, 0.375, 0.5, 2.0 / 3.0, 0.75, 1.0, 4.0 / 3.0, 1.5, 2.0, 4.0];
 
 macro_rules! descriptors {
     ($($t:expr),*) => {
