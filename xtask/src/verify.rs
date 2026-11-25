@@ -1151,6 +1151,19 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
     } else {
         blocked("E2E-08 (headless subset) Ubuntu deb build and inspection", &["PLAT-04", "E2E-08"], "runs on Ubuntu; Windows MSI/portable are built by `cargo xtask package --format msi|portable` on Windows (NOT RUN here)")
     });
+    checks.push(check("QA-01 parser fuzz regressions and smoke campaign (every saved crash input replays clean; 300 mutated inputs per target)", &["QUAL-03", "T-DATA"], || {
+        let o = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-fuzz"]).output()?;
+        if !o.status.success() {
+            let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            let lines: Vec<&str> = text.lines().filter(|l| l.contains("panicked") || l.contains("FAILED") || l.contains("assert") || l.starts_with("fuzz")).take(12).collect();
+            bail!("fuzz regressions or smoke campaign failed:\n{}", lines.join("\n"));
+        }
+        let saved = walkdir(&root.join("fixtures/fuzz-regressions"))?.into_iter().filter(|p| p.is_file()).count();
+        Ok((
+            format!("{saved} saved regression inputs replay clean; {} targets survive the smoke campaign; long campaigns: cargo xtask fuzz", rawdawg_fuzz::targets::all().len()),
+            None,
+        ))
+    }));
     let validator = which("clap-validator");
     checks.push(match validator {
         Some(path) => check("PL-03 clap-validator on exported CLAP", &["PLUG-03", "T-PLUGIN"], || {

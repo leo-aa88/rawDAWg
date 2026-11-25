@@ -42,6 +42,10 @@ pub struct StreamReader {
 type Opened = (Box<dyn FormatReader>, u32, symphonia::core::codecs::audio::AudioCodecParameters, Option<u64>);
 
 fn open_format(path: &Path) -> Result<Opened, DecodeError> {
+    crate::decode::contain(|| open_format_inner(path))
+}
+
+fn open_format_inner(path: &Path) -> Result<Opened, DecodeError> {
     let file = std::fs::File::open(path).map_err(|e| DecodeError::Open(path.display().to_string(), e))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -79,7 +83,9 @@ pub fn probe(path: &Path) -> Result<StreamInfo, DecodeError> {
 impl StreamReader {
     pub fn open(path: &Path) -> Result<Self, DecodeError> {
         let (format, track_id, params, frames) = open_format(path)?;
-        let decoder = symphonia::default::get_codecs().make_audio_decoder(&params, &AudioDecoderOptions::default()).map_err(|e| DecodeError::Unsupported(e.to_string()))?;
+        let decoder = crate::decode::contain(|| {
+            symphonia::default::get_codecs().make_audio_decoder(&params, &AudioDecoderOptions::default()).map_err(|e| DecodeError::Unsupported(e.to_string()))
+        })?;
         let sample_rate = params.sample_rate.unwrap_or(0);
         let channels = params.channels.as_ref().map(|c| c.count() as u16).unwrap_or(0);
         if sample_rate == 0 {
@@ -105,10 +111,11 @@ impl StreamReader {
 
     /// Position the reader so the next `read_into` starts exactly at `frame`.
     pub fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
-        let seeked = self
-            .format
-            .seek(SeekMode::Accurate, SeekTo::Timestamp { ts: Timestamp::new(frame as i64), track_id: self.track_id })
-            .map_err(|e| DecodeError::Decode(e.to_string()))?;
+        let track_id = self.track_id;
+        let format = &mut self.format;
+        let seeked = crate::decode::contain(|| {
+            format.seek(SeekMode::Accurate, SeekTo::Timestamp { ts: Timestamp::new(frame as i64), track_id }).map_err(|e| DecodeError::Decode(e.to_string()))
+        })?;
         self.decoder.reset();
         self.pend_l.clear();
         self.pend_r.clear();
@@ -154,7 +161,16 @@ impl StreamReader {
         Ok(done)
     }
 
+    /// Decode the next packet with decoder panics contained; a contained failure ends the stream.
     fn decode_next(&mut self) -> Result<bool, DecodeError> {
+        let r = crate::decode::contain(|| self.decode_next_inner());
+        if r.is_err() {
+            self.eof = true;
+        }
+        r
+    }
+
+    fn decode_next_inner(&mut self) -> Result<bool, DecodeError> {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,

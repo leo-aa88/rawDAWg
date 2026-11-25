@@ -34,9 +34,35 @@ pub enum DecodeError {
 /// stereo-first editor); mono stays mono.
 pub fn decode_file(path: &Path) -> Result<Arc<SampleAsset>, DecodeError> {
     let file = std::fs::File::open(path).map_err(|e| DecodeError::Open(path.display().to_string(), e))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    decode_source(Box::new(file), path.extension().and_then(|e| e.to_str()), name)
+}
+
+/// Decode audio held in memory (`ext` is a format hint such as `"wav"`). Same limits as
+/// [`decode_file`]; used for embedded preset assets and by the parser fuzz tests.
+pub fn decode_bytes(bytes: Vec<u8>, ext: Option<&str>, name: &str) -> Result<Arc<SampleAsset>, DecodeError> {
+    decode_source(Box::new(std::io::Cursor::new(bytes)), ext, name.to_owned())
+}
+
+/// Run third-party decoder code on untrusted data with panics contained: a malformed file
+/// must become an error, never take down the worker thread or the app. (Fuzzing found
+/// arithmetic overflows in the WAV reader on corrupt headers; they panic in debug builds and
+/// silently wrap in release builds.) Decoding never runs on the audio thread.
+pub(crate) fn contain<T>(f: impl FnOnce() -> Result<T, DecodeError>) -> Result<T, DecodeError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err(DecodeError::Decode("the audio decoder failed on malformed data".into())),
+    }
+}
+
+fn decode_source(source: Box<dyn symphonia::core::io::MediaSource>, ext: Option<&str>, name: String) -> Result<Arc<SampleAsset>, DecodeError> {
+    contain(|| decode_source_inner(source, ext, name))
+}
+
+fn decode_source_inner(source: Box<dyn symphonia::core::io::MediaSource>, ext: Option<&str>, name: String) -> Result<Arc<SampleAsset>, DecodeError> {
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = ext {
         hint.with_extension(ext);
     }
     let mut format =
@@ -94,7 +120,6 @@ pub fn decode_file(path: &Path) -> Result<Arc<SampleAsset>, DecodeError> {
             }
         }
     }
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     Ok(Arc::new(SampleAsset { name, sample_rate: rate, channels }))
 }
 

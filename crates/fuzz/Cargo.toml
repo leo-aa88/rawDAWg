@@ -1,0 +1,20 @@
+[package]
+name = "rawdawg-fuzz"
+description = "rawDAWg parser and state fuzzing: deterministic seeded mutation campaigns over every untrusted input surface (TESTING.md: fuzz file parsers/graph/ABI validation with bounded fixtures)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-dsp = { path = "../dsp" }
+rawdawg-project = { path = "../project" }
+rawdawg-sampler = { path = "../sampler" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-effects = { path = "../effects" }
+rawdawg-audio-engine = { path = "../audio-engine" }
+rawdawg-plugin-api = { path = "../plugin-api" }
+serde_json = { workspace = true }
+zip = { workspace = true }

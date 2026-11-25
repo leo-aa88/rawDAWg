@@ -10,7 +10,7 @@ pub mod sf2_player;
 pub mod stream;
 
 pub use asset::SampleAsset;
-pub use decode::{DecodeError, decode_file};
+pub use decode::{DecodeError, decode_bytes, decode_file};
 pub use sampler::{Sampler, SamplerPatch};
 pub use sf2_player::{Sf2Patch, Sf2Player};
 

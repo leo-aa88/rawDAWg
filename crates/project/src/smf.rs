@@ -52,7 +52,16 @@ fn scale_tick(t: u64, ppq: u64) -> i64 {
 
 /// Parse an SMF. Type 0 files are split into one track per MIDI channel.
 pub fn import(bytes: &[u8], name: &str) -> Result<MidiImport, SmfError> {
-    let smf = Smf::parse(bytes).map_err(|e| SmfError::Parse(e.to_string()))?;
+    // SMPTE timing is unsupported; reject it before the parser sees the division word
+    // (midly 0.5.3 negates the frame-rate byte and overflows on 0x80 — found by fuzzing).
+    if bytes.len() >= 14 && bytes.starts_with(b"MThd") && bytes[12] & 0x80 != 0 {
+        return Err(SmfError::SmpteTiming);
+    }
+    // the parser is third-party code on untrusted input: contain any other panic as an error
+    let smf = match std::panic::catch_unwind(|| Smf::parse(bytes)) {
+        Ok(r) => r.map_err(|e| SmfError::Parse(e.to_string()))?,
+        Err(_) => return Err(SmfError::Parse("the MIDI parser failed on malformed data".into())),
+    };
     let ppq = match smf.header.timing {
         Timing::Metrical(p) => u64::from(p.as_int()).max(1),
         Timing::Timecode(..) => return Err(SmfError::SmpteTiming),

@@ -33,6 +33,17 @@ pub enum ValidationError {
 }
 
 /// Default caps enforced before any allocation driven by the file.
+/// Largest timeline position or length accepted in a project: 2^40 ticks (at PPQ 960 and
+/// 120 BPM about 18 years). Bounding every tick-valued field keeps sums such as
+/// `tick + duration` and tick→frame conversions far from i64 overflow.
+pub const MAX_TICK: i64 = 1 << 40;
+/// Largest audio clip source offset/length/fade in frames (about 6 days at 192 kHz).
+pub const MAX_CLIP_FRAMES: u64 = 1 << 37;
+
+fn tick_ok(t: rawdawg_types::units::Tick) -> bool {
+    (0..=MAX_TICK).contains(&t.0)
+}
+
 pub struct Limits {
     pub max_channels: usize,
     pub max_patterns: usize,
@@ -106,12 +117,18 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
         return Err(ValidationError::LimitExceeded("mixer channels".into()));
     }
     for t in &p.tempo {
+        if !tick_ok(t.tick) {
+            return Err(ValidationError::Tempo(format!("tempo point at tick {} out of range", t.tick.0)));
+        }
         if !t.us_per_quarter.is_valid() {
             return Err(ValidationError::Tempo(format!("tempo {} us/qn out of range", t.us_per_quarter.0)));
         }
     }
     p.tempo_map().map_err(|e| ValidationError::Tempo(e.to_string()))?;
     for m in &p.meter {
+        if !tick_ok(m.tick) {
+            return Err(ValidationError::Meter(format!("meter point at tick {} out of range", m.tick.0)));
+        }
         if !m.meter().is_valid() {
             return Err(ValidationError::Meter(format!("{}/{}", m.numerator, m.denominator)));
         }
@@ -189,7 +206,7 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
     let mut note_ids = HashSet::new();
     for pat in &p.patterns {
         dup(&mut pattern_ids, pat.id)?;
-        if pat.length_ticks.0 <= 0 || pat.steps == 0 || pat.step_ticks.0 <= 0 {
+        if pat.length_ticks.0 <= 0 || !tick_ok(pat.length_ticks) || pat.steps == 0 || pat.step_ticks.0 <= 0 || !tick_ok(pat.step_ticks) {
             return Err(ValidationError::InvalidValue(format!("pattern {}", pat.name)));
         }
         let mut lane_channels = HashSet::new();
@@ -205,7 +222,15 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
             }
             for n in &lane.notes {
                 dup(&mut note_ids, n.id)?;
-                if n.tick.0 < 0 || n.duration_ticks.0 <= 0 || n.pitch > 127 || !n.velocity.is_finite() || n.velocity <= 0.0 || n.velocity > 1.0 || n.channel > 15 {
+                if !tick_ok(n.tick)
+                    || n.duration_ticks.0 <= 0
+                    || !tick_ok(n.duration_ticks)
+                    || n.pitch > 127
+                    || !n.velocity.is_finite()
+                    || n.velocity <= 0.0
+                    || n.velocity > 1.0
+                    || n.channel > 15
+                {
                     return Err(ValidationError::InvalidValue(format!("note {} in pattern {}", n.id, pat.name)));
                 }
                 if n.end_tick().0 > pat.length_ticks.0 {
@@ -213,7 +238,7 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
                 }
             }
             for c in &lane.controllers {
-                if c.tick.0 < 0 || c.channel > 15 {
+                if !tick_ok(c.tick) || c.channel > 15 {
                     return Err(ValidationError::InvalidValue(format!("controller event in pattern {}", pat.name)));
                 }
                 let ok = match c.kind {
@@ -255,7 +280,7 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
         let mut last = i64::MIN;
         for pt in &c.points {
             dup(&mut point_ids, pt.id)?;
-            if pt.tick.0 < 0 || pt.tick.0 < last || !pt.value.is_finite() || !(0.0..=1.0).contains(&pt.value) {
+            if !tick_ok(pt.tick) || pt.tick.0 < last || !pt.value.is_finite() || !(0.0..=1.0).contains(&pt.value) {
                 return Err(ValidationError::InvalidValue(format!("automation curve {}", c.name)));
             }
             last = pt.tick.0;
@@ -270,7 +295,7 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
         if !track_ids.contains(&c.track_id) {
             return Err(ValidationError::MissingReference { what: format!("clip {}", c.id), target: c.track_id.to_string() });
         }
-        if c.start_tick.0 < 0 || c.length_ticks.0 <= 0 {
+        if !tick_ok(c.start_tick) || c.length_ticks.0 <= 0 || !tick_ok(c.length_ticks) {
             return Err(ValidationError::InvalidValue(format!("clip {}", c.id)));
         }
         match &c.content {
@@ -278,11 +303,14 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
                 if !pattern_ids.contains(pattern_id) {
                     return Err(ValidationError::MissingReference { what: format!("clip {}", c.id), target: pattern_id.to_string() });
                 }
-                if source_offset_ticks.0 < 0 {
+                if !tick_ok(*source_offset_ticks) {
                     return Err(ValidationError::InvalidValue(format!("clip {} offset", c.id)));
                 }
             }
-            ClipContent::Audio { asset_id, source_length_frames, gain_db, playback_rate, .. } => {
+            ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, playback_rate, fade_in_frames, fade_out_frames } => {
+                if [*source_offset_frames, *source_length_frames, *fade_in_frames, *fade_out_frames].iter().any(|f| *f > MAX_CLIP_FRAMES) {
+                    return Err(ValidationError::InvalidValue(format!("audio clip {} frame range", c.id)));
+                }
                 // Missing assets are allowed (placeholder) but the id must be well-formed.
                 if !asset_id.is_valid() {
                     return Err(ValidationError::InvalidValue(format!("clip {} asset id", c.id)));
@@ -299,7 +327,7 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
         }
     }
     if let Some(l) = &p.r#loop
-        && (l.start_tick.0 < 0 || l.end_tick <= l.start_tick)
+        && (!tick_ok(l.start_tick) || !tick_ok(l.end_tick) || l.end_tick <= l.start_tick)
     {
         return Err(ValidationError::InvalidValue("loop range".into()));
     }

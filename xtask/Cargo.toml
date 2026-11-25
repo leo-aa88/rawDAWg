@@ -19,6 +19,7 @@ rawdawg-audio-engine = { path = "../crates/audio-engine" }
 rawdawg-plugin-host = { path = "../crates/plugin-host" }
 rawdawg-plugin-api = { path = "../crates/plugin-api" }
 rawdawg-plugin-vst3 = { path = "../crates/plugin-vst3" }
+rawdawg-fuzz = { path = "../crates/fuzz" }
 rawdawg-audio-io = { path = "../crates/audio-io" }
 anyhow = { workspace = true }
 clap = { workspace = true }

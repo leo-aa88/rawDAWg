@@ -191,9 +191,12 @@ pub fn sort_events(events: &mut [TimedEvent]) {
 /// Normalize a MIDI 1.0 byte triple into an [`EventKind`] (velocity-0 note-on → note-off).
 /// `note_id` is assigned by the caller's note registry.
 pub fn midi_message_to_kind(status: u8, data1: u8, data2: u8, note_id: u32) -> Option<EventKind> {
+    // data bytes are 7-bit: mask before interpreting, so a malformed 0x80 velocity byte is a
+    // note-off (velocity 0) and never a silent note-on
+    let (data1, data2) = (data1 & 0x7F, data2 & 0x7F);
     match status & 0xF0 {
-        0x90 if data2 == 0 => Some(EventKind::NoteOff { note_id, pitch: data1 & 0x7F }),
-        0x90 => Some(EventKind::NoteOn { note_id, pitch: data1 & 0x7F, velocity: f32::from(data2 & 0x7F) / 127.0 }),
+        0x90 if data2 == 0 => Some(EventKind::NoteOff { note_id, pitch: data1 }),
+        0x90 => Some(EventKind::NoteOn { note_id, pitch: data1, velocity: f32::from(data2) / 127.0 }),
         0x80 => Some(EventKind::NoteOff { note_id, pitch: data1 & 0x7F }),
         0xB0 => Some(EventKind::Control { cc: data1 & 0x7F, value: f32::from(data2 & 0x7F) / 127.0 }),
         0xE0 => {
@@ -245,6 +248,8 @@ mod tests {
         assert!(matches!(midi_message_to_kind(0xE0, 0x7F, 0x7F, 0), Some(EventKind::PitchBend { value }) if (value - 1.0).abs() < 1e-3));
         assert!(matches!(midi_message_to_kind(0xE0, 0x00, 0x00, 0), Some(EventKind::PitchBend { value }) if (value + 1.0).abs() < 1e-6));
         assert_eq!(midi_message_to_kind(0xF8, 0, 0, 0), None);
+        // fuzz regression: a velocity byte with the high bit set masks to 0 → note-off
+        assert_eq!(midi_message_to_kind(0x90, 0x80, 0x80, 3), Some(EventKind::NoteOff { note_id: 3, pitch: 0 }));
     }
 
     #[test]

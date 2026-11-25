@@ -12,6 +12,7 @@ use std::time::Instant;
 mod bench;
 mod fixtures;
 mod package;
+mod soak;
 mod verify;
 
 #[derive(Parser)]
@@ -40,6 +41,30 @@ enum Cmd {
         mode: String,
     },
     /// Offline engine throughput and block-time distribution on the reference workload.
+    /// Seeded mutation fuzzing of every untrusted input surface (see crates/fuzz).
+    Fuzz {
+        /// Only this target (project, preset, smf, sf2, audio, expr, patch, effect-state, plugin-envelope, midi-messages).
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 2000)]
+        iterations: u64,
+        /// Time budget per target.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Re-run one saved input (requires --target).
+        #[arg(long)]
+        replay: Option<PathBuf>,
+    },
+    /// Headless stress soak: random edits, plan swaps, transport, live notes and recording
+    /// against a real-time-paced engine; memory growth and stuck-note checks.
+    Soak {
+        #[arg(long, default_value_t = 30.0)]
+        minutes: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     BenchAudio {
         #[arg(long, default_value_t = 60.0)]
         seconds: f64,
@@ -80,6 +105,53 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Counts live heap bytes so the soak can tell growing data from allocator retention
+/// (resident memory alone cannot). One relaxed atomic add per allocation.
+struct CountingAlloc;
+
+static LIVE_HEAP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+// SAFETY: forwards every call unchanged to the system allocator; only a counter is updated.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: same contract as the caller's.
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            LIVE_HEAP.fetch_add(layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: same contract as the caller's.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        LIVE_HEAP.fetch_sub(layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: same contract as the caller's.
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            LIVE_HEAP.fetch_add(layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: same contract as the caller's.
+        let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            LIVE_HEAP.fetch_add(new_size as i64 - layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+/// Live heap bytes (all threads) as counted by the global allocator.
+pub fn live_heap_bytes() -> i64 {
+    LIVE_HEAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let root = workspace_root();
@@ -115,6 +187,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::BenchAudio { seconds } => bench::run(&root, seconds),
+        Cmd::Soak { minutes, seed } => soak::run(&root, minutes, seed),
+        Cmd::Fuzz { target, iterations, seconds, seed, replay } => fuzz(&root, target, iterations, seconds, seed, replay),
         Cmd::Package { format } => package(&root, format),
         Cmd::Ci => {
             run(Command::new("cargo").args(["fmt", "--all", "--", "--check"]))?;
@@ -140,6 +214,57 @@ fn package(root: &Path, format: PackageFormat) -> anyhow::Result<()> {
     println!("staging: {}", produced.staging.display());
     for w in &produced.warnings {
         println!("warning: {w}");
+    }
+    Ok(())
+}
+
+fn fuzz(root: &Path, target: Option<String>, iterations: u64, seconds: u64, seed: u64, replay: Option<PathBuf>) -> anyhow::Result<()> {
+    let out = root.join("target").join("fuzz");
+    if let Some(file) = replay {
+        let name = target.ok_or_else(|| anyhow::anyhow!("--replay needs --target"))?;
+        let t = rawdawg_fuzz::targets::by_name(&name).ok_or_else(|| anyhow::anyhow!("unknown target {name}"))?;
+        let input = std::fs::read(&file)?;
+        match rawdawg_fuzz::replay(&t, &input) {
+            Some(msg) => bail!("{name}: still fails: {msg}"),
+            None => println!("{name}: {} passes", file.display()),
+        }
+        return Ok(());
+    }
+    let targets: Vec<_> = rawdawg_fuzz::targets::all().into_iter().filter(|t| target.as_deref().is_none_or(|n| n == t.name)).collect();
+    if targets.is_empty() {
+        bail!("unknown target {target:?}");
+    }
+    let mut findings = 0;
+    let mut summary = Vec::new();
+    for t in &targets {
+        let r = rawdawg_fuzz::run_campaign(t, iterations, seed, std::time::Duration::from_secs(seconds), &out, 16, std::time::Duration::from_secs(30));
+        println!(
+            "{:<16} {:>7} inputs in {:>6.1} s, parsed {:>6} ({:>5.1}%), seeds accepted {}/{}, slowest {:.1} ms, findings {}",
+            r.target,
+            r.executed,
+            r.elapsed.as_secs_f64(),
+            r.parsed,
+            r.parsed as f64 / r.executed.max(1) as f64 * 100.0,
+            r.accepted_seeds,
+            t.seeds.len(),
+            r.slowest_ms,
+            r.findings.len()
+        );
+        for f in &r.findings {
+            println!("    iteration {}: {}\n      reproducer {}", f.iteration, f.message, f.input.display());
+        }
+        findings += r.findings.len();
+        summary.push(serde_json::json!({ "target": r.target, "inputs": r.executed, "parsed": r.parsed, "seconds": r.elapsed.as_secs_f64(), "seeds": t.seeds.len(), "seeds_accepted": r.accepted_seeds, "slowest_ms": r.slowest_ms, "findings": r.findings.iter().map(|f| serde_json::json!({"iteration": f.iteration, "message": f.message, "input": f.input})).collect::<Vec<_>>() }));
+    }
+    std::fs::create_dir_all(&out)?;
+    std::fs::write(
+        out.join("report.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({ "seed": seed, "iterations": iterations, "build": if cfg!(debug_assertions) { "debug" } else { "release" }, "targets": summary }),
+        )?,
+    )?;
+    if findings > 0 {
+        bail!("{findings} finding(s); reproducers under {}", out.display());
     }
     Ok(())
 }

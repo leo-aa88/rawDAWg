@@ -263,3 +263,34 @@ fn saved_projects_carry_an_association_marker_that_resolves_to_the_folder() {
     assert!(rawdawg_project::persist::resolve_project_dir(&proj.join("other.rawdawg")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn floats_in_saved_state_round_trip_exactly() {
+    // fuzz regression: without exact float parsing, a stored value such as a waveform sample
+    // changed by one ulp on every save/load
+    let x: f64 = "-0.45211684703826244".parse().unwrap();
+    let text = serde_json::to_string(&serde_json::json!({ "v": x })).unwrap();
+    let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(back["v"].as_f64().unwrap().to_bits(), x.to_bits(), "{text}");
+    // and a broad sweep: f32-derived and arbitrary finite f64 values
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..20_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let v = if i % 2 == 0 { f64::from(f32::from_bits(state as u32)) } else { f64::from_bits(state) };
+        if !v.is_finite() {
+            continue;
+        }
+        let t = serde_json::to_string(&serde_json::json!(v)).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(b.as_f64().unwrap().to_bits(), v.to_bits(), "{v:e} → {t}");
+    }
+    // a whole project with such a value survives two save/load cycles unchanged
+    let mut p = rawdawg_project::Project::new_default("floats", serde_json::json!({}));
+    p.channels[0].instrument.state = serde_json::json!({ "cycle": [x, 0.09655909240245819, 1e-300, -2.5e-7] });
+    let once = rawdawg_project::persist::parse_project(&rawdawg_project::persist::project_to_json(&p)).unwrap();
+    let twice = rawdawg_project::persist::parse_project(&rawdawg_project::persist::project_to_json(&once)).unwrap();
+    assert_eq!(once, p);
+    assert_eq!(twice, once);
+}

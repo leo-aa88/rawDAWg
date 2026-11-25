@@ -228,8 +228,9 @@ pub struct Note {
 }
 
 impl Note {
+    /// End position; saturates (validated projects stay far below the bound, see `MAX_TICK`).
     pub fn end_tick(&self) -> Tick {
-        self.tick + self.duration_ticks
+        Tick(self.tick.0.saturating_add(self.duration_ticks.0))
     }
 }
 
@@ -317,8 +318,9 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// End position; saturates (validated projects stay far below the bound, see `MAX_TICK`).
     pub fn end_tick(&self) -> Tick {
-        self.start_tick + self.length_ticks
+        Tick(self.start_tick.0.saturating_add(self.length_ticks.0))
     }
 }
 

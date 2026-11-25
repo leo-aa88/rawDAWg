@@ -3619,6 +3619,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawdawg-fuzz"
+version = "0.1.0"
+dependencies = [
+ "rawdawg-audio-engine",
+ "rawdawg-dsp",
+ "rawdawg-effects",
+ "rawdawg-plugin-api",
+ "rawdawg-project",
+ "rawdawg-sampler",
+ "rawdawg-synthesizer",
+ "rawdawg-types",
+ "serde_json",
+ "zip",
+]
+
+[[package]]
 name = "rawdawg-midi"
 version = "0.1.0"
 dependencies = [
@@ -5541,6 +5557,7 @@ dependencies = [
  "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-fuzz",
  "rawdawg-plugin-api",
  "rawdawg-plugin-host",
  "rawdawg-plugin-vst3",
