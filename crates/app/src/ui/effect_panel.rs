@@ -17,6 +17,8 @@ pub(crate) struct EffectPanelState {
     eq_drag: Option<usize>,
     /// Delay tap being dragged.
     tap_drag: Option<usize>,
+    /// Reverb decay-shape band being dragged.
+    shape_drag: Option<usize>,
 }
 
 fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
@@ -124,6 +126,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     }
     if type_id == rawdawg_effects::delay::TYPE_ID {
         delay_editor(app, ui, instance_id, &mut edits);
+    }
+    if type_id == rawdawg_effects::reverb::TYPE_ID {
+        reverb_editor(app, ui, instance_id, &mut edits);
     }
     let descriptors: Vec<ParamDescriptor> = app.other_mirrors[&instance_id].descriptors().iter().filter(|d| !d.flags.hidden).copied().collect();
     let simple_only = !app.effect_panel.advanced && type_id == rawdawg_effects::eq::TYPE_ID;
@@ -540,4 +545,66 @@ fn delay_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits
     }
     let _ = MAX_TAPS;
     ui.label(egui::RichText::new("Click the canvas to add a tap · drag taps · wheel pans · right-click toggles").color(theme::TEXT_SECONDARY).small());
+}
+
+// ---------------------------------------------------------------------------
+// Reverb: decay shape editor (four bands, RT60 multipliers, drawn as a curve)
+
+fn reverb_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    use rawdawg_dsp::processor::Processor;
+    use rawdawg_effects::reverb::{BAND_LABELS, MODE_LABELS, P_SHAPE0, Reverb};
+    let descs = app.other_mirrors[&instance_id].descriptors();
+    let desc = |id: u32| descs.iter().find(|d| d.id.0 == id).copied();
+    let (mode, shape) = {
+        let m = app.other_mirrors.get_mut(&instance_id).expect("mirror");
+        let r = m.as_any_mut().downcast_mut::<Reverb>().expect("reverb mirror");
+        let s: [f32; 4] =
+            std::array::from_fn(|b| r.param(ParamId(P_SHAPE0 + b as u32)).map(|n| desc(P_SHAPE0 + b as u32).map(|d| d.to_physical(n) as f32).unwrap_or(1.0)).unwrap_or(1.0));
+        (r.mode(), s)
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "{} · decay shape: how long each band rings relative to the decay time (stable by construction: no band can exceed unity gain)",
+            MODE_LABELS[mode.min(5)]
+        ))
+        .color(theme::TEXT_SECONDARY),
+    );
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(300.0), 120.0), Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, theme::BACKGROUND);
+    let col_w = rect.width() / 4.0;
+    let y_of = |m: f32| rect.max.y - ((m.clamp(0.1, 2.0) / 0.1).log10() / (20.0f32).log10()) * rect.height();
+    let m_of = |y: f32| 0.1 * 20f32.powf(((rect.max.y - y) / rect.height()).clamp(0.0, 1.0));
+    let y1 = y_of(1.0);
+    painter.line_segment([pos2(rect.min.x, y1), pos2(rect.max.x, y1)], Stroke::new(1.0, theme::BORDER));
+    painter.text(pos2(rect.min.x + 2.0, y1 - 1.0), egui::Align2::LEFT_BOTTOM, "1.0×", egui::FontId::proportional(9.0), theme::TEXT_SECONDARY);
+    let pts: Vec<Pos2> = (0..4).map(|b| pos2(rect.min.x + (b as f32 + 0.5) * col_w, y_of(shape[b]))).collect();
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.0, theme::WARNING)));
+    let ptr = super::PointerState::read(ui);
+    let hovered = ptr.pos.filter(|p| rect.contains(*p)).map(|p| (((p.x - rect.min.x) / col_w) as usize).min(3));
+    for (b, p) in pts.iter().enumerate() {
+        painter.circle(*p, 5.0, theme::WARNING, Stroke::new(1.0, theme::BACKGROUND));
+        painter.text(pos2(p.x, rect.max.y - 2.0), egui::Align2::CENTER_BOTTOM, BAND_LABELS[b], egui::FontId::proportional(9.0), theme::TEXT_SECONDARY);
+        painter.text(*p + vec2(0.0, -9.0), egui::Align2::CENTER_BOTTOM, format!("{:.2}×", shape[b]), egui::FontId::proportional(9.0), theme::TEXT);
+    }
+    if ptr.primary_pressed
+        && resp.contains_pointer()
+        && let Some(b) = hovered
+    {
+        app.effect_panel.shape_drag = Some(b);
+    }
+    if ptr.primary_down
+        && let Some(b) = app.effect_panel.shape_drag
+        && let Some(p) = ptr.pos
+        && let Some(d) = desc(P_SHAPE0 + b as u32)
+    {
+        edits.push((d.id, d.to_normalized(f64::from(m_of(p.y))), ptr.primary_pressed, false));
+    }
+    if (ptr.primary_released || !ptr.primary_down)
+        && let Some(b) = app.effect_panel.shape_drag.take()
+        && let Some(d) = desc(P_SHAPE0 + b as u32)
+    {
+        edits.push((d.id, d.to_normalized(f64::from(shape[b])), false, true));
+    }
+    ui.label(egui::RichText::new("Drag a band up to let it ring longer, down to damp it faster").color(theme::TEXT_SECONDARY).small());
 }

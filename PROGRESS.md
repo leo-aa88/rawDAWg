@@ -137,6 +137,15 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Effect editor: multitap **tap canvas** (time ratio × gain with ms labels for the current base time; click adds a tap, drag moves it, wheel pans, right-click toggles) — "tap drag changes time/gain" per DSP.md; tap parameters move to the Advanced grid.
 - Tests (`crates/effects/tests/delay.rs`): echo at 250 ms with geometric decay at 50 percent feedback and silence between repeats, L/R offset, tempo sync at 120/90 BPM and dotted eighths, ping-pong alternation, multitap tap positions/gains/pan, reverse ramp reversal with 4800-frame latency, tape wow spacing modulation and bounded output at maximum feedback with full drive, a preset per mode (all distinct), allocation-free processing in every mode (a `Vec`-returning tap helper found by the guard and replaced with a fixed array).
 
+### Slice 4 — algorithmic reverbs (FX-01/02/03 subset)
+
+261 automated tests pass, clippy clean.
+
+- `native.fx.reverb` with six types: **Room / Hall / Cathedral** (mode-specific early-reflection taps + 4 input all-pass diffusers + an 8-channel Hadamard FDN with distinct delay sets per type, one-pole damping, slight modulation), **Plate** (long diffusers into a short dense tank), **Spring** (dispersive second-order all-pass chain into a short damped feedback loop; documented as an approximation, no physical claim), **Shimmer** (hall with a granular two-tap pitch shifter in the feedback path, damped and soft-limited, loop gain bounded below unity). Pre-delay, size, decay RT60 0.1–30 s, damping, low cut, diffusion, modulation, early-reflection level, width, mix, shimmer pitch/amount.
+- **Decay shape** (FX-03 "reverb curve edit"): four band multipliers (0.1–2×) applied per FDN channel through low-shelf/peak/peak/high-shelf filters whose gains are derived from the channel's base decay gain, so no band can reach unity loop gain; the effect editor draws them as a draggable curve. Interpreted as a frequency-dependent decay envelope, which keeps the energy decay stable by construction.
+- Tests (`crates/effects/tests/reverb.rs`): Schroeder-integrated RT60 within 35 percent of the set decay for room/hall/cathedral and the three programs measurably different; echo density (Abel–Huang) builds fastest in the plate, then room, then hall, all dense after 100 ms; spring tail present, bounded and periodic at its loop length; the high-band multiplier 0.3 lowers the tail's spectral centroid; a 30 s cathedral with every band at 2× and full diffusion stays bounded and does not grow after the input stops; shimmer raises the tail centroid versus the hall; mix 0 is a bit-exact null; a preset per type (9 presets, pairwise distinct); allocation-free in every type.
+- Open: convolution reverb with user impulse responses (next slice), listening evaluation (manual).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -191,7 +200,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M4 in progress (slices 1–3: mixer routing/inserts, EQ, stereo, dynamics, delay); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M4 in progress (slices 1–4: mixer routing/inserts, EQ, stereo, dynamics, delay, algorithmic reverbs); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M4 — mixer UI and routing (buses/sends/sidechain/parallel, latency compensation), then native effects one vertical slice each (EQ, compressor, limiter, delay, reverbs, distortion, modulation, stereo, pitch/formant, granular, spectral) with presets, tests and dark editors; automation/MIDI-learn targets extended to mixer and effects.
 2. M3 leftovers when touched: rack channel reorder/duplicate, pattern-mode automation, CC capture into automation.
 3. (was) pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
