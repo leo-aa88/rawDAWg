@@ -980,12 +980,73 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
         Ok((format!("{} ({} bytes), {} ({} bytes)", clap_name, c.metadata()?.len(), vst3_name, v.metadata()?.len()), Some(profile_dir.display().to_string())))
     }));
     checks.push(check("PL-02 CLAP/VST3 ABI round-trip tests (cargo test)", &["PLUG-01", "T-PLUGIN"], || {
-        let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-clap", "-p", "rawdawg-plugin-vst3"]).status()?;
+        let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-clap", "-p", "rawdawg-plugin-vst3", "-p", "rawdawg-plugin-host"]).status()?;
         if !status.success() {
             bail!("plugin tests failed");
         }
-        Ok(("host load, instantiate, process, params, state: pass".into(), None))
+        Ok(("CLAP export (17 plugins) and VST3 fixture through the built modules; CLAP host bridge: hosted vs native renders, migration, state, params".into(), None))
     }));
+    checks.push(check(
+        "E2E-07 (headless subset) isolated scan of rawDAWg's own CLAP module into a catalog, hang/crash quarantine, safe-mode skip, hosted render equals native",
+        &["PLUG-02", "PLUG-03", "T-PLUGIN", "E2E-07"],
+        || {
+            let exe = profile_dir.join(if cfg!(target_os = "windows") { "rawdawg.exe" } else { "rawdawg" });
+            let module = profile_dir.join(clap_name);
+            if !exe.is_file() || !module.is_file() {
+                bail!("missing {} or {} (run cargo build --workspace)", exe.display(), module.display());
+            }
+            let base = out.join("e2e-07");
+            let _ = std::fs::remove_dir_all(&base);
+            let plugins = base.join("clap");
+            std::fs::create_dir_all(&plugins)?;
+            std::fs::copy(&module, plugins.join("rawDAWg.clap"))?;
+            std::fs::write(plugins.join("broken.clap"), b"not a plugin")?;
+            let catalog = base.join("plugins.json");
+            // 1. scan through the CLI (each module in its own child process)
+            let o = Command::new(&exe).args(["--scan-plugins", "--catalog"]).arg(&catalog).env("CLAP_PATH", &plugins).env("HOME", base.join("home")).output()?;
+            if !o.status.success() {
+                bail!("--scan-plugins failed: {}", String::from_utf8_lossy(&o.stderr));
+            }
+            let report: serde_json::Value = serde_json::from_slice(&o.stdout)?;
+            let n = report["plugins"].as_array().map(|a| a.len()).unwrap_or(0);
+            if n != 17 || report["quarantine"].as_array().map(|a| a.len()) != Some(1) {
+                bail!("expected 17 plugins and 1 quarantined module, got {n} and {:?}", report["quarantine"]);
+            }
+            // 2. a hanging scanner child is killed and quarantined (test hook, 1 s timeout)
+            let mut cat = rawdawg_plugin_host::Catalog::load(&catalog);
+            cat.timeout_secs = 1;
+            cat.clear_quarantine(&plugins.join("broken.clap"));
+            let opts = rawdawg_plugin_host::ScanOptions::new(exe.clone(), 1);
+            let hang = {
+                // SAFETY: xtask is single-threaded here; the hook only affects the children it spawns.
+                unsafe { std::env::set_var(rawdawg_plugin_host::scan::TEST_BEHAVIOUR_ENV, "hang") };
+                let r = rawdawg_plugin_host::scan::scan_library(&plugins.join("rawDAWg.clap"), rawdawg_plugin_host::Format::Clap, &opts);
+                unsafe { std::env::remove_var(rawdawg_plugin_host::scan::TEST_BEHAVIOUR_ENV) };
+                r
+            };
+            match hang {
+                rawdawg_plugin_host::ScanOutcome::Quarantined(q) if matches!(q.reason, rawdawg_plugin_host::QuarantineReason::Timeout { .. }) => {}
+                rawdawg_plugin_host::ScanOutcome::Quarantined(q) => bail!("hang quarantined with the wrong reason: {}", q.reason.summary()),
+                rawdawg_plugin_host::ScanOutcome::Scanned(_) => bail!("a hanging scanner produced a library"),
+            }
+            // 3. hosted render equals native render; safe mode and missing plugins become stand-ins
+            let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_host"]).status()?;
+            if !status.success() {
+                bail!("hosted-vs-native engine tests failed");
+            }
+            let status = Command::new("cargo").args(["test", "-q", "-p", "rawdawg", "--test", "plugin_scan", "--bin", "rawdawg", "hosted_plugins"]).status()?;
+            if !status.success() {
+                bail!("scanner subprocess / hosted UI tests failed");
+            }
+            Ok((
+                format!(
+                    "catalog {}: 17 plugins, broken module quarantined (load failed), hang quarantined (timeout 1 s), hosted delay/synth renders equal native, safe mode stand-ins",
+                    catalog.display()
+                ),
+                Some(base.display().to_string()),
+            ))
+        },
+    ));
     let validator = which("clap-validator");
     checks.push(match validator {
         Some(path) => check("PL-03 clap-validator on exported CLAP", &["PLUG-03", "T-PLUGIN"], || {

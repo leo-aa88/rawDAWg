@@ -11,11 +11,12 @@ pub(crate) struct SettingsState {
     pub device_id: Option<String>,
     pub sample_rate: Option<u32>,
     pub buffer: Option<u32>,
+    pub plugin_path_input: String,
 }
 
 impl SettingsState {
     pub fn from_request(req: &StreamConfigRequest) -> Self {
-        Self { device_id: req.device_id.clone(), sample_rate: req.sample_rate_hz, buffer: req.buffer_frames }
+        Self { device_id: req.device_id.clone(), sample_rate: req.sample_rate_hz, buffer: req.buffer_frames, plugin_path_input: String::new() }
     }
     pub fn request(&self) -> StreamConfigRequest {
         StreamConfigRequest { device_id: self.device_id.clone(), sample_rate_hz: self.sample_rate, buffer_frames: self.buffer }
@@ -284,6 +285,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             app.save_prefs();
         }
         ui.separator();
+        ui.heading("Plugins");
+        plugins_section(app, ui);
+        ui.separator();
         ui.heading("Typing keyboard");
         ui.label("Lower row plays notes; the octave and velocity controls are in the toolbar.");
         ui.monospace(" S D   G H J   L ;      black keys");
@@ -298,4 +302,119 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         }
     });
     app.show_settings = open;
+}
+
+/// Third-party plugin catalog: scan, search roots, timeout, quarantine, crash notice.
+fn plugins_section(app: &mut App, ui: &mut egui::Ui) {
+    let host = &mut app.plugin_host;
+    if host.safe_mode {
+        ui.label(egui::RichText::new("Safe mode: third-party plugins are listed but never loaded in this session (start without --safe-mode to use them).").color(theme::WARNING));
+    }
+    if let Some(prev) = host.previous_crash.clone() {
+        ui.label(egui::RichText::new(format!("The previous session ended without a clean shutdown while these plugins were loaded: {}", prev.join(", "))).color(theme::WARNING));
+        ui.label(
+            egui::RichText::new("If rawDAWg crashed, a plugin is the likely cause: restart with --safe-mode to open the project without loading them.")
+                .color(theme::TEXT_SECONDARY),
+        );
+        if ui.button("Dismiss").clicked() {
+            host.acknowledge_previous_crash();
+        }
+    }
+    ui.label(egui::RichText::new("Each module is examined in a separate process with a timeout; crashes and hangs are quarantined, not loaded. Plugins then run inside rawDAWg as native code (crash containment, not a sandbox).").color(theme::TEXT_SECONDARY).small());
+    ui.horizontal(|ui| {
+        let scanning = host.scanning();
+        if ui
+            .add_enabled(!scanning && !host.safe_mode, egui::Button::new("Scan plugin folders"))
+            .on_hover_text("Standard CLAP locations, CLAP_PATH and the folders below")
+            .clicked()
+        {
+            host.start_scan();
+        }
+        if let Some(job) = &host.scan {
+            ui.spinner();
+            ui.label(format!("scanning {}", job.current));
+        } else if let Some(r) = &host.last_report {
+            ui.label(
+                egui::RichText::new(format!("last scan: {} candidates, {} scanned, {} quarantined, {} unchanged", r.candidates, r.scanned, r.quarantined, r.unchanged))
+                    .color(theme::TEXT_SECONDARY),
+            );
+        }
+        ui.label(format!("{} plugins in {} modules", host.catalog.plugins().count(), host.catalog.libraries.len()));
+    });
+    if let Some(e) = &host.last_error {
+        ui.colored_label(theme::ERROR, e);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Per-plugin scan timeout (s)");
+        let mut t = host.catalog.timeout_secs;
+        if ui.add(egui::DragValue::new(&mut t).range(1..=120)).changed() {
+            host.catalog.timeout_secs = t;
+            host.save();
+        }
+    });
+    ui.label("Extra plugin folders");
+    let mut remove: Option<usize> = None;
+    for (i, p) in host.catalog.user_paths.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.monospace(p.display().to_string());
+            if ui.small_button("remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        host.catalog.user_paths.remove(i);
+        host.save();
+    }
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut app.settings.plugin_path_input).hint_text("/path/to/plugins").desired_width(320.0));
+        if ui.button("Add folder").clicked() {
+            let p = std::path::PathBuf::from(app.settings.plugin_path_input.trim());
+            if p.is_dir() {
+                if !host.catalog.user_paths.contains(&p) {
+                    host.catalog.user_paths.push(p);
+                    host.save();
+                }
+                app.settings.plugin_path_input.clear();
+            } else {
+                host.last_error = Some(format!("{} is not a folder", p.display()));
+            }
+        }
+    });
+    if !host.catalog.quarantine.is_empty() {
+        ui.label(egui::RichText::new("Quarantined modules").strong());
+        let mut retry: Option<std::path::PathBuf> = None;
+        let mut forget: Option<std::path::PathBuf> = None;
+        for q in &host.catalog.quarantine {
+            ui.horizontal(|ui| {
+                ui.monospace(q.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).on_hover_text(q.path.display().to_string());
+                if ui.small_button("retry").on_hover_text("Scan this module again on the next scan").clicked() {
+                    retry = Some(q.path.clone());
+                }
+                if ui.small_button("remove").on_hover_text("Forget this module (it is scanned again only if you rescan after it changed)").clicked() {
+                    forget = Some(q.path.clone());
+                }
+                let reason = q.reason.summary();
+                ui.add(egui::Label::new(egui::RichText::new(&reason).color(theme::WARNING)).truncate()).on_hover_text(reason);
+            });
+        }
+        if let Some(p) = retry {
+            host.catalog.clear_quarantine(&p);
+            host.save();
+        }
+        if let Some(p) = forget {
+            host.catalog.remove(&p);
+            host.save();
+        }
+    }
+    let problems: Vec<(String, u32)> = app
+        .other_mirrors
+        .values_mut()
+        .filter_map(|m| m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>())
+        .filter(|l| l.problem_count() > 0)
+        .map(|l| (l.info.name.clone(), l.problem_count()))
+        .collect();
+    for (name, n) in problems {
+        ui.colored_label(theme::WARNING, format!("{name}: {n} block(s) with processing errors or non-finite output were muted"));
+    }
 }

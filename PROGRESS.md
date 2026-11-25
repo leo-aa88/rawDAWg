@@ -311,6 +311,26 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Commands: `cargo test -p rawdawg-plugin-clap` (3 passed), `cargo clippy --workspace --all-targets -- -D warnings` (clean).
 - Not done: GUI extension (M7 later slice), VST3 generalisation, validators (PL-03/04 BLOCKED), independent hosts (PL-05 BLOCKED).
 
+### Slice 2 — plugin-host crate: catalog, bounded discovery, isolated scanner, quarantine (PLUG-02/03)
+
+- `crates/plugin-host`: `catalog` (formats, fingerprints size+mtime, `PluginDescription` with ports/params/GUI flags, `ScannedLibrary`, `QuarantineRecord` with crash/timeout/load-failed/invalid-output reasons, user roots, timeout, atomic save, prune, retry/remove, `needs_scan`), `scan` (standard per-OS roots + `CLAP_PATH`, recursive discovery with depth 8 / 10 000 candidates / canonical-path loop guard, scanner child protocol as one JSON document, parent with timeout kill, bounded stdout 1 MiB, stderr capture, `refresh` with progress), `describe` (in-process description: instantiates each plugin for port/param counts and the GUI extension; runs only in the child), `host` (clack host handlers), `marker` (crash marker).
+- App: hidden `--scan-plugin PATH --scan-format clap` child entry, user-facing `--scan-plugins [--catalog FILE]` JSON report; `plugins.rs` with catalog path in the preferences directory.
+- Tests: `crates/plugin-host/tests/catalog.rs` (persistence, id/hint resolution, fingerprint rescan, quarantine/retry/prune, unsupported catalog versions; discovery with mixed case, bundle-like folders, depth limit and a symlink loop; in-process description of the built module: 17 plugins, compressor main+sidechain), `crates/app/tests/plugin_scan.rs` (real `rawdawg` binary as scanner: describes the module; garbage/missing files → load failed; `RAWDAWG_SCAN_TEST_BEHAVIOUR=hang` killed at the 1 s timeout; `crash` → crash record; `refresh` scans once, keeps quarantine, honours retry and prunes; CLI writes the given catalog). Deterministic hang/crash hooks are test-only and documented.
+
+### Slice 3 — in-process CLAP bridge and engine injection (PLUG-02)
+
+- `plugin-host::clap`: `ModuleCache` (one mapped library per path), `ClapInstance` (main-thread half = the app's mirror: descriptors leaked once per plugin id, cached values, inactive flush, state envelope `{format, plugin_id, clap_state_b64}`, latency, activation/deactivation, returned-processor collection) and `ClapProcessor` (RT half: preallocated port buffers per declared port with mono downmix/duplication, sidechain on port 2, bounded event translation incl. CLAP notes / MIDI dialect / note expressions / params, host transport event, non-finite and error muting with a counter, bounded pending-param queue, no allocation in `process`). One plugin instance per project instance: `activate_for_rt` during compile, `migrate_from` carries the started processor into the next plan, `Drop` (off RT) returns it for deactivation. `MainThreadCell` + `b64` helpers. ADR 0004.
+- Engine: `externals::{ExternalPlugins, PluginRole, NoExternals}`, `compile_with(.., externals)`; `Processor::carries_live_state()`; `Engine::install_plan` now migrates like the RT swap. Project: `Instance::external`, `Command::SetInstrument` (undo + orphan handling).
+- Tests (`crates/plugin-host/tests/clap_host.rs`): descriptors/params/state envelope (inactive set read back through the ABI, bare/garbage/wrong-plugin states refused); hosted `rawdawg.fx.delay` equals the native delay sample-exactly in the engine (max diff < 1e-5), survives a plan swap with its tail intact and the same activation, returns and deactivates when its plan is dropped, re-activates; realtime parameter events (initial and mid-flight) match the native path exactly; hosted `rawdawg.synth` plays sequencer notes at 440 Hz and releases; without a provider the instance is a silent stand-in reported in `missing_plugins`.
+
+### Slice 4 — app wiring: catalog UI, inserts/instruments from the catalog, mirrors, safe mode, crash marker (PLUG-02/03, E2E-07 subset)
+
+- `App.plugin_host` (`PluginHost`: catalog load/save gated like preferences, background scan thread with progress, `create_instance` from the catalog with saved state, `unavailable_reason` incl. safe mode / quarantine / not catalogued / VST3, crash marker written while plugins are live and cleared on clean exit, previous-crash notice). `AppExternals` provides the engine with activated RT halves and reloads project state into a live instance when it changed underneath (undo, preset).
+- UI: browser **Plugins** group (search, effect → insert on the selected mixer channel, instrument → `SetInstrument`), mixer **+ Add effect** lists catalog effects with a format suffix, effect/instrument panels use the live instance as the mirror (generic parameter grid, format/vendor/version line, unavailable reason), Settings › Plugins (scan with progress, last report, timeout, extra folders, quarantine with retry/remove, muted-block counters, safe-mode and crash notices), `--ui-preset plugins`. Hosted mirrors survive `rebuild_mirrors`; returned RT halves are collected at UI rate and before each compile.
+- xtask: PL-02 now includes `rawdawg-plugin-host`; new **E2E-07 (headless subset)**: CLI scan of the built module into a temp catalog (17 plugins, broken module quarantined), hang quarantined at the 1 s timeout, hosted-vs-native engine tests, scanner subprocess and UI tests.
+- Evidence: `docs/verification/screenshots/m7-plugins.png` (Settings › Plugins with the scanned module and a quarantined file). Commands: `cargo test --workspace` (349 passed), `cargo clippy --workspace --all-targets -- -D warnings` (clean), `cargo xtask verify --suite all` (all automated checks PASS incl. E2E-07; PL-03/04/05, HW-01, GUI-01 BLOCKED).
+- Not done: plugin GUI embedding (CLAP `gui` extension on both sides), VST3 export generalisation and hosting, plugin-formatted parameter readouts, spill of very large opaque states to `plugin-state/`, independent third-party plugins/hosts (none on this machine).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -356,6 +376,8 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Known issues / risks
 
+- Plan swaps are not sample-exact for native processors: a recompile with unchanged state migrates synth voices but the first frames after the swap differ from an uninterrupted render (peak diff ≈0.02 on the demo), and native effects restart their delay/reverb buffers (no `migrate_from`). Found while testing hosted plugins (which keep their running instance across swaps). To investigate: snap smoothers and carry effect state in `migrate_from` (M7/M8 polish).
+
 - `TransportView` meter fields are constant 4/4 until the meter map is consulted per block (M3).
 - Pattern-mode scheduling uses the tempo at tick 0 (per spec) but the UI shows only the first tempo point.
 - Channel pan is applied as a stereo balance derived from equal-power gains; stereo width option deferred (M4).
@@ -365,9 +387,8 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M7 in progress (slice 1 done: CLAP export of the synth and every effect family). Next, in order:
-1. M7 slice 2 — `plugin-host` crate: CLAP catalog (standard + user paths, fingerprints), scanner subprocess (`rawdawg --scan-plugin`, 15 s timeout, bounded output, crash/timeout quarantine), safe mode, preferences persistence; tests self-scan the built `librawdawg_clap.so`.
-2. M7 slice 3 — CLAP host processor (clack-host): instantiate from the catalog, audio/note/param/state/latency, sidechain, transport; engine injection for `PluginFormat::Clap`; opaque state in projects; tests compare a CLAP-hosted rawDAWg effect against the native one.
-3. M7 slice 4 — UI: Settings › Plugins (scan, paths, quarantine retry/remove), browser Plugins list, insert/instrument from the catalog, generic parameter editor, missing-plugin relink; E2E-07 headless subset.
-4. M7 slice 5 — plugin GUI embedding where the platform allows (X11/XWayland on WSLg: expect BLOCKED for real hosts), VST3 export generalisation and host; validators remain BLOCKED unless installed.
-5. M8 — packaging, Windows CI, reference benchmarks. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery.
+M7 in progress (slices 1–4 done: CLAP export of every effect family; plugin-host catalog/scanner/quarantine; in-process CLAP bridge with engine injection; app wiring with Settings/browser/mixer, safe mode, crash marker, E2E-07 headless subset). Next, in order:
+1. M7 slice 5 — VST3: generalise `crates/plugin-vst3` to export the synth and every effect family (stable class ids recorded in source, bus arrangements, params/state/latency/tail, process context), `.vst3` bundle layout in `cargo xtask verify`/packaging; VST3 hosting via the `vst3` bindings behind the same `ExternalPlugins`/catalog (scanner `--scan-format vst3`).
+2. M7 slice 6 — plugin GUIs: CLAP `gui` extension on the export side (floating window with the shared egui editor where the platform allows) and host side (embedding/floating for third-party editors, X11/XWayland), dark generic editor fallback stays; plugin-formatted parameter readouts.
+3. M7 gate: validators (PL-03/04) and independent hosts/plugins (PL-05) remain BLOCKED here; record exact versions when run.
+4. M8 — packaging, Windows CI, reference benchmarks. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.

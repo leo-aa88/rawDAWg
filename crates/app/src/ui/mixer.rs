@@ -348,6 +348,22 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
                                 app.editor_view = EditorView::Effect;
                             }
                         }
+                        // hosted effects from the catalog
+                        let hosted: Vec<(rawdawg_plugin_host::PluginDescription, std::path::PathBuf)> =
+                            app.plugin_host.catalog.plugins().filter(|(_, p)| p.is_effect).map(|(l, p)| (p.clone(), l.path.clone())).collect();
+                        for (desc, path) in hosted {
+                            if !needle.is_empty() && !desc.name.to_lowercase().contains(&needle) && !desc.vendor.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            if ui
+                                .button(format!("{} ({})", desc.name, desc.format.label()))
+                                .on_hover_text(format!("{} — {}\n{}", desc.plugin_id, desc.vendor, path.display()))
+                                .clicked()
+                            {
+                                app.mixer.add_open = false;
+                                app.add_catalog_plugin(&desc, &path, id);
+                            }
+                        }
                     });
                     if ui.small_button("Close").clicked() {
                         app.mixer.add_open = false;

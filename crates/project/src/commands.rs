@@ -213,6 +213,12 @@ pub enum Command {
         instance: Instance,
         index: Option<usize>,
     },
+    /// Replace a channel's instrument (native or hosted); the old instance is kept in the
+    /// inverse, references to it (automation, MIDI mappings) are orphaned with undo.
+    SetInstrument {
+        channel_id: ChannelId,
+        instance: Instance,
+    },
     RemoveInsert {
         mixer_id: MixerChannelId,
         instance_id: InstanceId,
@@ -755,6 +761,19 @@ impl Command {
                 m.inserts.insert(idx, instance);
                 Ok(Command::RemoveInsert { mixer_id, instance_id: id })
             }
+            Command::SetInstrument { channel_id, instance } => {
+                if instance.id != p.channel(channel_id).map(|c| c.instrument.id).unwrap_or(instance.id) && p.instance(instance.id).is_some() {
+                    return Err(CommandError::Invalid("instance id already exists".into()));
+                }
+                let c = p.channels.iter_mut().find(|c| c.id == channel_id).ok_or_else(|| unknown("channel", channel_id))?;
+                let old = std::mem::replace(&mut c.instrument, instance);
+                let old_id = old.id;
+                let mut cmds = vec![Command::SetInstrument { channel_id, instance: old }];
+                if old_id != p.channel(channel_id).map(|c| c.instrument.id).unwrap_or(old_id) {
+                    cmds.append(&mut orphan_references(p, old_id));
+                }
+                if cmds.len() == 1 { Ok(cmds.pop().unwrap()) } else { Ok(Command::Batch { commands: cmds }) }
+            }
             Command::RemoveInsert { mixer_id, instance_id } => {
                 let m = p.mixer_channel_mut(mixer_id).ok_or_else(|| unknown("mixer channel", mixer_id))?;
                 let idx = m.inserts.iter().position(|i| i.id == instance_id).ok_or_else(|| unknown("insert", instance_id))?;
@@ -929,6 +948,7 @@ impl Command {
             Command::SetMixerOutput { .. } => "Mixer routing",
             Command::SetMixerSends { .. } => "Sends",
             Command::AddInsert { .. } => "Add effect",
+            Command::SetInstrument { .. } => "Change instrument",
             Command::RemoveInsert { .. } => "Delete effect",
             Command::MoveInsert { .. } => "Move effect",
             Command::SetMasterProtection { .. } => "Master protection",

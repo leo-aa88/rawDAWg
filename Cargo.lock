@@ -5520,6 +5520,7 @@ dependencies = [
  "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-plugin-host",
  "rawdawg-project",
  "rawdawg-sampler",
  "rawdawg-synthesizer",

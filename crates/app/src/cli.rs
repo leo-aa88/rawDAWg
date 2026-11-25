@@ -223,6 +223,7 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
         no_audio: args.no_audio,
         screenshot: args.screenshot.clone().map(|p| (p, std::time::Duration::from_millis(args.screenshot_delay_ms))),
         ui_preset: args.ui_preset.clone(),
+        catalog: args.catalog.clone(),
     })?;
     Ok(0)
 }

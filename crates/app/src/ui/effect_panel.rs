@@ -31,6 +31,9 @@ pub(crate) fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<()
         return Ok(());
     }
     let inst = app.project.instance(instance_id).cloned().ok_or("the effect no longer exists")?;
+    if inst.format != rawdawg_project::PluginFormat::Native {
+        return crate::plugins::ensure_external_mirror(&mut app.plugin_host, &mut app.other_mirrors, &inst);
+    }
     let mut p = rawdawg_audio_engine::plan::make_effect(&inst, &inst.display_name, &app.assets).map_err(|e| e.to_string())?;
     let sr = match &app.audio {
         AudioState::Running(s) => f64::from(s.sample_rate.0),
@@ -56,7 +59,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     let owner = app.project.mixer.channels.iter().find(|m| m.inserts.iter().any(|i| i.id == instance_id)).map(|m| m.name.clone()).unwrap_or_default();
     let mut cmds: Vec<Command> = Vec::new();
     ui.horizontal_wrapped(|ui| {
-        ui.heading(format!("{} — {owner}", info.map(|i| i.name).unwrap_or(type_id.as_str())));
+        let shown = info.map(|i| i.name).unwrap_or(if inst.display_name.is_empty() { type_id.as_str() } else { inst.display_name.as_str() });
+        ui.heading(format!("{shown} — {owner}"));
+        if inst.format != rawdawg_project::PluginFormat::Native {
+            ui.label(egui::RichText::new(format!("{:?} · {} {}", inst.format, inst.vendor, inst.version)).color(theme::TEXT_SECONDARY).small());
+        }
         let mut on = !inst.bypass;
         let on_label = if on { "On" } else { "Bypassed" };
         if ui.toggle_value(&mut on, on_label).changed() {

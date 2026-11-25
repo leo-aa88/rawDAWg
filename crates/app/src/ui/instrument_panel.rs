@@ -16,7 +16,13 @@ pub(crate) struct InstrumentPanelState {
 
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     let Some(channel) = app.project.channels.iter().find(|c| c.instrument.id == instance_id).cloned() else { return };
-    if !app.other_mirrors.contains_key(&instance_id) {
+    if channel.instrument.format != rawdawg_project::PluginFormat::Native {
+        if let Err(e) = crate::plugins::ensure_external_mirror(&mut app.plugin_host, &mut app.other_mirrors, &channel.instrument) {
+            ui.label(egui::RichText::new(format!("{} is not available: {e}", channel.instrument.display_name)).color(theme::WARNING));
+            ui.label(egui::RichText::new("The channel stays silent; its plugin state is preserved in the project.").color(theme::TEXT_SECONDARY));
+            return;
+        }
+    } else if !app.other_mirrors.contains_key(&instance_id) {
         match rawdawg_audio_engine::plan::make_instrument(&channel.instrument, &channel.name, &app.assets) {
             Ok((p, _)) => {
                 app.other_mirrors.insert(instance_id, p);
@@ -31,6 +37,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     let title = match type_id.as_str() {
         rawdawg_types::ids::native_types::SAMPLER => rawdawg_sampler::SAMPLER_DISPLAY_NAME,
         rawdawg_types::ids::native_types::SF2 => rawdawg_sampler::SF2_DISPLAY_NAME,
+        _ if channel.instrument.format != rawdawg_project::PluginFormat::Native && !channel.instrument.display_name.is_empty() => channel.instrument.display_name.as_str(),
         _ => "Instrument",
     };
     ui.horizontal(|ui| {

@@ -25,7 +25,6 @@ use crate::audio::AudioSystem;
 use crate::prefs::Preferences;
 use crate::theme;
 use rawdawg_audio_engine::commands::{EngineCommand, TransportMode};
-use rawdawg_audio_engine::plan::compile;
 use rawdawg_audio_io::stream::StreamConfigRequest;
 use rawdawg_audio_io::{DeviceSnapshot, enumerate};
 use rawdawg_dsp::processor::Processor;
@@ -48,6 +47,8 @@ pub struct GuiOptions {
     pub screenshot: Option<(PathBuf, std::time::Duration)>,
     /// Initial UI state preset (`advanced`, `graph`).
     pub ui_preset: Option<String>,
+    /// Plugin catalog file override (tests, portable setups).
+    pub catalog: Option<PathBuf>,
 }
 
 pub fn run_gui(opts: GuiOptions) -> anyhow::Result<()> {
@@ -173,6 +174,9 @@ pub(crate) struct App {
     pub assets: rawdawg_audio_engine::ProjectAssetCache,
     /// Main-thread mirrors for non-synth native instruments.
     pub other_mirrors: HashMap<rawdawg_types::InstanceId, Box<dyn rawdawg_dsp::processor::Processor>>,
+    /// Third-party plugin catalog, loaded modules and scan state.
+    pub plugin_host: crate::plugins::PluginHost,
+    plugin_refresh_counter: u32,
     pub instrument_panel: instrument_panel::InstrumentPanelState,
     pub import_path: String,
     pub synth_panel: synth_panel::SynthPanelState,
@@ -272,6 +276,8 @@ impl App {
             table_senders: HashMap::new(),
             assets: rawdawg_audio_engine::ProjectAssetCache::new(None),
             other_mirrors: HashMap::new(),
+            plugin_host: crate::plugins::PluginHost::load(opts.safe_mode, persist_prefs, opts.catalog.clone()),
+            plugin_refresh_counter: 0,
             instrument_panel: Default::default(),
             import_path: String::new(),
             synth_panel: Default::default(),
@@ -343,6 +349,13 @@ impl App {
                 app.show_settings = true;
                 app.prefs.input_enabled = true;
             }
+            Some("plugins") => {
+                // Settings › Plugins with the browser filtered to the catalog (screenshot aid)
+                app.show_settings = true;
+                app.browser_search = "rawDAWg".into();
+                app.editor_view = EditorView::Mixer;
+                app.mixer.add_open = true;
+            }
             Some("export") => {
                 app.export.open = true;
                 app.export.stems = true;
@@ -378,7 +391,9 @@ impl App {
         // assets must resolve even when no audio device is open (editing/offline mode)
         self.assets.sync(self.project_path.clone(), &self.project);
         self.synth_mirrors.clear();
-        self.other_mirrors.clear();
+        // hosted plugin instances stay alive while their project instance exists
+        let project = &self.project;
+        self.other_mirrors.retain(|id, p| rawdawg_dsp::processor::Processor::type_id(p.as_ref()).starts_with("clap:") && project.instance(*id).is_some());
         for c in &self.project.channels {
             if c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH {
                 let mut s = Synth::default();
@@ -401,7 +416,32 @@ impl App {
         project.sample_rate_hz = sys.sample_rate;
         self.plan_revision += 1;
         self.assets.sync(self.project_path.clone(), &self.project);
-        match compile(&project, self.plan_revision, rawdawg_audio_io::stream::MAX_CHUNK_FRAMES, &self.limits, &self.live_fingerprints, &self.assets) {
+        // retired plans are dropped here (off RT): hosted plugins hand their audio halves back
+        sys.handle.collect_retired();
+        for m in self.other_mirrors.values_mut() {
+            if let Some(live) = m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>() {
+                live.collect_returns();
+            }
+        }
+        let mut externals = crate::plugins::AppExternals {
+            host: &mut self.plugin_host,
+            mirrors: &mut self.other_mirrors,
+            live_fingerprints: &self.live_fingerprints,
+            unavailable: Vec::new(),
+            live_ids: Vec::new(),
+        };
+        let compiled = rawdawg_audio_engine::compile_with(
+            &project,
+            self.plan_revision,
+            rawdawg_audio_io::stream::MAX_CHUNK_FRAMES,
+            &self.limits,
+            &self.live_fingerprints,
+            &self.assets,
+            &mut externals,
+        );
+        let unavailable = std::mem::take(&mut externals.unavailable);
+        let live_ids = std::mem::take(&mut externals.live_ids);
+        match compiled {
             Ok(out) => {
                 sys.handle.collect_retired();
                 match sys.handle.publish_plan(out.plan) {
@@ -410,8 +450,10 @@ impl App {
                         // the old worker stops when replaced; the retired plan's streams go with it
                         self.stream_worker = out.stream_worker;
                         if !out.missing_plugins.is_empty() {
-                            self.status_line = format!("{} plugin(s) not available (state preserved): {}", out.missing_plugins.len(), out.missing_plugins.join("; "));
+                            let why = if unavailable.is_empty() { out.missing_plugins.join("; ") } else { unavailable.join("; ") };
+                            self.status_line = format!("{} plugin(s) not available (state preserved): {why}", out.missing_plugins.len());
                         }
+                        self.plugin_host.mark_live(live_ids);
                         self.live_fingerprints = out.fingerprints;
                         self.slots = out.slots;
                         for (id, sender) in out.table_senders {
@@ -455,7 +497,7 @@ impl App {
                 self.recompile();
                 if !matches!(self.audio, AudioState::Running(_)) {
                     // no plan is compiled without a device: report stand-ins from the model instead
-                    let missing = missing_plugin_notes(&self.project);
+                    let missing = missing_plugin_notes(&self.project, &self.plugin_host);
                     if !missing.is_empty() {
                         self.status_line = format!("{} plugin(s) not available (state preserved): {}", missing.len(), missing.join("; "));
                     }
@@ -1092,6 +1134,32 @@ impl App {
                 });
             }
         });
+        egui::CollapsingHeader::new("Plugins").show(ui, |ui| {
+            let count = self.plugin_host.catalog.plugins().count();
+            if count == 0 {
+                ui.label(egui::RichText::new("No third-party plugins in the catalog yet — scan in Settings › Plugins").color(theme::TEXT_SECONDARY).small());
+            } else {
+                ui.label(
+                    egui::RichText::new("Effects go to the selected mixer channel; instruments replace the selected channel's instrument").color(theme::TEXT_SECONDARY).small(),
+                );
+            }
+            if self.plugin_host.safe_mode {
+                ui.label(egui::RichText::new("Safe mode: plugins are listed but not loaded").color(theme::WARNING).small());
+            }
+            let target = self.mixer.selected.unwrap_or(self.project.mixer.master_id);
+            let rows: Vec<(rawdawg_plugin_host::PluginDescription, PathBuf)> = self.plugin_host.catalog.plugins().map(|(l, p)| (p.clone(), l.path.clone())).collect();
+            for (desc, path) in rows {
+                if !browser_matches(&needle, &[&desc.name, &desc.vendor, &desc.plugin_id]) {
+                    continue;
+                }
+                let kind = if desc.is_instrument && !desc.is_effect { "instrument" } else { "effect" };
+                let label = format!("{} ({} {kind})", desc.name, desc.format.label());
+                let hover = format!("{} — {} {}\n{}\n{}", desc.plugin_id, desc.vendor, desc.version, desc.description, path.display());
+                if ui.button(label).on_hover_text(hover).clicked() {
+                    self.add_catalog_plugin(&desc, &path, target);
+                }
+            }
+        });
         egui::CollapsingHeader::new("Samples & SoundFonts").default_open(true).show(ui, |ui| {
             // project audio assets: click to arm for the playlist, "+ channel" for a sampler
             let audio: Vec<(rawdawg_types::AssetId, String)> =
@@ -1484,6 +1552,11 @@ impl eframe::App for App {
             let _ = self.prefs.save();
         }
     }
+
+    fn on_exit(&mut self) {
+        // clean shutdown: the next start must not offer safe mode because of us
+        self.plugin_host.clear_marker();
+    }
 }
 
 impl App {
@@ -1494,6 +1567,7 @@ impl App {
             self.save_project_checked();
         }
         self.poll_project_files(ctx);
+        self.poll_plugins();
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();
@@ -1676,20 +1750,71 @@ impl App {
 }
 
 /// Third-party instances the project references (no host yet): shown as preserved stand-ins.
-pub(crate) fn missing_plugin_notes(project: &Project) -> Vec<String> {
-    let label = |i: &rawdawg_project::Instance, owner: &str| {
-        format!("{owner}: {} ({:?}) is not available — its state is preserved", if i.display_name.is_empty() { i.type_id.as_str() } else { i.display_name.as_str() }, i.format)
+pub(crate) fn missing_plugin_notes(project: &Project, host: &crate::plugins::PluginHost) -> Vec<String> {
+    let label = |i: &rawdawg_project::Instance, owner: &str, reason: &str| {
+        format!(
+            "{owner}: {} ({:?}) is not available — {reason}; its state is preserved",
+            if i.display_name.is_empty() { i.type_id.as_str() } else { i.display_name.as_str() },
+            i.format
+        )
     };
     let mut out = Vec::new();
     for c in &project.channels {
-        if c.instrument.format != rawdawg_project::PluginFormat::Native {
-            out.push(label(&c.instrument, &c.name));
+        if let Some(reason) = host.unavailable_reason(&c.instrument) {
+            out.push(label(&c.instrument, &c.name, &reason));
         }
     }
     for m in &project.mixer.channels {
-        for i in m.inserts.iter().filter(|i| i.format != rawdawg_project::PluginFormat::Native) {
-            out.push(label(i, &m.name));
+        for i in &m.inserts {
+            if let Some(reason) = host.unavailable_reason(i) {
+                out.push(label(i, &m.name, &reason));
+            }
         }
     }
     out
+}
+
+impl App {
+    /// Scan progress, hosted-mirror value refresh and crash-marker housekeeping (UI rate).
+    pub(crate) fn poll_plugins(&mut self) {
+        if self.plugin_host.poll() {
+            let r = self.plugin_host.last_report.clone().unwrap_or_default();
+            self.status_line =
+                format!("Plugin scan: {} found, {} scanned, {} quarantined, {} unchanged", self.plugin_host.catalog.plugins().count(), r.scanned, r.quarantined, r.unchanged);
+            // instances that were stand-ins may be hostable now
+            self.recompile();
+        }
+        self.plugin_refresh_counter = self.plugin_refresh_counter.wrapping_add(1);
+        if self.plugin_refresh_counter.is_multiple_of(6) {
+            for m in self.other_mirrors.values_mut() {
+                if let Some(live) = m.as_any_mut().downcast_mut::<rawdawg_plugin_host::ClapInstance>() {
+                    live.collect_returns();
+                    live.refresh_values();
+                }
+            }
+        }
+    }
+
+    /// Add a catalog plugin to the project: effects become inserts on `mixer_target`,
+    /// instruments replace the selected channel's instrument.
+    pub(crate) fn add_catalog_plugin(&mut self, desc: &rawdawg_plugin_host::PluginDescription, module_path: &std::path::Path, mixer_target: rawdawg_types::MixerChannelId) {
+        let format = match desc.format {
+            rawdawg_plugin_host::Format::Clap => rawdawg_project::PluginFormat::Clap,
+            rawdawg_plugin_host::Format::Vst3 => rawdawg_project::PluginFormat::Vst3,
+        };
+        let inst = rawdawg_project::Instance::external(format, &desc.plugin_id, &desc.name, &desc.vendor, &desc.version, Some(module_path.display().to_string()));
+        let iid = inst.id;
+        if desc.is_instrument && !desc.is_effect {
+            let Some(channel_id) = self.selected_channel else {
+                self.status_line = "Select a channel to give it this instrument".to_owned();
+                return;
+            };
+            self.apply(Command::SetInstrument { channel_id, instance: inst });
+            self.editor_view = EditorView::Synth;
+        } else {
+            self.apply(Command::AddInsert { mixer_id: mixer_target, instance: inst, index: None });
+            self.effect_editor = Some(iid);
+            self.editor_view = EditorView::Effect;
+        }
+    }
 }

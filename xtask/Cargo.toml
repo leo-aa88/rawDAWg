@@ -16,6 +16,7 @@ rawdawg-effects = { path = "../crates/effects" }
 rawdawg-sampler = { path = "../crates/sampler" }
 rawdawg-project = { path = "../crates/project" }
 rawdawg-audio-engine = { path = "../crates/audio-engine" }
+rawdawg-plugin-host = { path = "../crates/plugin-host" }
 rawdawg-audio-io = { path = "../crates/audio-io" }
 anyhow = { workspace = true }
 clap = { workspace = true }

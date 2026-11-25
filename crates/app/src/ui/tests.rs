@@ -29,6 +29,7 @@ impl Harness {
             no_audio: true,
             screenshot: None,
             ui_preset: ui_preset.map(str::to_owned),
+            catalog: None,
         };
         let app = App::build(&ctx, opts, Preferences::default(), false);
         let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX };
@@ -670,4 +671,110 @@ fn missing_plugins_are_reported_without_blocking_and_the_help_window_draws() {
     // undo removes the stand-in insert again
     h.key(egui::Key::Z, egui::Modifiers::CTRL);
     assert!(h.app.project.mixer_channel(master).unwrap().inserts.is_empty());
+}
+
+/// Build (cached) and describe rawDAWg's own CLAP module so tests have a real catalog entry.
+fn hosted_catalog() -> rawdawg_plugin_host::ScannedLibrary {
+    let status = std::process::Command::new(env!("CARGO")).args(["build", "-q", "-p", "rawdawg-plugin-clap"]).status().expect("cargo build");
+    assert!(status.success());
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe.parent().unwrap().parent().unwrap();
+    let name = if cfg!(target_os = "windows") { "rawdawg_clap.dll" } else { "librawdawg_clap.so" };
+    // SAFETY: our own freshly built module.
+    unsafe { rawdawg_plugin_host::describe::describe_clap_library(&dir.join(name)) }.expect("describe")
+}
+
+#[test]
+fn hosted_plugins_are_added_from_the_catalog_edited_through_mirrors_and_shown_in_settings() {
+    use rawdawg_plugin_host::catalog::{Fingerprint, QuarantineReason, QuarantineRecord, now_unix};
+    let mut h = Harness::new(None);
+    assert!(h.app.plugin_host.catalog_path.is_none(), "headless tests never touch the user's catalog");
+    let lib = hosted_catalog();
+    let module_path = lib.path.clone();
+    h.app.plugin_host.catalog.insert_library(lib);
+    assert_eq!(h.app.plugin_host.catalog.plugins().count(), 17);
+
+    // browser lists catalog plugins and the search filters them
+    h.app.browser_search = "rawdawg.fx.rev".into();
+    h.frame(vec![]);
+    // an effect from the catalog becomes an external insert on the master
+    let master = h.app.project.mixer.master_id;
+    let (reverb, _) = h.app.plugin_host.catalog.find(rawdawg_plugin_host::Format::Clap, "rawdawg.fx.reverb", None).map(|(l, p)| (p.clone(), l.path.clone())).unwrap();
+    h.app.add_catalog_plugin(&reverb, &module_path, master);
+    let inserts = h.app.project.mixer_channel(master).unwrap().inserts.clone();
+    assert_eq!(inserts.len(), 1);
+    let ext = &inserts[0];
+    assert_eq!(ext.format, rawdawg_project::PluginFormat::Clap);
+    assert_eq!(ext.type_id.as_str(), "rawdawg.fx.reverb");
+    assert_eq!(ext.display_name, "rawDAWg Reverb");
+    assert_eq!(ext.path_hint.as_deref(), Some(module_path.display().to_string().as_str()));
+    assert!(!h.app.status_line.contains("not available"), "{}", h.app.status_line);
+    assert_eq!(h.app.editor_view, EditorView::Effect);
+    assert_eq!(h.app.effect_editor, Some(ext.id));
+    // the effect panel creates the live main-thread instance as the mirror and draws its parameters
+    h.frame(vec![]);
+    let mirror = h.app.other_mirrors.get_mut(&ext.id).expect("hosted mirror");
+    assert_eq!(rawdawg_dsp::processor::Processor::type_id(mirror.as_ref()), "clap:rawdawg.fx.reverb");
+    let descs = mirror.descriptors();
+    assert!(descs.len() > 5, "{}", descs.len());
+    let bypass = descs.iter().find(|d| d.flags.is_bypass).expect("wrapper bypass exposed");
+    let first = descs.iter().find(|d| !d.flags.is_bypass && !d.flags.stepped).expect("a continuous parameter");
+    // committing a state from the mirror stores the base64 envelope in the project
+    assert!(mirror.set_param(first.id, 0.33));
+    let state: serde_json::Value = serde_json::from_slice(&mirror.save_state()).unwrap();
+    assert_eq!(state["format"], "clap");
+    assert!(state[rawdawg_plugin_host::clap::STATE_KEY].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(mirror.param(bypass.id), Some(0.0));
+    h.app.apply(rawdawg_project::Command::SetInstanceState { instance_id: ext.id, state_version: 1, state: state.clone() });
+    assert_eq!(h.app.project.instance(ext.id).unwrap().state, state);
+    // the mirror survives model edits (it is the live plugin instance)
+    h.app.rebuild_mirrors();
+    assert!(h.app.other_mirrors.contains_key(&ext.id));
+
+    // an instrument from the catalog replaces the selected channel's instrument, with undo
+    let channel = h.app.project.channels[0].id;
+    let old_instrument = h.app.project.channels[0].instrument.clone();
+    h.app.selected_channel = Some(channel);
+    let synth = h.app.plugin_host.catalog.find(rawdawg_plugin_host::Format::Clap, "rawdawg.synth", None).map(|(_, p)| p.clone()).unwrap();
+    h.app.add_catalog_plugin(&synth, &module_path, master);
+    let now = h.app.project.channels[0].instrument.clone();
+    assert_eq!(now.format, rawdawg_project::PluginFormat::Clap);
+    assert_eq!(now.type_id.as_str(), "rawdawg.synth");
+    h.frame(vec![]); // instrument panel draws the hosted instrument
+    assert!(h.app.other_mirrors.get(&now.id).is_some_and(|m| rawdawg_dsp::processor::Processor::type_id(m.as_ref()) == "clap:rawdawg.synth"));
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.channels[0].instrument, old_instrument, "undo restores the native instrument");
+
+    // settings: quarantine entries are listed and retry clears the record; the window draws
+    h.app.plugin_host.catalog.insert_quarantine(QuarantineRecord {
+        path: PathBuf::from("/tmp/broken.clap"),
+        fingerprint: Some(Fingerprint { size: 1, mtime_unix: 1 }),
+        reason: QuarantineReason::Timeout { secs: 15 },
+        at_unix: now_unix(),
+    });
+    h.app.show_settings = true;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.app.plugin_host.catalog.clear_quarantine(std::path::Path::new("/tmp/broken.clap")));
+    assert!(h.app.plugin_host.catalog.quarantine.is_empty());
+
+    // a catalog plugin that is not hostable (unknown id) stays a stand-in with a reason
+    let mut unknown = rawdawg_project::Instance::external(rawdawg_project::PluginFormat::Clap, "com.example.missing", "Missing FX", "Nobody", "1.0", None);
+    unknown.state = serde_json::json!({ "format": "clap", "plugin_id": "com.example.missing", "clap_state_b64": "AAAA" });
+    let saved_state = unknown.state.clone();
+    let uid = unknown.id;
+    h.app.apply(rawdawg_project::Command::AddInsert { mixer_id: master, instance: unknown, index: None });
+    assert!(h.app.status_line.contains("not available") && h.app.status_line.contains("catalog"), "{}", h.app.status_line);
+    assert_eq!(h.app.project.instance(uid).unwrap().state, saved_state, "opaque state untouched");
+    h.app.effect_editor = Some(uid);
+    h.frame(vec![]);
+    assert!(!h.app.other_mirrors.contains_key(&uid), "no mirror for an unavailable plugin");
+
+    // safe mode: catalog plugins are never loaded
+    h.app.plugin_host.safe_mode = true;
+    h.app.other_mirrors.clear();
+    h.app.effect_editor = Some(ext.id);
+    h.frame(vec![]);
+    assert!(!h.app.other_mirrors.contains_key(&ext.id));
+    assert!(h.app.plugin_host.unavailable_reason(h.app.project.instance(ext.id).unwrap()).is_some_and(|r| r.contains("safe mode")));
 }
