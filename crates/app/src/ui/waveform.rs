@@ -42,6 +42,12 @@ struct Stroke {
     dirty: bool,
 }
 
+impl WaveformState {
+    pub(crate) fn builder_mut(&mut self) -> &mut TableBuilder {
+        &mut self.builder
+    }
+}
+
 impl Default for WaveformState {
     fn default() -> Self {
         Self {

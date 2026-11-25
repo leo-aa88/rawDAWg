@@ -659,6 +659,79 @@ pub struct Patch {
     pub lfos: Vec<Lfo>,
     #[serde(default)]
     pub mod_routes: Vec<ModRoute>,
+    /// Randomization provenance and locks (persisted with the sound).
+    #[serde(default)]
+    pub mutation: MutationInfo,
+}
+
+/// Randomization bookkeeping stored in the patch (PROJECT_FORMAT.md §4).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct MutationInfo {
+    pub algorithm_version: u32,
+    pub seed: u64,
+    /// Chaos 0..100 used for the last mutation.
+    pub chaos: f32,
+    #[serde(default)]
+    pub locks: Locks,
+}
+
+impl Default for MutationInfo {
+    fn default() -> Self {
+        Self { algorithm_version: crate::mutate::ALGORITHM_VERSION, seed: 0, chaos: 35.0, locks: Locks::default() }
+    }
+}
+
+/// What randomization must not touch.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Locks {
+    /// Locked semantic categories (see `ParamCategory`); stored as stable strings.
+    pub categories: Vec<String>,
+    /// Locked individual parameter ids.
+    pub params: Vec<u32>,
+}
+
+impl Default for Locks {
+    fn default() -> Self {
+        // DSP.md §4: master output safety, tuning/root pitch and routing locked by default.
+        Self { categories: vec!["safety".into(), "routing".into(), "pitch".into()], params: vec![] }
+    }
+}
+
+impl Locks {
+    pub fn category_key(c: rawdawg_types::params::ParamCategory) -> &'static str {
+        use rawdawg_types::params::ParamCategory::*;
+        match c {
+            Wave => "wave",
+            Pitch => "pitch",
+            Envelope => "envelope",
+            Filter => "filter",
+            Modulation => "modulation",
+            Effects => "effects",
+            Topology => "topology",
+            Mix => "mix",
+            Safety => "safety",
+            Routing => "routing",
+        }
+    }
+    pub fn is_category_locked(&self, c: rawdawg_types::params::ParamCategory) -> bool {
+        self.categories.iter().any(|k| k == Self::category_key(c))
+    }
+    pub fn is_param_locked(&self, d: &rawdawg_types::ParamDescriptor) -> bool {
+        self.params.contains(&d.id.0) || self.is_category_locked(d.category)
+    }
+    pub fn set_category(&mut self, c: rawdawg_types::params::ParamCategory, locked: bool) {
+        let k = Self::category_key(c);
+        self.categories.retain(|x| x != k);
+        if locked {
+            self.categories.push(k.to_owned());
+        }
+    }
+    pub fn set_param(&mut self, id: u32, locked: bool) {
+        self.params.retain(|x| *x != id);
+        if locked {
+            self.params.push(id);
+        }
+    }
 }
 
 fn default_lfos() -> Vec<Lfo> {
@@ -682,6 +755,7 @@ impl Default for Patch {
             velocity_sensitivity: 0.7,
             lfos: default_lfos(),
             mod_routes: vec![],
+            mutation: MutationInfo::default(),
         }
     }
 }
@@ -728,6 +802,9 @@ impl Patch {
         }
         if self.mod_routes.len() > MAX_MOD_ROUTES || self.mod_routes.iter().any(|r| !r.is_valid()) {
             return Err(format!("at most {MAX_MOD_ROUTES} valid modulation routes"));
+        }
+        if !self.mutation.chaos.is_finite() || !(0.0..=100.0).contains(&self.mutation.chaos) {
+            return Err("chaos out of range".into());
         }
         let osc_budget: u32 = self.layers.iter().filter(|l| l.enabled).map(|l| u32::from(l.unison)).sum::<u32>() * self.max_voices;
         if osc_budget > rawdawg_types::limits::EngineLimits::DEFAULT.max_voice_oscillators * 4 {

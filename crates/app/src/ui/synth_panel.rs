@@ -13,12 +13,24 @@ use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
 use rawdawg_types::params::ParamMapping;
 use rawdawg_types::{InstanceId, ParamDescriptor, ParamId};
 
-#[derive(Default)]
 pub(crate) struct SynthPanelState {
     /// Instance whose parameter gesture is in progress, with the pre-gesture state.
     gesture: Option<(InstanceId, Vec<u8>)>,
     pub advanced: bool,
     pub waveform: super::waveform::WaveformState,
+    pub evolve: super::evolve::EvolveState,
+}
+
+impl Default for SynthPanelState {
+    fn default() -> Self {
+        Self { gesture: None, advanced: false, waveform: Default::default(), evolve: super::evolve::EvolveState::new() }
+    }
+}
+
+impl SynthPanelState {
+    pub(crate) fn waveform_builder(&mut self) -> &mut rawdawg_dsp::wavetable::TableBuilder {
+        self.waveform.builder_mut()
+    }
 }
 
 const SIMPLE: &[u32] = &[params::AMP_ATTACK, params::AMP_RELEASE, params::FILTER_CUTOFF, params::FILTER_RESONANCE, params::MASTER_GAIN, params::VOICE_MODE];
@@ -43,7 +55,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     super::waveform::show(app, ui, instance_id);
-    ui.label(egui::RichText::new("Randomize, Evolve and XY Morph arrive later in M2.").color(theme::TEXT_SECONDARY));
+    super::evolve::randomize_bar(app, ui, instance_id);
     ui.separator();
     let descriptors: &'static [ParamDescriptor] = &rawdawg_synthesizer::params::DESCRIPTORS;
     let mut edits: Vec<(ParamId, f32, bool, bool)> = Vec::new();
@@ -210,10 +222,25 @@ fn param_grid(
                 }
                 _ => ui.add(egui::Slider::new(&mut n, 0.0..=1.0).show_value(false)),
             };
+            let resp = resp
+                .context_menu(|ui| {
+                    let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
+                    if ui.button(if locked { "Unlock for randomize" } else { "Lock for randomize" }).clicked() {
+                        app.synth_panel.evolve.locks.set_param(d.id.0, !locked);
+                        ui.close();
+                    }
+                    if ui.button("Reset to default").clicked() {
+                        edits.push((d.id, d.default_normalized, true, true));
+                        ui.close();
+                    }
+                })
+                .map(|r| r.response)
+                .unwrap_or(resp);
             if labeled.is_some() {
                 ui.label("");
             } else {
-                ui.label(egui::RichText::new(d.format(n)).monospace().color(theme::TEXT_SECONDARY));
+                let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
+                ui.label(egui::RichText::new(format!("{}{}", d.format(n), if locked { " 🔒" } else { "" })).monospace().color(theme::TEXT_SECONDARY));
             }
             ui.end_row();
             if resp.changed() && (n - current).abs() > 1e-7 {

@@ -1,6 +1,7 @@
 //! GUI shell (M1): dark workspace skeleton, transport, typing/MIDI/on-screen
 //! keyboards, synth parameter panel, settings, status.
 
+mod evolve;
 mod keyboard;
 mod settings;
 mod synth_panel;

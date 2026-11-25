@@ -330,7 +330,7 @@ macro_rules! gen_block {
                 ParamUnit::Ratio,
                 ParamMapping::Log { min: 0.25, max: 16.0 },
                 0.5,
-                ParamCategory::Pitch,
+                ParamCategory::Wave,
             ),
             ParamDescriptor::continuous(
                 GEN_BASE + $l * GEN_STRIDE + G_FM_RATIO3,
@@ -339,7 +339,7 @@ macro_rules! gen_block {
                 ParamUnit::Ratio,
                 ParamMapping::Log { min: 0.25, max: 16.0 },
                 1.0 / 3.0,
-                ParamCategory::Pitch,
+                ParamCategory::Wave,
             ),
             ParamDescriptor::continuous(
                 GEN_BASE + $l * GEN_STRIDE + G_FM_RATIO4,
@@ -348,7 +348,7 @@ macro_rules! gen_block {
                 ParamUnit::Ratio,
                 ParamMapping::Log { min: 0.25, max: 16.0 },
                 1.0 / 3.0,
-                ParamCategory::Pitch,
+                ParamCategory::Wave,
             ),
             ParamDescriptor::continuous(
                 GEN_BASE + $l * GEN_STRIDE + G_FM_LEVEL1,
