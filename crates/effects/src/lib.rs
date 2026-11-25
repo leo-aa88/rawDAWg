@@ -9,10 +9,12 @@ pub mod delay;
 pub mod distortion;
 pub mod dynamics;
 pub mod eq;
+pub mod granular;
 pub mod modulation;
 pub mod oversample;
 pub mod pitch;
 pub mod reverb;
+pub mod spectral;
 pub mod stereo;
 pub mod testfx;
 
@@ -37,7 +39,7 @@ const fn entry(type_id: &'static str, name: &'static str, family: &'static str, 
 }
 
 /// Every effect the menus offer. [`make_effect`] must accept each entry (tested).
-pub static CATALOG: [EffectInfo; 15] = [
+pub static CATALOG: [EffectInfo; 17] = [
     entry(eq::TYPE_ID, eq::DISPLAY_NAME, "EQ", "8-band parametric equalizer with draggable bands and a response plot", false),
     entry(dynamics::compressor::TYPE_ID, dynamics::compressor::DISPLAY_NAME, "Dynamics", "RMS/peak compressor with sidechain input, knee and gain-reduction meter", true),
     entry(dynamics::limiter::TYPE_ID, dynamics::limiter::DISPLAY_NAME, "Dynamics", "True-peak lookahead limiter with ceiling, release and dBTP meter", false),
@@ -49,6 +51,8 @@ pub static CATALOG: [EffectInfo; 15] = [
     entry(modulation::flanger::TYPE_ID, modulation::flanger::DISPLAY_NAME, "Modulation", "Short modulated comb with bounded positive or negative feedback", true),
     entry(modulation::phaser::TYPE_ID, modulation::phaser::DISPLAY_NAME, "Modulation", "2 to 12 all-pass stages swept around a centre frequency with feedback", true),
     entry(pitch::TYPE_ID, pitch::DISPLAY_NAME, "Pitch", "Phase-vocoder pitch shift with cepstral formant shifting and formant preservation", true),
+    entry(granular::TYPE_ID, granular::DISPLAY_NAME, "Granular", "Grains cut from the last two seconds: size, density, position, jitter, pitch, reverse, freeze", true),
+    entry(spectral::TYPE_ID, spectral::DISPLAY_NAME, "Spectral", "STFT freeze, blur, gate, tilt, frequency shift and robotise", true),
     entry(reverb::TYPE_ID, reverb::DISPLAY_NAME, "Reverb", "Room, hall, cathedral, plate, spring and shimmer with a decay-shape editor", true),
     entry(convolution::TYPE_ID, convolution::DISPLAY_NAME, "Reverb", "Partitioned convolution with impulse responses from the project's samples", true),
     entry(stereo::TYPE_ID, stereo::DISPLAY_NAME, "Stereo", "Gain, pan, balance, width, mono and phase with a correlation meter", false),
@@ -68,6 +72,8 @@ pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Proces
         modulation::flanger::TYPE_ID => Box::new(modulation::flanger::Flanger::new()),
         modulation::phaser::TYPE_ID => Box::new(modulation::phaser::Phaser::new()),
         pitch::TYPE_ID => Box::new(pitch::PitchShift::new()),
+        granular::TYPE_ID => Box::new(granular::Granular::new()),
+        spectral::TYPE_ID => Box::new(spectral::Spectral::new()),
         reverb::TYPE_ID => Box::new(reverb::Reverb::new()),
         distortion::single::TYPE_ID => Box::new(distortion::single::Distortion::new()),
         distortion::multiband::TYPE_ID => Box::new(distortion::multiband::Multiband::new()),
@@ -96,6 +102,8 @@ pub fn presets(type_id: &str) -> &'static [Preset] {
         modulation::flanger::TYPE_ID => &modulation::flanger::PRESETS,
         modulation::phaser::TYPE_ID => &modulation::phaser::PRESETS,
         pitch::TYPE_ID => &pitch::PRESETS,
+        granular::TYPE_ID => &granular::PRESETS,
+        spectral::TYPE_ID => &spectral::PRESETS,
         reverb::TYPE_ID => &reverb::PRESETS,
         distortion::single::TYPE_ID => &distortion::single::PRESETS,
         distortion::multiband::TYPE_ID => &distortion::multiband::PRESETS,

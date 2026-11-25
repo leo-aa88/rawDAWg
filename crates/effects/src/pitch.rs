@@ -6,6 +6,7 @@
 
 use crate::common::{Params, Preset, mix_wet};
 use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail};
+use rawdawg_dsp::stft::{Stft, interp, princarg};
 use rawdawg_types::events::EventKind;
 use rawdawg_types::params::{ParamCategory, ParamMapping, ParamUnit};
 use rawdawg_types::{ParamDescriptor, ParamId};
@@ -49,14 +50,15 @@ pub static PRESETS: [Preset; 7] = [
     Preset { name: "Up a third, same voice", description: "+4 semitones keeping the formants", values: &[("pitch", 4.0), ("preserve", 1.0)] },
 ];
 
-/// One channel of the STFT engine (all buffers fixed at prepare time).
+/// One channel: the STFT engine plus the vocoder state its frames are processed with
+/// (kept as separate fields so both can be borrowed at once without any copy).
 struct Channel {
-    ibuf: Vec<f32>,
-    obuf: Vec<f32>,
-    t: usize,
-    counter: usize,
-    frame: Vec<f32>,
-    spec: Vec<Complex<f32>>,
+    stft: Stft,
+    voc: VocState,
+}
+
+/// Per-channel vocoder state (all buffers fixed at prepare time).
+struct VocState {
     last_phase: Vec<f32>,
     phase_acc: Vec<f32>,
     mag: Vec<f32>,
@@ -70,13 +72,11 @@ struct Channel {
 }
 
 fn channel() -> Channel {
-    Channel {
-        ibuf: vec![0.0; FRAME],
-        obuf: vec![0.0; 2 * FRAME],
-        t: 0,
-        counter: 0,
-        frame: vec![0.0; FRAME],
-        spec: vec![Complex::new(0.0, 0.0); BINS],
+    Channel { stft: Stft::new(FRAME, HOP), voc: voc_state() }
+}
+
+fn voc_state() -> VocState {
+    VocState {
         last_phase: vec![0.0; BINS],
         phase_acc: vec![0.0; BINS],
         mag: vec![0.0; BINS],
@@ -90,66 +90,32 @@ fn channel() -> Channel {
     }
 }
 
-struct Vocoder {
+/// Cepstral envelope helper (its own FFT pair over the log magnitude).
+struct Cepstrum {
     fft: Arc<dyn RealToComplex<f32>>,
     ifft: Arc<dyn ComplexToReal<f32>>,
     scratch_f: Vec<Complex<f32>>,
     scratch_i: Vec<Complex<f32>>,
-    window: Vec<f32>,
     lifter: usize,
-    ch: [Channel; 2],
 }
 
-/// Wrap a phase difference into (-π, π].
-#[inline]
-fn princarg(x: f32) -> f32 {
-    let mut q = (x / std::f32::consts::PI) as i64;
-    if q >= 0 {
-        q += q & 1;
-    } else {
-        q -= q & 1;
-    }
-    x - std::f32::consts::PI * q as f32
-}
-
-#[inline]
-fn interp(v: &[f32], pos: f32) -> f32 {
-    let i = (pos.max(0.0).floor() as usize).min(v.len() - 1);
-    let f = (pos - i as f32).clamp(0.0, 1.0);
-    let a = v[i];
-    let b = v[(i + 1).min(v.len() - 1)];
-    a + (b - a) * f
-}
-
-impl Vocoder {
+impl Cepstrum {
     fn new(sr: f32) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FRAME);
         let ifft = planner.plan_fft_inverse(FRAME);
         let scratch_f = fft.make_scratch_vec();
         let scratch_i = ifft.make_scratch_vec();
-        let window: Vec<f32> = (0..FRAME).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FRAME as f32).cos()).collect();
         // quefrency cut-off: envelope detail coarser than ~300 Hz (harmonic ripple removed)
         let lifter = ((sr / 300.0) as usize).clamp(16, FRAME / 4);
-        Self { fft, ifft, scratch_f, scratch_i, window, lifter, ch: [channel(), channel()] }
+        Self { fft, ifft, scratch_f, scratch_i, lifter }
     }
 
-    fn reset(&mut self) {
-        for c in &mut self.ch {
-            c.ibuf.fill(0.0);
-            c.obuf.fill(0.0);
-            c.t = 0;
-            c.counter = 0;
-            c.last_phase.fill(0.0);
-            c.phase_acc.fill(0.0);
-        }
-    }
-
-    /// Cepstrally smoothed log-magnitude envelope of `ch.spec` into `ch.env`.
-    fn envelope(&mut self, c: usize) {
-        let ch = &mut self.ch[c];
+    /// Cepstrally smoothed log-magnitude envelope of `spec` into `ch.env`.
+    #[allow(clippy::needless_range_loop, reason = "bin index addresses several parallel spectra")]
+    fn envelope(&mut self, ch: &mut VocState, spec: &[Complex<f32>]) {
         for k in 0..BINS {
-            ch.logmag[k] = Complex::new((ch.spec[k].norm() + 1e-9).ln(), 0.0);
+            ch.logmag[k] = Complex::new((spec[k].norm() + 1e-9).ln(), 0.0);
         }
         let _ = self.ifft.process_with_scratch(&mut ch.logmag, &mut ch.cep, &mut self.scratch_i);
         let l = self.lifter;
@@ -165,114 +131,76 @@ impl Vocoder {
             ch.env[k] = ch.env_c[k].re;
         }
     }
+}
 
-    /// Analyse the last FRAME samples of channel `c`, shift the pitch by `ratio`, impose the
-    /// envelope warped by `formant` (relative to the shifted spectrum's envelope) and
-    /// overlap-add the result.
-    fn frame(&mut self, c: usize, ratio: f32, formant: f32) {
-        let shift = (ratio - 1.0).abs() > 1e-4;
-        let warp = (formant - 1.0).abs() > 1e-4;
-        let n = FRAME;
-        {
-            let ch = &mut self.ch[c];
-            for i in 0..n {
-                ch.frame[i] = ch.ibuf[(ch.t + i) % n] * self.window[i];
-            }
-            let _ = self.fft.process_with_scratch(&mut ch.frame, &mut ch.spec, &mut self.scratch_f);
-        }
-        if warp {
-            self.envelope(c);
-        }
-        let expct = std::f32::consts::TAU * HOP as f32 / n as f32;
-        let osamp = (n / HOP) as f32;
-        let ch = &mut self.ch[c];
-        if shift {
-            // analysis: true frequency of every bin from the phase advance since the last hop
-            for k in 0..BINS {
-                let phase = ch.spec[k].arg();
-                let mut d = phase - ch.last_phase[k];
-                ch.last_phase[k] = phase;
-                d -= k as f32 * expct;
-                d = princarg(d);
-                ch.mag[k] = ch.spec[k].norm();
-                ch.freq[k] = k as f32 + osamp * d / std::f32::consts::TAU;
-            }
-            ch.mag_s.fill(0.0);
-            ch.freq_s.fill(0.0);
-            for k in 0..BINS {
-                let idx = (k as f32 * ratio).round() as usize;
-                if idx < BINS {
-                    ch.mag_s[idx] += ch.mag[k];
-                    ch.freq_s[idx] = ch.freq[k] * ratio;
-                }
-            }
-            // envelope correction: the shifted spectrum carries env(k/ratio); impose env(k/formant/ratio')
-            for k in 0..BINS {
-                let g = if warp {
-                    let have = interp(&ch.env, k as f32 / ratio);
-                    let want = interp(&ch.env, k as f32 / (ratio * formant));
-                    (want - have).clamp(-MAX_CUT_DB / 8.6859, MAX_BOOST_DB / 8.6859).exp()
-                } else {
-                    1.0
-                };
-                let inc = ch.freq_s[k] * expct;
-                ch.phase_acc[k] += inc;
-                let m = ch.mag_s[k] * g;
-                ch.spec[k] = Complex::new(m * ch.phase_acc[k].cos(), m * ch.phase_acc[k].sin());
-            }
-        } else {
-            // unity pitch: keep the analysed phases (exact reconstruction), sync the accumulators
-            for k in 0..BINS {
-                let phase = ch.spec[k].arg();
-                ch.last_phase[k] = phase;
-                ch.phase_acc[k] = phase;
-                if warp {
-                    let want = interp(&ch.env, k as f32 / formant);
-                    let g = (want - ch.env[k]).clamp(-MAX_CUT_DB / 8.6859, MAX_BOOST_DB / 8.6859).exp();
-                    ch.spec[k] *= g;
-                }
-            }
-        }
-        ch.spec[0].im = 0.0;
-        ch.spec[BINS - 1].im = 0.0;
-        let _ = self.ifft.process_with_scratch(&mut ch.spec, &mut ch.frame, &mut self.scratch_i);
-        // Hann synthesis at 75 % overlap: Σ w = 2 for resynthesised frames, Σ w² = 1.5 when
-        // the analysis window is still on the frame (unity path)
-        let norm = if shift { 1.0 / (n as f32 * 2.0) } else { 1.0 / (n as f32 * 1.5) };
-        let start = ch.t + n; // == t - n (mod 2n): output time of frame sample 0
-        for i in 0..n {
-            let idx = (start + i) % (2 * n);
-            ch.obuf[idx] += ch.frame[i] * self.window[i] * norm;
-        }
+/// Shift the pitch of one analysed frame by `ratio` and impose the envelope warped by
+/// `formant` (relative to the shifted spectrum's own envelope). Returns whether the frame
+/// was resynthesised.
+#[allow(clippy::needless_range_loop, reason = "bin index addresses several parallel spectra")]
+fn vocode(ch: &mut VocState, cep: &mut Cepstrum, spec: &mut [Complex<f32>], ratio: f32, formant: f32) -> bool {
+    let shift = (ratio - 1.0).abs() > 1e-4;
+    let warp = (formant - 1.0).abs() > 1e-4;
+    if warp {
+        cep.envelope(ch, spec);
     }
-
-    #[inline]
-    fn push(&mut self, c: usize, x: f32, ratio: f32, formant: f32) -> f32 {
-        let n = FRAME;
-        {
-            let ch = &mut self.ch[c];
-            ch.ibuf[ch.t % n] = x;
-            ch.t += 1;
-            ch.counter += 1;
+    let expct = std::f32::consts::TAU * HOP as f32 / FRAME as f32;
+    let osamp = (FRAME / HOP) as f32;
+    let (lo, hi) = (-MAX_CUT_DB / 8.6859, MAX_BOOST_DB / 8.6859);
+    if shift {
+        // analysis: true frequency of every bin from the phase advance since the last hop
+        for k in 0..BINS {
+            let phase = spec[k].arg();
+            let mut d = phase - ch.last_phase[k];
+            ch.last_phase[k] = phase;
+            d -= k as f32 * expct;
+            d = princarg(d);
+            ch.mag[k] = spec[k].norm();
+            ch.freq[k] = k as f32 + osamp * d / std::f32::consts::TAU;
         }
-        if self.ch[c].counter == HOP {
-            self.ch[c].counter = 0;
-            self.frame(c, ratio, formant);
+        ch.mag_s.fill(0.0);
+        ch.freq_s.fill(0.0);
+        for k in 0..BINS {
+            let idx = (k as f32 * ratio).round() as usize;
+            if idx < BINS {
+                ch.mag_s[idx] += ch.mag[k];
+                ch.freq_s[idx] = ch.freq[k] * ratio;
+            }
         }
-        let ch = &mut self.ch[c];
-        // emit the sample exactly one frame older than the one just pushed; every frame
-        // covering it has been added (the last one ends at or before the pushed sample)
-        let idx = (ch.t + 2 * n - n - 1) % (2 * n);
-        let y = ch.obuf[idx];
-        ch.obuf[idx] = 0.0;
-        y
+        // envelope correction: the shifted spectrum carries env(k/ratio); impose env(k/(ratio·formant))
+        for k in 0..BINS {
+            let g = if warp {
+                let have = interp(&ch.env, k as f32 / ratio);
+                let want = interp(&ch.env, k as f32 / (ratio * formant));
+                (want - have).clamp(lo, hi).exp()
+            } else {
+                1.0
+            };
+            ch.phase_acc[k] += ch.freq_s[k] * expct;
+            let m = ch.mag_s[k] * g;
+            spec[k] = Complex::new(m * ch.phase_acc[k].cos(), m * ch.phase_acc[k].sin());
+        }
+        true
+    } else {
+        // unity pitch: keep the analysed phases (exact reconstruction), sync the accumulators
+        for k in 0..BINS {
+            let phase = spec[k].arg();
+            ch.last_phase[k] = phase;
+            ch.phase_acc[k] = phase;
+            if warp {
+                let want = interp(&ch.env, k as f32 / formant);
+                let g = (want - ch.env[k]).clamp(lo, hi).exp();
+                spec[k] *= g;
+            }
+        }
+        false
     }
 }
 
 pub struct PitchShift {
     params: Params,
     sr: f32,
-    vocoder: Vocoder,
+    ch: [Channel; 2],
+    cep: Cepstrum,
 }
 
 impl Default for PitchShift {
@@ -283,7 +211,7 @@ impl Default for PitchShift {
 
 impl PitchShift {
     pub fn new() -> Self {
-        Self { params: Params::new(&DESCRIPTORS), sr: 48_000.0, vocoder: Vocoder::new(48_000.0) }
+        Self { params: Params::new(&DESCRIPTORS), sr: 48_000.0, ch: [channel(), channel()], cep: Cepstrum::new(48_000.0) }
     }
     /// Frequency ratio of the pitch stage.
     pub fn pitch_ratio(&self) -> f32 {
@@ -307,7 +235,8 @@ impl Processor for PitchShift {
         }
         self.sr = spec.sample_rate as f32;
         self.params.set_sample_rate(self.sr);
-        self.vocoder = Vocoder::new(self.sr);
+        self.ch = [channel(), channel()];
+        self.cep = Cepstrum::new(self.sr);
         self.reset();
         Ok(())
     }
@@ -337,7 +266,9 @@ impl Processor for PitchShift {
             let xs = [inputs[0][i], inputs[1][i]];
             let mut ys = [0.0f32; 2];
             for c in 0..2 {
-                let w = self.vocoder.push(c, xs[c], ratio, formant);
+                let Channel { stft, voc } = &mut self.ch[c];
+                let cep = &mut self.cep;
+                let w = stft.push(xs[c], |spec| vocode(voc, cep, spec, ratio, formant));
                 ys[c] = mix_wet(xs[c], w, mix);
             }
             l[i] = ys[0];
@@ -345,7 +276,11 @@ impl Processor for PitchShift {
         }
     }
     fn reset(&mut self) {
-        self.vocoder.reset();
+        for c in &mut self.ch {
+            c.stft.reset();
+            c.voc.last_phase.fill(0.0);
+            c.voc.phase_acc.fill(0.0);
+        }
         self.params.snap_all();
     }
     fn latency_frames(&self) -> u32 {

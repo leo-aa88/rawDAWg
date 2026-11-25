@@ -20,6 +20,7 @@ pub mod pitch;
 pub mod processor;
 pub mod rng;
 pub mod smooth;
+pub mod stft;
 pub mod wavetable;
 
 pub use buffer::{AudioBlock, AudioBuffer, BusLayout};

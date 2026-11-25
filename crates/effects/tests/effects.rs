@@ -228,6 +228,8 @@ fn every_catalogue_entry_instantiates_and_every_effect_is_listed() {
         rawdawg_effects::modulation::phaser::TYPE_ID,
         rawdawg_effects::reverb::TYPE_ID,
         rawdawg_effects::pitch::TYPE_ID,
+        rawdawg_effects::granular::TYPE_ID,
+        rawdawg_effects::spectral::TYPE_ID,
         rawdawg_effects::convolution::TYPE_ID,
         rawdawg_effects::distortion::single::TYPE_ID,
         rawdawg_effects::distortion::multiband::TYPE_ID,
