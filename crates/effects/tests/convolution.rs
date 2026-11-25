@@ -172,3 +172,48 @@ fn state_keeps_the_asset_reference_and_process_is_allocation_free() {
     assert_eq!(allocs, 0, "convolution allocates on the process path");
     assert!(rawdawg_effects::presets(convolution::TYPE_ID).len() >= 3);
 }
+
+#[test]
+fn long_ir_tail_stage_matches_direct_convolution_and_is_allocation_free() {
+    // 20,000 taps: the 8,192-sample head plus three tail partitions of 4,096
+    let n_ir = 20_000;
+    let h: Vec<f32> = noise(n_ir, 11).iter().enumerate().map(|(i, v)| v * (-3.0 * i as f32 / n_ir as f32).exp()).collect();
+    let x = noise(40_000, 12);
+    let lat = PARTITION;
+    // reference at sampled output positions (f64 accumulation)
+    let reference = |i: usize| -> f32 {
+        let mut acc = 0.0f64;
+        for (k, hk) in h.iter().enumerate() {
+            if i >= k {
+                acc += f64::from(x[i - k]) * f64::from(*hk);
+            }
+        }
+        acc as f32
+    };
+    let checks: Vec<usize> = (0..x.len() - lat).step_by(37).collect();
+    let expected: Vec<f32> = checks.iter().map(|&i| reference(i)).collect();
+    let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    for block in [64usize, 100, 256, 1000] {
+        let mut c = conv(ImpulseResponse { name: "long".into(), sample_rate: 48_000, channels: vec![h.clone()] }, false, false);
+        assert_eq!(c.info().unwrap().used_frames, n_ir);
+        let (l, r) = run(&mut c, &x, &x, block);
+        let err = checks.iter().zip(&expected).map(|(&i, e)| (l[i + lat] - e).abs()).fold(0.0f32, f32::max);
+        assert!(err < 2e-4 * scale.max(1.0), "block {block}: max error {err} vs direct convolution (scale {scale})");
+        // the tail clearly contributes: outputs after the head differ from a head-only IR
+        assert_eq!(l, r, "mono IR feeds both channels");
+    }
+    // the tail work stays inside the real-time rules: no allocation while processing
+    let mut c = conv(ImpulseResponse { name: "long".into(), sample_rate: 48_000, channels: vec![h.clone()] }, false, false);
+    let transport = TransportView::stopped(SR);
+    let input = noise(256, 13);
+    let (mut ol, mut or) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+    let (_, allocs) = measure_rt(|| {
+        for _ in 0..200 {
+            let inputs: [&[f32]; 2] = [&input, &input];
+            let mut outputs: [&mut [f32]; 2] = [&mut ol, &mut or];
+            let mut ctx = ProcessContext { audio: AudioBlock { frames: 256, inputs: &inputs, outputs: &mut outputs, sidechain: &[] }, events: &[], transport: &transport };
+            c.process(&mut ctx);
+        }
+    });
+    assert_eq!(allocs, 0, "the tail stage allocates on the audio path");
+}

@@ -387,6 +387,14 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Commands: `cargo test --workspace` (366 passed), clippy clean, `cargo xtask verify --suite all` (21 PASS incl. QA-01; PL-03/04/05, HW-01, GUI-01 BLOCKED), `cargo xtask fuzz --iterations 60000 --seconds 240 --seed 1234` (0 findings), `cargo run --release -p xtask -- soak --minutes 30 --seed 11` (pass). Report: `docs/verification/robustness.md`.
 - Not done: sanitizers and Miri (nightly only), grammar-based expression fuzzing, disk-full fault injection, soak on bare metal and Windows.
 
+### Slice 4 — dependency audit, user guide, convolution performance fix, morph benchmark (QUAL-03/04, FX-01)
+
+- Dependency audit (`docs/verification/dependency-audit.md`): `cargo deny --offline check` with cargo-deny 0.20.2 and the RustSec database at `10db699` (2026-11-24): advisories, bans, licenses, sources ok; three unmaintained-crate advisories ignored with reasons (Linux accessibility bridge via eframe); license distribution recorded. CI refreshes the database on every run.
+- User guide: accurate header, ten-minute quickstart, current options table (`--scan-plugins`, `--capture-smoke`, FLAC, stems, project marker, preset `--open`), expanded troubleshooting (audio, xruns, MIDI, long releases, crash recovery, locks, missing samples, plugin stand-ins and quarantine, folder association). `--ui-preset` help lists every preset.
+- **Convolution could not run in real time at its specified 30 s maximum** (found by the new benchmark: 5.47 ms mean per 256-frame block against a 5.33 ms deadline). The convolver is now two-stage: 256-sample partitions for the first 8,192 samples, 4,096-sample partitions for the tail, with each tail chunk's FFT, multiply-accumulate and inverse FFT spread over 16 blocks. Same 256-sample latency and memory; 30 s now costs 0.31 ms mean / 0.53 ms p99 (10% of the deadline). New test: a 20,000-tap response matches direct convolution at block sizes 64/100/256/1000 and the tail path allocates nothing; a mutation check (tail output disabled) makes it fail.
+- Benchmarks: convolution at 1/5/10/30 s and the four-corner morph (blend 38.7 µs per pointer move; moving morph adds about 15 µs per synth block) added to `cargo xtask bench-audio` (`--units-only` skips the long workload runs) and `docs/verification/benchmarks.md`.
+- Commands: `cargo test --workspace` (367 passed), clippy clean, `cargo xtask verify --suite headless` (16 PASS, E2E-05 mix figures unchanged), `cargo run --release -p xtask -- bench-audio --units-only`.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -443,7 +451,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset, lintian clean; slice 2: reference benchmarks in `docs/verification/benchmarks.md`; slice 3: parser fuzzing with five fixed findings and a passing 30-minute soak in `docs/verification/robustness.md`). Next, in order:
-1. Investigate the max-block spikes on bare metal (Ubuntu 24.04, real-time-priority thread) before optimising anything; add morph and long-IR convolution to the bench.
-2. M8 slice 4 — CI hygiene: run the workflow on GitHub when the owner pushes (not done by the agent); dependency audit report; quickstart/troubleshooting in USER_GUIDE.
+M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset, lintian clean; slice 2: reference benchmarks in `docs/verification/benchmarks.md`; slice 3: parser fuzzing with five fixed findings and a passing 30-minute soak in `docs/verification/robustness.md`; slice 4: dependency audit, user guide quickstart, real-time convolution at 30 s). Next, in order:
+1. Investigate the max-block spikes on bare metal (Ubuntu 24.04, real-time-priority thread) before optimising anything.
+2. CI: the workflow runs on GitHub only when the owner pushes (not done by the agent).
 3. M7 follow-ups: plugin editors (export `gui`/`IPlugView`, host embedding on X11/XWayland), plugin-formatted parameter readouts, large opaque state spill; validators/independent hosts when available. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.

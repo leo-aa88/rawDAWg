@@ -1,8 +1,17 @@
 //! Convolution reverb (`native.fx.convolution`): a user impulse response from a
-//! project asset, uniformly partitioned FFT convolution (partition 256 frames,
-//! reported as latency), optional trim/normalize applied off-thread when the IR
-//! is set, IR length bounded (30 s). Mono IRs feed both channels; stereo IRs map
-//! L→L, R→R (true-stereo four-channel IRs are not supported in v1).
+//! project asset, non-uniformly partitioned FFT convolution, optional trim/normalize
+//! applied off-thread when the IR is set, IR length bounded (30 s). Mono IRs feed both
+//! channels; stereo IRs map L→L, R→R (true-stereo four-channel IRs are not supported in v1).
+//!
+//! Two stages, exact (equal to direct convolution up to float rounding):
+//! - **head**: the first [`HEAD_LEN`] samples of the IR in [`PARTITION`]-sample partitions
+//!   (uniformly partitioned overlap-save; the partition is the reported latency);
+//! - **tail**: the rest in [`TAIL_PART`]-sample partitions. The tail filter starts two tail
+//!   chunks into the IR, so each chunk's FFT, multiply-accumulate and inverse FFT can be spread
+//!   evenly over the [`SPREAD`] small blocks while the next chunk arrives: no block carries the
+//!   whole tail's cost. With a 30 s IR this measured about 17× cheaper per block than
+//!   256-sample partitions throughout (0.31 ms vs 5.47 ms mean at 48 kHz/256 frames;
+//!   `cargo xtask bench-audio`, `docs/verification/benchmarks.md`).
 
 use crate::common::{Params, Preset};
 use rawdawg_dsp::biquad::{Biquad, BiquadKind, Coeffs};
@@ -19,6 +28,12 @@ pub const TYPE_ID: &str = "native.fx.convolution";
 pub const DISPLAY_NAME: &str = "Convolution";
 pub const STATE_VERSION: u32 = 1;
 pub const PARTITION: usize = 256;
+/// Tail partition size (FFT size twice this).
+pub const TAIL_PART: usize = 4096;
+/// The head covers two tail partitions, which gives the tail one full chunk of time to compute.
+pub const HEAD_LEN: usize = 2 * TAIL_PART;
+/// Small blocks per tail chunk: the tail work is spread over this many `convolve_block` calls.
+pub const SPREAD: usize = TAIL_PART / PARTITION;
 pub const MAX_IR_SECONDS: f32 = 30.0;
 
 pub const P_MIX: u32 = 1;
@@ -83,6 +98,58 @@ struct ChannelConv {
     pre: DelayLine,
     lowcut: Biquad,
     highcut: Biquad,
+    tail: TailConv,
+}
+
+/// Tail stage of one channel (see the module notes).
+struct TailConv {
+    /// Tail partition spectra (K × (TAIL_PART + 1)); empty when the IR fits in the head.
+    h: Vec<Vec<Complex<f32>>>,
+    fdl: Vec<Vec<Complex<f32>>>,
+    fdl_pos: usize,
+    /// Input chunks m-1 and m (the pair transformed at slot 0) and the chunk being collected.
+    prev: Vec<f32>,
+    last: Vec<f32>,
+    collect: Vec<f32>,
+    time: Vec<f32>,
+    spec: Vec<Complex<f32>>,
+    acc: Vec<Complex<f32>>,
+    /// Output segment being read and the one being produced.
+    cur: Vec<f32>,
+    next: Vec<f32>,
+    /// Small block index within the current chunk (0..SPREAD).
+    slot: usize,
+}
+
+impl TailConv {
+    fn new() -> Self {
+        let zc = || vec![Complex::new(0.0, 0.0); TAIL_PART + 1];
+        Self {
+            h: Vec::new(),
+            fdl: Vec::new(),
+            fdl_pos: 0,
+            prev: vec![0.0; TAIL_PART],
+            last: vec![0.0; TAIL_PART],
+            collect: vec![0.0; TAIL_PART],
+            time: vec![0.0; 2 * TAIL_PART],
+            spec: zc(),
+            acc: zc(),
+            cur: vec![0.0; TAIL_PART],
+            next: vec![0.0; TAIL_PART],
+            slot: 0,
+        }
+    }
+    fn reset(&mut self) {
+        for f in &mut self.fdl {
+            f.fill(Complex::new(0.0, 0.0));
+        }
+        self.fdl_pos = 0;
+        for b in [&mut self.prev, &mut self.last, &mut self.collect, &mut self.cur, &mut self.next] {
+            b.fill(0.0);
+        }
+        self.acc.fill(Complex::new(0.0, 0.0));
+        self.slot = 0;
+    }
 }
 
 impl ChannelConv {
@@ -101,6 +168,7 @@ impl ChannelConv {
             pre: DelayLine::new((0.2 * sr) as usize + 8),
             lowcut: Biquad::new(),
             highcut: Biquad::new(),
+            tail: TailConv::new(),
         }
     }
     fn reset(&mut self) {
@@ -115,6 +183,7 @@ impl ChannelConv {
         self.pre.reset();
         self.lowcut.reset();
         self.highcut.reset();
+        self.tail.reset();
     }
 }
 
@@ -128,6 +197,10 @@ pub struct Convolution {
     ifft: Arc<dyn ComplexToReal<f32>>,
     scratch_f: Vec<Complex<f32>>,
     scratch_i: Vec<Complex<f32>>,
+    tail_fft: Arc<dyn RealToComplex<f32>>,
+    tail_ifft: Arc<dyn ComplexToReal<f32>>,
+    tail_scratch_f: Vec<Complex<f32>>,
+    tail_scratch_i: Vec<Complex<f32>>,
     ir_len: usize,
 }
 
@@ -144,6 +217,10 @@ impl Convolution {
         let ifft = planner.plan_fft_inverse(2 * PARTITION);
         let scratch_f = fft.make_scratch_vec();
         let scratch_i = ifft.make_scratch_vec();
+        let tail_fft = planner.plan_fft_forward(2 * TAIL_PART);
+        let tail_ifft = planner.plan_fft_inverse(2 * TAIL_PART);
+        let tail_scratch_f = tail_fft.make_scratch_vec();
+        let tail_scratch_i = tail_ifft.make_scratch_vec();
         Self {
             params: Params::new(&DESCRIPTORS),
             sr: 48_000.0,
@@ -154,6 +231,10 @@ impl Convolution {
             ifft,
             scratch_f,
             scratch_i,
+            tail_fft,
+            tail_ifft,
+            tail_scratch_f,
+            tail_scratch_i,
             ir_len: 0,
         }
     }
@@ -177,6 +258,9 @@ impl Convolution {
         for c in &mut self.ch {
             c.h.clear();
             c.fdl.clear();
+            c.tail.h.clear();
+            c.tail.fdl.clear();
+            c.tail.reset();
         }
         let Some(ir) = ir else {
             self.info = None;
@@ -248,8 +332,12 @@ impl Convolution {
         let len = chans.iter().map(|c| c.len()).max().unwrap_or(0);
         info.used_frames = len;
         self.ir_len = len;
-        let k = len.div_ceil(PARTITION).max(1);
+        // head: the first HEAD_LEN samples in small partitions
+        let k = len.min(HEAD_LEN).div_ceil(PARTITION).max(1);
+        // tail: the rest in TAIL_PART partitions, starting at HEAD_LEN
+        let k_tail = len.saturating_sub(HEAD_LEN).div_ceil(TAIL_PART);
         let mut input = vec![0.0f32; 2 * PARTITION];
+        let mut tail_input = vec![0.0f32; 2 * TAIL_PART];
         for (ci, conv) in self.ch.iter_mut().enumerate() {
             let src = &chans[ci.min(chans.len() - 1)];
             conv.h = Vec::with_capacity(k);
@@ -257,7 +345,9 @@ impl Convolution {
                 input.fill(0.0);
                 let start = part * PARTITION;
                 for (i, v) in input.iter_mut().take(PARTITION).enumerate() {
-                    *v = src.get(start + i).copied().unwrap_or(0.0);
+                    if start + i < HEAD_LEN {
+                        *v = src.get(start + i).copied().unwrap_or(0.0);
+                    }
                 }
                 let mut spec = self.fft.make_output_vec();
                 let _ = self.fft.process_with_scratch(&mut input, &mut spec, &mut self.scratch_f);
@@ -265,6 +355,19 @@ impl Convolution {
             }
             conv.fdl = (0..k).map(|_| vec![Complex::new(0.0, 0.0); PARTITION + 1]).collect();
             conv.fdl_pos = 0;
+            conv.tail.h = Vec::with_capacity(k_tail);
+            for part in 0..k_tail {
+                tail_input.fill(0.0);
+                let start = HEAD_LEN + part * TAIL_PART;
+                for (i, v) in tail_input.iter_mut().take(TAIL_PART).enumerate() {
+                    *v = src.get(start + i).copied().unwrap_or(0.0);
+                }
+                let mut spec = self.tail_fft.make_output_vec();
+                let _ = self.tail_fft.process_with_scratch(&mut tail_input, &mut spec, &mut self.tail_scratch_f);
+                conv.tail.h.push(spec);
+            }
+            conv.tail.fdl = (0..k_tail).map(|_| vec![Complex::new(0.0, 0.0); TAIL_PART + 1]).collect();
+            conv.tail.reset();
         }
         self.info = Some(info);
     }
@@ -299,6 +402,50 @@ impl Convolution {
         let norm = 1.0 / (2 * PARTITION) as f32;
         for i in 0..PARTITION {
             ch.out_fifo[i] = ch.time[PARTITION + i] * norm;
+        }
+        // ---- tail stage
+        let t = &mut ch.tail;
+        let kt = t.h.len();
+        if kt == 0 {
+            return;
+        }
+        let slot = t.slot;
+        // this block's output: add the tail segment computed during the previous chunk
+        for i in 0..PARTITION {
+            ch.out_fifo[i] += t.cur[slot * PARTITION + i];
+        }
+        // collect this block's input into the chunk being gathered
+        t.collect[slot * PARTITION..(slot + 1) * PARTITION].copy_from_slice(&ch.in_fifo);
+        // one share of the work for the previous chunk
+        if slot == 0 {
+            t.time[..TAIL_PART].copy_from_slice(&t.prev);
+            t.time[TAIL_PART..].copy_from_slice(&t.last);
+            let _ = self.tail_fft.process_with_scratch(&mut t.time, &mut t.spec, &mut self.tail_scratch_f);
+            t.fdl[t.fdl_pos].copy_from_slice(&t.spec);
+            t.acc.fill(Complex::new(0.0, 0.0));
+        }
+        let (from, to) = (slot * kt / SPREAD, (slot + 1) * kt / SPREAD);
+        for p in from..to {
+            let x = &t.fdl[(t.fdl_pos + kt - p) % kt];
+            let h = &t.h[p];
+            for b in 0..=TAIL_PART {
+                t.acc[b] += x[b] * h[b];
+            }
+        }
+        if slot == SPREAD - 1 {
+            t.fdl_pos = (t.fdl_pos + 1) % kt;
+            let _ = self.tail_ifft.process_with_scratch(&mut t.acc, &mut t.time, &mut self.tail_scratch_i);
+            let norm = 1.0 / (2 * TAIL_PART) as f32;
+            for i in 0..TAIL_PART {
+                t.next[i] = t.time[TAIL_PART + i] * norm;
+            }
+            // next round: read the new segment, transform [last, collected]
+            std::mem::swap(&mut t.cur, &mut t.next);
+            std::mem::swap(&mut t.prev, &mut t.last);
+            std::mem::swap(&mut t.last, &mut t.collect);
+            t.slot = 0;
+        } else {
+            t.slot = slot + 1;
         }
     }
 }

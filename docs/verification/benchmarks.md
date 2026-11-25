@@ -98,8 +98,37 @@ Each listed effect alone on a stereo sine-plus-noise signal, 5 s per unit:
 | Convolution | 1.5 | 2.4 | 0.0% |
 | Stereo | 0.8 | 0.8 | 0.0% |
 
-The convolution figure has **no impulse response loaded**, so it measures pass-through only.
-Convolution with an IR is exercised in E2E-05 but not timed here yet.
+The convolution figure in this table has **no impulse response loaded**, so it measures
+pass-through only. Convolution with real impulse responses is measured below.
+
+### Convolution with an impulse response
+
+Stereo, 100% wet, exponentially decaying noise as the impulse response, 256-frame blocks, 5 s per
+length, release build. The first version used 256-sample partitions for the whole response, so
+its cost grew linearly with length. At the specified 30-second maximum it could not keep up: its
+mean block time was above the deadline. The convolver now keeps 256-sample partitions for the
+first 8,192 samples and uses 4,096-sample partitions for the rest, with each tail chunk's work
+spread evenly over 16 blocks. The output is unchanged: a 20,000-tap test still matches direct
+convolution.
+
+| Impulse response | Before: mean µs | Before: p99 µs | After: mean µs | After: p99 µs | After: p99 / deadline |
+|---|---|---|---|---|---|
+| 1 s | 101 | 190 | 32.6 | 86.6 | 1.6% |
+| 5 s | 554 | 898 | 58.8 | 127.5 | 2.4% |
+| 10 s | 1,220 | 1,969 | 101.0 | 171.2 | 3.2% |
+| 30 s (maximum) | 5,467 | 7,550 | 310.5 | 530.9 | 10.0% |
+
+### Four-corner morph
+
+Four corners of the default synth patch with different values for 136 automatable parameters:
+
+| Measure | mean µs | p99 µs | p99 / 256-frame deadline |
+|---|---|---|---|
+| Computing one blend (main thread, per pointer move) | 38.7 | 70.5 | 1.3% |
+| Synth, 8 notes, morph still | 74.5 | 143.5 | 2.7% |
+| Synth, 8 notes, morph moving (136 parameter events every block) | 89.3 | 157.1 | 2.9% |
+
+Moving the morph adds about 15 µs per block on average for the parameter changes.
 
 Default synth patch, one instance:
 
@@ -117,5 +146,5 @@ The default patch's polyphony is 32 voices per instance, so 64 requested notes s
 - UI frame times, dense-playlist frame rate, waveform mouse-to-audible latency (need a display
   session: GUI-01).
 - 30-minute stress soak with resident-memory tracking (M8 slice 3).
-- 4-corner morph cost, convolution with a long IR, 64- and 1024-frame buffers, rates above 48 kHz.
+- 64- and 1024-frame buffers, rates above 48 kHz.
 - Windows numbers.

@@ -419,6 +419,150 @@ pub fn synth_voice_costs(seconds: f64) -> anyhow::Result<Vec<UnitCost>> {
     Ok(out)
 }
 
+/// Convolution with impulse responses of growing length (exponentially decaying stereo noise),
+/// 256-frame blocks. Uniform 256-frame partitions: cost should grow linearly with IR length.
+pub fn convolution_costs(seconds: f64) -> anyhow::Result<Vec<UnitCost>> {
+    use rawdawg_dsp::processor::Processor;
+    use rawdawg_effects::convolution::{Convolution, ImpulseResponse};
+    let block = 256usize;
+    let deadline_us = block as f64 * 1e6 / f64::from(SR);
+    let mut out = Vec::new();
+    for ir_seconds in [1.0f32, 5.0, 10.0, rawdawg_effects::convolution::MAX_IR_SECONDS] {
+        let n = (ir_seconds * SR as f32) as usize;
+        let mut state = 0x2545_F491u32;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as f32 / u32::MAX as f32 - 0.5
+        };
+        let decay = |i: usize| (-6.9 * i as f32 / n as f32).exp(); // −60 dB at the end
+        let ch: Vec<Vec<f32>> = (0..2).map(|_| (0..n).map(|i| noise() * decay(i)).collect()).collect();
+        let ir = std::sync::Arc::new(ImpulseResponse { name: format!("{ir_seconds} s noise"), sample_rate: SR, channels: ch });
+        let mut conv = Convolution::new();
+        conv.prepare(&PrepareSpec::new(f64::from(SR), block, BusLayout::Stereo)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        conv.set_ir(Some(ir));
+        let d = conv.descriptors().iter().find(|d| d.key == "mix").copied().context("mix param")?;
+        conv.set_param(d.id, d.to_normalized(100.0));
+        let input: Vec<f32> = (0..block).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+        let (mut ol, mut or) = (vec![0.0f32; block], vec![0.0f32; block]);
+        let transport = TransportView::stopped(f64::from(SR));
+        let blocks = ((seconds * f64::from(SR)) / block as f64) as usize;
+        let mut times = Vec::with_capacity(blocks);
+        for b in 0..blocks + 20 {
+            let inputs: [&[f32]; 2] = [&input, &input];
+            let mut outs: [&mut [f32]; 2] = [&mut ol, &mut or];
+            let mut ctx = ProcessContext { audio: AudioBlock { frames: block, inputs: &inputs, outputs: &mut outs, sidechain: &[] }, events: &[], transport: &transport };
+            let t = Instant::now();
+            conv.process(&mut ctx);
+            if b >= 20 {
+                times.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        if ol.iter().any(|v| !v.is_finite()) || ol.iter().all(|v| *v == 0.0) {
+            bail!("convolution with a {ir_seconds} s IR produced no usable output");
+        }
+        let d = distribution(&mut times);
+        out.push(UnitCost { name: format!("{ir_seconds:.0} s impulse response"), mean_us: d.mean_ms, p99_us: d.p99_ms, percent_of_deadline_p99: d.p99_ms / deadline_us * 100.0 });
+    }
+    Ok(out)
+}
+
+/// Four-corner morph (SYN-05): the blend itself (main thread, per pointer move) and synth
+/// rendering while every block carries the changed parameters (8 held notes).
+pub fn morph_costs(seconds: f64) -> anyhow::Result<Vec<UnitCost>> {
+    use rawdawg_dsp::processor::Processor;
+    use rawdawg_synthesizer::{Patch, Synth};
+    use rawdawg_types::events::{EventSource, TimedEvent};
+    let block = 256usize;
+    let deadline_us = block as f64 * 1e6 / f64::from(SR);
+    // four compatible corners: the default patch with different automatable parameter values
+    let mut state = 77u64;
+    let mut unit = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32
+    };
+    let mut corners: Vec<Patch> = Vec::new();
+    let mut probe = Synth::default();
+    let params: Vec<_> = probe.descriptors().iter().filter(|d| d.flags.automatable && !d.flags.hidden && !d.flags.stepped).copied().collect();
+    for _ in 0..4 {
+        let mut s = Synth::default();
+        for d in &params {
+            s.set_param(d.id, unit());
+        }
+        corners.push(Patch::from_json(&s.save_state()).map_err(anyhow::Error::msg)?);
+    }
+    let refs: [&Patch; 4] = [&corners[0], &corners[1], &corners[2], &corners[3]];
+    if !rawdawg_synthesizer::morph::compatible(&refs) {
+        bail!("benchmark corners are not compatible");
+    }
+    // 1. the blend: 2,000 positions along a circle
+    let mut times = Vec::new();
+    for i in 0..2000 {
+        let a = i as f32 / 2000.0 * std::f32::consts::TAU;
+        let t = Instant::now();
+        let p = rawdawg_synthesizer::morph::morph(&refs, 0.5 + 0.45 * a.cos(), 0.5 + 0.45 * a.sin()).context("morph")?;
+        times.push(t.elapsed().as_secs_f64() * 1e6);
+        std::hint::black_box(p);
+    }
+    let d = distribution(&mut times);
+    let mut out = vec![UnitCost { name: "morph blend (one pointer move)".into(), mean_us: d.mean_ms, p99_us: d.p99_ms, percent_of_deadline_p99: d.p99_ms / deadline_us * 100.0 }];
+    // 2. rendering while the morph moves: every block applies the blended values as events
+    let transport = TransportView::stopped(f64::from(SR));
+    let ons: Vec<TimedEvent> = (0..8u32).map(|k| TimedEvent::note_on(0, EventSource::Host, 0, k + 1, (40 + k * 5) as u8, 0.7)).collect();
+    let blocks = ((seconds * f64::from(SR)) / block as f64) as usize;
+    // each corner's normalized value per parameter, read once
+    let mut corner_values: Vec<[f32; 4]> = vec![[0.0; 4]; params.len()];
+    for (c, patch) in corners.iter().enumerate() {
+        let mut s = Synth::default();
+        s.load_state(&serde_json::to_vec(patch)?).map_err(anyhow::Error::msg)?;
+        for (i, d) in params.iter().enumerate() {
+            corner_values[i][c] = s.param(d.id).unwrap_or(d.default_normalized);
+        }
+    }
+    for moving in [false, true] {
+        probe = Synth::default();
+        probe.load_state(&serde_json::to_vec(&corners[0])?).map_err(anyhow::Error::msg)?;
+        probe.prepare(&PrepareSpec::new(f64::from(SR), block, BusLayout::Stereo)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut ol, mut or) = (vec![0.0f32; block], vec![0.0f32; block]);
+        let mut events: Vec<TimedEvent> = Vec::with_capacity(params.len() + 8);
+        let mut times = Vec::with_capacity(blocks);
+        for b in 0..blocks + 20 {
+            events.clear();
+            if b == 0 {
+                events.extend_from_slice(&ons);
+            }
+            if moving {
+                // the pad sweeps a circle every 4 s; the changed values arrive with the block
+                let a = (b as f32 * block as f32 / SR as f32) / 4.0 * std::f32::consts::TAU;
+                let (x, y) = (0.5 + 0.45 * a.cos(), 0.5 + 0.45 * a.sin());
+                let w = rawdawg_synthesizer::morph::weights(x, y);
+                for (d, cv) in params.iter().zip(&corner_values) {
+                    let v: f32 = cv.iter().zip(w).map(|(c, w)| c * w).sum();
+                    events.push(TimedEvent::new(0, EventSource::Host, 0, rawdawg_types::events::EventKind::Param { id: d.id, value: v }));
+                }
+            }
+            let mut outs: [&mut [f32]; 2] = [&mut ol, &mut or];
+            let mut ctx = ProcessContext { audio: AudioBlock::output_only(block, &mut outs), events: &events, transport: &transport };
+            let t = Instant::now();
+            probe.process(&mut ctx);
+            if b >= 20 {
+                times.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        let d = distribution(&mut times);
+        out.push(UnitCost {
+            name: if moving { format!("synth, 8 notes, morph moving ({} params per block)", params.len()) } else { "synth, 8 notes, morph still".into() },
+            mean_us: d.mean_ms,
+            p99_us: d.p99_ms,
+            percent_of_deadline_p99: d.p99_ms / deadline_us * 100.0,
+        });
+    }
+    Ok(out)
+}
+
 fn machine() -> serde_json::Value {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -433,7 +577,7 @@ fn machine() -> serde_json::Value {
     serde_json::json!({ "cpu": cpu, "os": os, "kernel": kernel, "hardware_threads": threads, "build": if cfg!(debug_assertions) { "debug" } else { "release" } })
 }
 
-pub fn run(root: &Path, seconds: f64) -> anyhow::Result<()> {
+pub fn run(root: &Path, seconds: f64, units_only: bool) -> anyhow::Result<()> {
     if cfg!(debug_assertions) {
         eprintln!("warning: debug build — run `cargo run --release -p xtask -- bench-audio` for reference numbers");
     }
@@ -441,11 +585,16 @@ pub fn run(root: &Path, seconds: f64) -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
     let dir = out.join("bench-reference.rawdawg");
     let bars = ((seconds + 2.0) / 2.0).ceil() as i64 + 2; // 120 BPM: 2 s per bar
-    let project = reference_project(root, &dir, bars)?;
-    let w256 = run_workload(&project, &dir, seconds, 256)?;
-    let w128 = run_workload(&project, &dir, seconds.min(60.0), 128)?;
+    let (w256, w128) = if units_only {
+        (None, None)
+    } else {
+        let project = reference_project(root, &dir, bars)?;
+        (Some(run_workload(&project, &dir, seconds, 256)?), Some(run_workload(&project, &dir, seconds.min(60.0), 128)?))
+    };
     let fx = effect_costs(5.0)?;
     let voices = synth_voice_costs(5.0)?;
+    let conv = convolution_costs(5.0)?;
+    let morph = morph_costs(5.0)?;
     let print_w = |w: &WorkloadResult| {
         println!(
             "reference workload @48 kHz/{} frames: {:.0} s audio in {:.2} s ({:.1}x realtime); block ms p50 {:.3} p95 {:.3} p99 {:.3} max {:.3} (deadline {:.3}; p99 {:.0}%, max {:.0}%); peak voices {}; rms {:.3}; non-finite {}; compile {:.1} ms",
@@ -475,10 +624,10 @@ pub fn run(root: &Path, seconds: f64) -> anyhow::Result<()> {
             println!("    block {:>6}: wall {:.3} ms, on-CPU {}", b.index, b.wall_ms, b.on_cpu_ms.map(|c| format!("{c:.3} ms")).unwrap_or_else(|| "n/a".into()));
         }
     };
-    print_w(&w256);
-    print_slow(&w256);
-    print_w(&w128);
-    print_slow(&w128);
+    for w in [&w256, &w128].into_iter().flatten() {
+        print_w(w);
+        print_slow(w);
+    }
     println!("effects (256 frames, stereo, alone):");
     for c in &fx {
         println!("  {:<22} mean {:>7.1} µs  p99 {:>7.1} µs  ({:.1}% of deadline)", c.name, c.mean_us, c.p99_us, c.percent_of_deadline_p99);
@@ -487,7 +636,16 @@ pub fn run(root: &Path, seconds: f64) -> anyhow::Result<()> {
     for c in &voices {
         println!("  {:<22} mean {:>7.1} µs  p99 {:>7.1} µs  ({:.1}% of deadline)", c.name, c.mean_us, c.p99_us, c.percent_of_deadline_p99);
     }
-    let report = serde_json::json!({ "machine": machine(), "workload_256": w256, "workload_128": w128, "effects": fx, "synth_voices": voices });
+    println!("convolution, stereo, 100% wet (256 frames):");
+    for c in &conv {
+        println!("  {:<22} mean {:>7.1} µs  p99 {:>7.1} µs  ({:.1}% of deadline)", c.name, c.mean_us, c.p99_us, c.percent_of_deadline_p99);
+    }
+    println!("four-corner morph:");
+    for c in &morph {
+        println!("  {:<52} mean {:>7.1} µs  p99 {:>7.1} µs  ({:.1}% of a 256-frame deadline)", c.name, c.mean_us, c.p99_us, c.percent_of_deadline_p99);
+    }
+    let report =
+        serde_json::json!({ "machine": machine(), "workload_256": w256, "workload_128": w128, "effects": fx, "synth_voices": voices, "convolution": conv, "morph": morph });
     std::fs::write(out.join("bench-audio.json"), serde_json::to_vec_pretty(&report)?)?;
     println!("report: {}", out.join("bench-audio.json").display());
     Ok(())

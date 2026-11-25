@@ -68,6 +68,9 @@ enum Cmd {
     BenchAudio {
         #[arg(long, default_value_t = 60.0)]
         seconds: f64,
+        /// Only the single-unit measurements (effects, voices, convolution, morph).
+        #[arg(long)]
+        units_only: bool,
     },
     /// Build a native package (deb on Ubuntu; msi/portable on Windows).
     Package {
@@ -186,7 +189,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::BenchAudio { seconds } => bench::run(&root, seconds),
+        Cmd::BenchAudio { seconds, units_only } => bench::run(&root, seconds, units_only),
         Cmd::Soak { minutes, seed } => soak::run(&root, minutes, seed),
         Cmd::Fuzz { target, iterations, seconds, seed, replay } => fuzz(&root, target, iterations, seconds, seed, replay),
         Cmd::Package { format } => package(&root, format),
