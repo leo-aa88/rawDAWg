@@ -32,7 +32,7 @@ macro_rules! band_descriptors {
             ParamDescriptor::continuous(P_OUTPUT, "output", "Output", ParamUnit::Decibel, ParamMapping::Linear { min: -24.0, max: 24.0 }, 0.5, ParamCategory::Mix).with_smoothing(20.0),
             $(
                 ParamDescriptor::continuous(band_param($b, B_ENABLED), concat!("band", $b, ".on"), concat!("Band ", $b, " on"), ParamUnit::None, ParamMapping::Toggle, if $b < 2 { 1.0 } else { 0.0 }, ParamCategory::Filter).stepped(),
-                ParamDescriptor::continuous(band_param($b, B_KIND), concat!("band", $b, ".kind"), concat!("Band ", $b, " type"), ParamUnit::None, ParamMapping::Discrete { steps: 6 }, DEFAULT_KIND[$b], ParamCategory::Filter).stepped(),
+                ParamDescriptor::continuous(band_param($b, B_KIND), concat!("band", $b, ".kind"), concat!("Band ", $b, " type"), ParamUnit::None, ParamMapping::Discrete { steps: 6 }, DEFAULT_KIND[$b], ParamCategory::Filter).stepped().with_labels(&KIND_LABELS),
                 ParamDescriptor::continuous(band_param($b, B_FREQ), concat!("band", $b, ".freq"), concat!("Band ", $b, " freq"), ParamUnit::Hertz, ParamMapping::Log { min: 20.0, max: 20_000.0 }, DEFAULT_FREQ[$b], ParamCategory::Filter).with_smoothing(30.0),
                 ParamDescriptor::continuous(band_param($b, B_GAIN), concat!("band", $b, ".gain"), concat!("Band ", $b, " gain"), ParamUnit::Decibel, ParamMapping::Linear { min: -24.0, max: 24.0 }, 0.5, ParamCategory::Filter).with_smoothing(30.0),
                 ParamDescriptor::continuous(band_param($b, B_Q), concat!("band", $b, ".q"), concat!("Band ", $b, " Q"), ParamUnit::Ratio, ParamMapping::Log { min: 0.1, max: 18.0 }, 0.4675, ParamCategory::Filter).with_smoothing(30.0),

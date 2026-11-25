@@ -295,6 +295,21 @@ impl App {
                 app.effect_editor = app.project.mixer.channels.iter().flat_map(|m| m.inserts.iter()).map(|i| i.id).next();
                 app.editor_view = EditorView::Effect;
             }
+            Some(p) if p.starts_with("effect:") => {
+                // open a fresh insert of the named effect on the first mixer channel (demo/screenshot aid)
+                let type_id = &p["effect:".len()..];
+                if let (Some(fx), Some(mixer_id)) = (rawdawg_effects::CATALOG.iter().find(|f| f.type_id == type_id), app.project.mixer.channels.first().map(|m| m.id)) {
+                    let mut inst = rawdawg_project::Instance::native(fx.type_id, serde_json::Value::Null);
+                    inst.display_name = fx.name.to_owned();
+                    let iid = inst.id;
+                    app.apply(rawdawg_project::Command::AddInsert { mixer_id, instance: inst, index: None });
+                    app.effect_editor = Some(iid);
+                    app.editor_height_hint = Some(560.0);
+                    app.editor_view = EditorView::Effect;
+                } else {
+                    app.status_line = format!("Unknown effect {type_id}");
+                }
+            }
             Some("automation") => {
                 app.editor_view = EditorView::Automation;
                 app.automation.curve = app.project.automation.first().map(|c| c.id);

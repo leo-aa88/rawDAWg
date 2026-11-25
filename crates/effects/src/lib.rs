@@ -6,8 +6,10 @@
 pub mod common;
 pub mod convolution;
 pub mod delay;
+pub mod distortion;
 pub mod dynamics;
 pub mod eq;
+pub mod oversample;
 pub mod reverb;
 pub mod stereo;
 pub mod testfx;
@@ -28,23 +30,22 @@ pub struct EffectInfo {
     pub listed: bool,
 }
 
-pub static CATALOG: [EffectInfo; 3] = [
-    EffectInfo {
-        type_id: eq::TYPE_ID,
-        name: eq::DISPLAY_NAME,
-        family: "EQ",
-        description: "8-band parametric equalizer with draggable bands and a response plot",
-        has_mix: false,
-        listed: true,
-    },
-    EffectInfo {
-        type_id: stereo::TYPE_ID,
-        name: stereo::DISPLAY_NAME,
-        family: "Stereo",
-        description: "Gain, pan, balance, width, mono and phase with a correlation meter",
-        has_mix: false,
-        listed: true,
-    },
+const fn entry(type_id: &'static str, name: &'static str, family: &'static str, description: &'static str, has_mix: bool) -> EffectInfo {
+    EffectInfo { type_id, name, family, description, has_mix, listed: true }
+}
+
+/// Every effect the menus offer. [`make_effect`] must accept each entry (tested).
+pub static CATALOG: [EffectInfo; 11] = [
+    entry(eq::TYPE_ID, eq::DISPLAY_NAME, "EQ", "8-band parametric equalizer with draggable bands and a response plot", false),
+    entry(dynamics::compressor::TYPE_ID, dynamics::compressor::DISPLAY_NAME, "Dynamics", "RMS/peak compressor with sidechain input, knee and gain-reduction meter", true),
+    entry(dynamics::limiter::TYPE_ID, dynamics::limiter::DISPLAY_NAME, "Dynamics", "True-peak lookahead limiter with ceiling, release and dBTP meter", false),
+    entry(dynamics::gate::TYPE_ID, dynamics::gate::DISPLAY_NAME, "Dynamics", "Noise gate with hysteresis, hold, range and sidechain", false),
+    entry(distortion::single::TYPE_ID, distortion::single::DISPLAY_NAME, "Distortion", "Tube, tape, soft/hard clip, wavefolder and bitcrusher with oversampling and tone", true),
+    entry(distortion::multiband::TYPE_ID, distortion::multiband::DISPLAY_NAME, "Distortion", "Four Linkwitz-Riley bands with drive, mix and gain painted per band", true),
+    entry(delay::TYPE_ID, delay::DISPLAY_NAME, "Delay", "Stereo, ping-pong, tape, multitap and reverse delay with tempo sync", true),
+    entry(reverb::TYPE_ID, reverb::DISPLAY_NAME, "Reverb", "Room, hall, cathedral, plate, spring and shimmer with a decay-shape editor", true),
+    entry(convolution::TYPE_ID, convolution::DISPLAY_NAME, "Reverb", "Partitioned convolution with impulse responses from the project's samples", true),
+    entry(stereo::TYPE_ID, stereo::DISPLAY_NAME, "Stereo", "Gain, pan, balance, width, mono and phase with a correlation meter", false),
     EffectInfo { type_id: testfx::TYPE_ID, name: "Latency test", family: "Test", description: "Fixed delay reporting its latency (tests only)", has_mix: true, listed: false },
 ];
 
@@ -58,6 +59,8 @@ pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Proces
         eq::TYPE_ID => Box::new(eq::ParametricEq::new()),
         delay::TYPE_ID => Box::new(delay::Delay::new()),
         reverb::TYPE_ID => Box::new(reverb::Reverb::new()),
+        distortion::single::TYPE_ID => Box::new(distortion::single::Distortion::new()),
+        distortion::multiband::TYPE_ID => Box::new(distortion::multiband::Multiband::new()),
         convolution::TYPE_ID => Box::new(convolution::Convolution::new()),
         dynamics::compressor::TYPE_ID => Box::new(dynamics::compressor::Compressor::new()),
         dynamics::limiter::TYPE_ID => Box::new(dynamics::limiter::Limiter::new()),
@@ -80,6 +83,8 @@ pub fn presets(type_id: &str) -> &'static [Preset] {
         eq::TYPE_ID => &eq::PRESETS,
         delay::TYPE_ID => &delay::PRESETS,
         reverb::TYPE_ID => &reverb::PRESETS,
+        distortion::single::TYPE_ID => &distortion::single::PRESETS,
+        distortion::multiband::TYPE_ID => &distortion::multiband::PRESETS,
         convolution::TYPE_ID => &convolution::PRESETS,
         dynamics::compressor::TYPE_ID => &dynamics::compressor::PRESETS,
         dynamics::limiter::TYPE_ID => &dynamics::limiter::PRESETS,

@@ -16,8 +16,20 @@ const H: f32 = 900.0;
 
 impl Harness {
     fn new(project_dir: Option<&str>) -> Self {
+        Self::with_preset(project_dir, None)
+    }
+
+    fn with_preset(project_dir: Option<&str>, ui_preset: Option<&str>) -> Self {
         let ctx = egui::Context::default();
-        let opts = GuiOptions { open: project_dir.map(PathBuf::from), safe_mode: false, device: None, buffer: None, no_audio: true, screenshot: None, ui_preset: None };
+        let opts = GuiOptions {
+            open: project_dir.map(PathBuf::from),
+            safe_mode: false,
+            device: None,
+            buffer: None,
+            no_audio: true,
+            screenshot: None,
+            ui_preset: ui_preset.map(str::to_owned),
+        };
         let app = App::build(&ctx, opts, Preferences::default(), false);
         let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX };
         // two warm-up frames so panels and scroll areas settle
@@ -191,5 +203,29 @@ fn window_is_dark_only_and_draws_every_view_without_panicking() {
     let visuals = h.ctx.global_style().visuals.clone();
     assert!(visuals.dark_mode, "the owned UI is dark only");
     assert_eq!(visuals.panel_fill, theme::PANEL);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}
+
+#[test]
+fn multiband_canvas_paints_one_band_per_gesture_and_undo_restores_it() {
+    use rawdawg_effects::distortion::multiband::{Multiband, TYPE_ID};
+    let mut h = Harness::with_preset(Some("../../fixtures/demo-song.rawdawg"), Some(&format!("effect:{TYPE_ID}")));
+    let iid = h.app.effect_editor.expect("the preset opened a fresh insert");
+    assert_eq!(h.app.editor_view, EditorView::Effect);
+    let bands = |h: &mut Harness| h.app.other_mirrors.get_mut(&iid).unwrap().as_any_mut().downcast_mut::<Multiband>().unwrap().bands();
+    assert_eq!(bands(&mut h)[1].0, 0.0, "fresh insert: no drive");
+    let canvas = h.rect(egui::Id::unique("multiband-canvas"));
+    let rows = (canvas.height() - 14.0) / 3.0;
+    let col = canvas.width() / 4.0;
+    // drag upward in the Drive row of the second band: drive rises with the pointer
+    let x = canvas.min.x + col * 1.5;
+    h.drag(egui::pos2(x, canvas.min.y + rows - 6.0), egui::pos2(x, canvas.min.y + 8.0), egui::PointerButton::Primary);
+    let painted = bands(&mut h);
+    assert!(painted[1].0 > 30.0, "band 1 drive painted high: {}", painted[1].0);
+    assert_eq!(painted[0].0, 0.0, "neighbouring band untouched");
+    assert_eq!(painted[1].1, 100.0, "mix row untouched");
+    // the whole stroke is one undo entry; undo restores the unpainted band
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(bands(&mut h)[1].0, 0.0, "undo restores the band in one step");
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }

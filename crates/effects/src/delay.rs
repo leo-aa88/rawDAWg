@@ -47,9 +47,9 @@ const SYNC_QUARTERS: [f32; 14] = [0.0, 0.125, 1.0 / 6.0, 0.25, 1.0 / 3.0, 0.375,
 macro_rules! descriptors {
     ($($t:expr),*) => {
         [
-            ParamDescriptor::continuous(P_MODE, "mode", "Mode", ParamUnit::None, ParamMapping::Discrete { steps: 5 }, 0.0, ParamCategory::Topology).stepped(),
+            ParamDescriptor::continuous(P_MODE, "mode", "Mode", ParamUnit::None, ParamMapping::Discrete { steps: 5 }, 0.0, ParamCategory::Topology).stepped().with_labels(&MODE_LABELS),
             ParamDescriptor::continuous(P_TIME, "time", "Time", ParamUnit::Milliseconds, ParamMapping::Log { min: 1.0, max: 2000.0 }, 0.7598, ParamCategory::Effects).with_smoothing(60.0),
-            ParamDescriptor::continuous(P_SYNC, "sync", "Sync", ParamUnit::None, ParamMapping::Discrete { steps: 14 }, 0.0, ParamCategory::Effects).stepped(),
+            ParamDescriptor::continuous(P_SYNC, "sync", "Sync", ParamUnit::None, ParamMapping::Discrete { steps: 14 }, 0.0, ParamCategory::Effects).stepped().with_labels(&SYNC_LABELS),
             ParamDescriptor::continuous(P_FEEDBACK, "feedback", "Feedback", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 98.0 }, 0.4, ParamCategory::Effects).with_smoothing(20.0),
             ParamDescriptor::continuous(P_MIX, "mix", "Mix", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 100.0 }, 0.35, ParamCategory::Mix).with_smoothing(20.0),
             ParamDescriptor::continuous(P_DAMP, "damp", "Damping", ParamUnit::Hertz, ParamMapping::Log { min: 500.0, max: 20_000.0 }, 0.7, ParamCategory::Effects).with_smoothing(30.0),

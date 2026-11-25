@@ -93,6 +93,9 @@ pub struct ParamDescriptor {
     pub smoothing_ms: f32,
     pub flags: ParamFlags,
     pub category: ParamCategory,
+    /// Display labels for a `Discrete` mapping, one per step (menus and readouts use them).
+    #[serde(skip)]
+    pub labels: Option<&'static [&'static str]>,
 }
 
 impl ParamDescriptor {
@@ -108,7 +111,20 @@ impl ParamDescriptor {
             smoothing_ms: 10.0,
             flags: ParamFlags { automatable: true, modulatable: true, stepped: false, hidden: false, read_only: false, is_bypass: false },
             category,
+            labels: None,
         }
+    }
+
+    /// Attach one display label per discrete step.
+    pub const fn with_labels(mut self, labels: &'static [&'static str]) -> Self {
+        self.labels = Some(labels);
+        self
+    }
+
+    /// The label of the current step of a labelled discrete parameter.
+    pub fn label_for(&self, normalized: f32) -> Option<&'static str> {
+        let labels = self.labels?;
+        labels.get(self.to_physical(normalized).max(0.0) as usize).copied()
     }
 
     pub const fn with_smoothing(mut self, ms: f32) -> Self {
@@ -233,14 +249,25 @@ impl ParamDescriptor {
             && !self.name.is_empty()
     }
 
+    fn percent_range_is_unity(&self) -> bool {
+        match self.mapping {
+            ParamMapping::Linear { min, max } | ParamMapping::Log { min, max } | ParamMapping::LogWithZero { min, max } => (max - min).abs() <= 1.5,
+            _ => true,
+        }
+    }
+
     /// Format a normalized value for display.
     pub fn format(&self, normalized: f32) -> String {
         let p = self.to_physical(normalized);
         match (self.mapping, self.unit) {
             (ParamMapping::Toggle, _) => (if p >= 0.5 { "On" } else { "Off" }).to_owned(),
-            (ParamMapping::Discrete { .. }, _) => format!("{}", p as i64),
+            (ParamMapping::Discrete { .. }, _) => self.label_for(normalized).map(str::to_owned).unwrap_or_else(|| format!("{}", p as i64)),
             (ParamMapping::LogWithZero { .. }, _) if p <= 0.0 => "Off".to_owned(),
-            (_, ParamUnit::Percent) => format!("{:.0} %", p * 100.0),
+            (_, ParamUnit::Percent) => {
+                // physical ranges wider than unity are already expressed in percent
+                let scale = if self.percent_range_is_unity() { 100.0 } else { 1.0 };
+                format!("{:.0} %", p * scale)
+            }
             (_, ParamUnit::Decibel) => {
                 if p <= -144.0 {
                     "-inf dB".to_owned()

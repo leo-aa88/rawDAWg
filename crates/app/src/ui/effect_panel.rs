@@ -4,7 +4,7 @@
 
 use super::{App, AudioState, EngineCommand};
 use crate::theme;
-use egui::{Pos2, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_project::Command;
 use rawdawg_types::params::ParamMapping;
 use rawdawg_types::{InstanceId, ParamDescriptor, ParamId};
@@ -20,6 +20,8 @@ pub(crate) struct EffectPanelState {
     /// Reverb decay-shape band being dragged.
     shape_drag: Option<usize>,
     pub ir_path: String,
+    /// Multiband paint gesture in progress.
+    paint_active: bool,
 }
 
 fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
@@ -135,12 +137,21 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     if type_id == rawdawg_effects::convolution::TYPE_ID {
         convolution_editor(app, ui, instance_id, &mut cmds);
     }
+    if type_id == rawdawg_effects::distortion::multiband::TYPE_ID {
+        multiband_editor(app, ui, instance_id, &mut edits);
+    }
     let descriptors: Vec<ParamDescriptor> = app.other_mirrors[&instance_id].descriptors().iter().filter(|d| !d.flags.hidden).copied().collect();
     let simple_only = !app.effect_panel.advanced && type_id == rawdawg_effects::eq::TYPE_ID;
     if !simple_only {
         // the multitap tap parameters are edited on the canvas unless Advanced is on
-        let shown: Vec<ParamDescriptor> =
-            if type_id == rawdawg_effects::delay::TYPE_ID && !app.effect_panel.advanced { descriptors.iter().filter(|d| d.id.0 < 100).copied().collect() } else { descriptors };
+        let shown: Vec<ParamDescriptor> = if type_id == rawdawg_effects::delay::TYPE_ID && !app.effect_panel.advanced {
+            descriptors.iter().filter(|d| d.id.0 < 100).copied().collect()
+        } else if type_id == rawdawg_effects::distortion::multiband::TYPE_ID && !app.effect_panel.advanced {
+            // per-band drive/mix/gain are painted on the canvas unless Advanced is on
+            descriptors.iter().filter(|d| d.id.0 < 20).copied().collect()
+        } else {
+            descriptors
+        };
         param_grid(app, ui, instance_id, &shown, &mut edits);
     }
     apply_edits(app, instance_id, &type_id, edits);
@@ -160,6 +171,25 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
                     let mut b = n >= 0.5;
                     let r = ui.checkbox(&mut b, "");
                     n = if b { 1.0 } else { 0.0 };
+                    r
+                }
+                ParamMapping::Discrete { steps } if d.labels.is_some_and(|l| l.len() >= steps as usize) => {
+                    let labels = d.labels.unwrap_or_default();
+                    let mut idx = (d.to_physical(n).max(0.0) as usize).min(labels.len() - 1);
+                    let mut r = egui::ComboBox::from_id_salt(("fx-combo", instance_id, d.id.0))
+                        .selected_text(labels[idx])
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            for (i, l) in labels.iter().enumerate() {
+                                changed |= ui.selectable_value(&mut idx, i, *l).changed();
+                            }
+                            changed
+                        })
+                        .response;
+                    if idx != d.to_physical(n).max(0.0) as usize {
+                        r.mark_changed();
+                    }
+                    n = d.to_normalized(idx as f64);
                     r
                 }
                 ParamMapping::Discrete { steps } => {
@@ -692,4 +722,83 @@ fn convolution_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId,
         }
         cmds.push(Command::SetInstanceState { instance_id, state_version: 1, state });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-band distortion: paint drive / mix / gain across the four bands
+
+fn multiband_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    use rawdawg_effects::distortion::multiband::{B_DRIVE, B_GAIN, B_MIX, BAND_LABELS, BANDS, Multiband, band_param};
+    let descs = app.other_mirrors[&instance_id].descriptors();
+    let desc = |id: u32| descs.iter().find(|d| d.id.0 == id).copied();
+    let bands = {
+        let m = app.other_mirrors.get_mut(&instance_id).expect("mirror");
+        m.as_any_mut().downcast_mut::<Multiband>().expect("multiband mirror").bands()
+    };
+    let rows: [(&str, u32, f32, f32); 3] = [("Drive", B_DRIVE, 0.0, 40.0), ("Mix", B_MIX, 0.0, 100.0), ("Gain", B_GAIN, -24.0, 12.0)];
+    let (_, full) = ui.allocate_space(vec2(ui.available_width().max(300.0), 164.0));
+    let resp = ui.interact(full, egui::Id::unique("multiband-canvas"), Sense::click_and_drag());
+    let painter = ui.painter_at(full);
+    painter.rect_filled(full, 4.0, theme::BACKGROUND);
+    let rect = Rect::from_min_max(full.min, pos2(full.max.x, full.max.y - 14.0));
+    let row_h = rect.height() / 3.0;
+    let col_w = rect.width() / BANDS as f32;
+    let ptr = super::PointerState::read(ui);
+    let over = resp.contains_pointer();
+    for (ri, (label, off, lo, hi)) in rows.iter().enumerate() {
+        let y0 = rect.min.y + ri as f32 * row_h;
+        painter.line_segment([pos2(rect.min.x, y0), pos2(rect.max.x, y0)], Stroke::new(1.0, theme::BORDER));
+        painter.text(pos2(rect.min.x + 4.0, y0 + 2.0), egui::Align2::LEFT_TOP, *label, egui::FontId::proportional(9.0), theme::TEXT_SECONDARY);
+        for b in 0..BANDS {
+            let v = match *off {
+                B_DRIVE => bands[b].0,
+                B_MIX => bands[b].1,
+                _ => bands[b].2,
+            };
+            let frac = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let x0 = rect.min.x + b as f32 * col_w + 6.0;
+            let bar = Rect::from_min_max(pos2(x0, y0 + row_h - 4.0 - frac * (row_h - 16.0)), pos2(x0 + col_w - 12.0, y0 + row_h - 4.0));
+            let col = match *off {
+                B_DRIVE => theme::WARNING,
+                B_MIX => theme::ACCENT,
+                _ => Color32::from_rgb(0x7F, 0xA8, 0xE6),
+            };
+            painter.rect_filled(bar, 2.0, col.linear_multiply(0.8));
+            painter.text(pos2(x0 + (col_w - 12.0) * 0.5, y0 + row_h - 5.0), egui::Align2::CENTER_BOTTOM, format!("{v:.0}"), egui::FontId::proportional(9.0), theme::TEXT);
+            if ri == 2 {
+                painter.text(
+                    pos2(x0 + (col_w - 12.0) * 0.5, full.max.y - 1.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    BAND_LABELS[b],
+                    egui::FontId::proportional(9.0),
+                    theme::TEXT_SECONDARY,
+                );
+            }
+        }
+    }
+    if ptr.primary_pressed && over {
+        app.effect_panel.paint_active = true;
+    }
+    if app.effect_panel.paint_active
+        && ptr.primary_down
+        && let Some(p) = ptr.pos
+        && rect.contains(p)
+    {
+        let ri = (((p.y - rect.min.y) / row_h) as usize).min(2);
+        let b = (((p.x - rect.min.x) / col_w) as usize).min(BANDS - 1);
+        let (_, off, lo, hi) = rows[ri];
+        let y0 = rect.min.y + ri as f32 * row_h;
+        let frac = ((y0 + row_h - 4.0 - p.y) / (row_h - 16.0)).clamp(0.0, 1.0);
+        let v = lo + frac * (hi - lo);
+        if let Some(d) = desc(band_param(b, off)) {
+            edits.push((d.id, d.to_normalized(f64::from(v)), ptr.primary_pressed, false));
+        }
+    }
+    if app.effect_panel.paint_active && (ptr.primary_released || !ptr.primary_down) {
+        app.effect_panel.paint_active = false;
+        if let Some(d) = desc(band_param(0, B_DRIVE)) {
+            edits.push((d.id, d.to_normalized(f64::from(bands[0].0)), false, true));
+        }
+    }
+    ui.label(egui::RichText::new("Paint drive, mix and gain per band by dragging across the rows; bands recombine at unity when untouched").color(theme::TEXT_SECONDARY).small());
 }

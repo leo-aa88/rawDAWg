@@ -256,8 +256,8 @@ impl Convolution {
             for part in 0..k {
                 input.fill(0.0);
                 let start = part * PARTITION;
-                for i in 0..PARTITION {
-                    input[i] = src.get(start + i).copied().unwrap_or(0.0);
+                for (i, v) in input.iter_mut().take(PARTITION).enumerate() {
+                    *v = src.get(start + i).copied().unwrap_or(0.0);
                 }
                 let mut spec = self.fft.make_output_vec();
                 let _ = self.fft.process_with_scratch(&mut input, &mut spec, &mut self.scratch_f);
@@ -379,9 +379,9 @@ impl Processor for Convolution {
                 self.ch[0].fifo_pos = pos;
                 self.ch[1].fifo_pos = pos;
             }
-            for c in 0..2 {
+            for (c, w_out) in wet.iter_mut().enumerate() {
                 let ch = &mut self.ch[c];
-                ch.pre.push(wet[c]);
+                ch.pre.push(*w_out);
                 let mut w = ch.pre.read_frac(pre) * gain;
                 if lc_on {
                     w = ch.lowcut.process(w);
@@ -389,7 +389,7 @@ impl Processor for Convolution {
                 if hc_on {
                     w = ch.highcut.process(w);
                 }
-                wet[c] = w;
+                *w_out = w;
             }
             l[i] = xs[0] + (wet[0] - xs[0]) * mix;
             r[i] = xs[1] + (wet[1] - xs[1]) * mix;

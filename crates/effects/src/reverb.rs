@@ -40,7 +40,7 @@ pub const P_SHIMMER_AMOUNT: u32 = 13;
 pub const P_SHAPE0: u32 = 20;
 
 pub static DESCRIPTORS: [ParamDescriptor; 17] = [
-    ParamDescriptor::continuous(P_MODE, "mode", "Type", ParamUnit::None, ParamMapping::Discrete { steps: 6 }, 0.2, ParamCategory::Topology).stepped(),
+    ParamDescriptor::continuous(P_MODE, "mode", "Type", ParamUnit::None, ParamMapping::Discrete { steps: 6 }, 0.2, ParamCategory::Topology).stepped().with_labels(&MODE_LABELS),
     ParamDescriptor::continuous(P_SIZE, "size", "Size", ParamUnit::Percent, ParamMapping::Linear { min: 50.0, max: 200.0 }, 1.0 / 3.0, ParamCategory::Effects)
         .with_smoothing(200.0),
     ParamDescriptor::continuous(P_DECAY, "decay", "Decay (RT60)", ParamUnit::Seconds, ParamMapping::Log { min: 0.1, max: 30.0 }, 0.5, ParamCategory::Effects).with_smoothing(100.0),

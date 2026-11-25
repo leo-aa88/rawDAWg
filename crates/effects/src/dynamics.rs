@@ -41,7 +41,9 @@ pub mod compressor {
         ParamDescriptor::continuous(P_KNEE, "knee", "Knee", ParamUnit::Decibel, ParamMapping::Linear { min: 0.0, max: 24.0 }, 0.25, ParamCategory::Effects),
         ParamDescriptor::continuous(P_MAKEUP, "makeup", "Makeup", ParamUnit::Decibel, ParamMapping::Linear { min: 0.0, max: 24.0 }, 0.0, ParamCategory::Effects)
             .with_smoothing(10.0),
-        ParamDescriptor::continuous(P_DETECTOR, "detector", "Detector", ParamUnit::None, ParamMapping::Discrete { steps: 2 }, 0.0, ParamCategory::Effects).stepped(),
+        ParamDescriptor::continuous(P_DETECTOR, "detector", "Detector", ParamUnit::None, ParamMapping::Discrete { steps: 2 }, 0.0, ParamCategory::Effects)
+            .stepped()
+            .with_labels(&DETECTOR_LABELS),
         ParamDescriptor::continuous(P_SIDECHAIN, "sidechain", "External sidechain", ParamUnit::None, ParamMapping::Toggle, 0.0, ParamCategory::Effects).stepped(),
         ParamDescriptor::continuous(P_MIX, "mix", "Mix", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 100.0 }, 1.0, ParamCategory::Mix).with_smoothing(10.0),
     ];

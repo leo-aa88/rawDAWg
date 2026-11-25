@@ -208,3 +208,29 @@ fn effects_process_path_is_allocation_free() {
         assert_eq!(allocs, 0, "{type_id} allocates on the process path");
     }
 }
+
+#[test]
+fn every_catalogue_entry_instantiates_and_every_effect_is_listed() {
+    for e in rawdawg_effects::CATALOG.iter() {
+        let p = rawdawg_effects::make_effect(e.type_id, None).unwrap_or_else(|err| panic!("{}: {err}", e.type_id));
+        assert!(!p.descriptors().is_empty(), "{} has parameters", e.type_id);
+        for preset in rawdawg_effects::presets(e.type_id) {
+            assert!(rawdawg_effects::preset_state(e.type_id, preset).is_some(), "{}: preset {} serializes", e.type_id, preset.name);
+        }
+    }
+    // every type with presets is in the catalogue (menus can reach it)
+    for id in [
+        rawdawg_effects::eq::TYPE_ID,
+        rawdawg_effects::stereo::TYPE_ID,
+        rawdawg_effects::delay::TYPE_ID,
+        rawdawg_effects::reverb::TYPE_ID,
+        rawdawg_effects::convolution::TYPE_ID,
+        rawdawg_effects::distortion::single::TYPE_ID,
+        rawdawg_effects::distortion::multiband::TYPE_ID,
+        rawdawg_effects::dynamics::compressor::TYPE_ID,
+        rawdawg_effects::dynamics::limiter::TYPE_ID,
+        rawdawg_effects::dynamics::gate::TYPE_ID,
+    ] {
+        assert!(rawdawg_effects::info(id).is_some_and(|i| i.listed), "{id} is listed in the catalogue");
+    }
+}
