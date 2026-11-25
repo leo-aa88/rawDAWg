@@ -2,6 +2,7 @@
 //! keyboards, synth parameter panel, settings, status.
 
 mod evolve;
+mod graph_editor;
 mod instrument_panel;
 mod keyboard;
 mod presets;
@@ -34,6 +35,8 @@ pub struct GuiOptions {
     pub no_audio: bool,
     /// Capture a screenshot to this path after the delay, then exit.
     pub screenshot: Option<(PathBuf, std::time::Duration)>,
+    /// Initial UI state preset (`advanced`, `graph`).
+    pub ui_preset: Option<String>,
 }
 
 pub fn run_gui(opts: GuiOptions) -> anyhow::Result<()> {
@@ -181,6 +184,16 @@ impl App {
         };
         app.rebuild_mirrors();
         app.recompile();
+        match opts.ui_preset.as_deref() {
+            Some("advanced") => app.synth_panel.advanced = true,
+            Some("graph") => {
+                app.synth_panel.advanced = true;
+                app.synth_panel.graph.scope = rawdawg_synthesizer::graph::Scope::Voice;
+                app.synth_panel.graph.focus_frames = 4;
+            }
+            Some(other) => app.status_line = format!("Unknown --ui-preset {other}"),
+            None => {}
+        }
         app
     }
 
@@ -989,7 +1002,7 @@ impl eframe::App for App {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("browser").resizable(true).default_size(220.0).show(ui, |ui| self.browser(ui));
-        egui::Panel::bottom("editor").resizable(true).default_size(380.0).show(ui, |ui| {
+        egui::Panel::bottom("editor").resizable(true).default_size(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.editor_view {
                 EditorView::Rack => self.rack(ui),
                 EditorView::Synth => {

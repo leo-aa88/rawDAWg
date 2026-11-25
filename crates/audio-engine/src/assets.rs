@@ -36,6 +36,7 @@ impl AssetResolver for NoAssets {
 pub struct ProjectAssetCache {
     project_dir: Option<PathBuf>,
     paths: HashMap<AssetId, PathBuf>,
+    names: HashMap<AssetId, String>,
     samples: Mutex<HashMap<AssetId, Option<Arc<SampleAsset>>>>,
     fonts: Mutex<HashMap<AssetId, Option<Arc<SoundFont>>>>,
     problems: Mutex<Vec<String>>,
@@ -43,7 +44,7 @@ pub struct ProjectAssetCache {
 
 impl ProjectAssetCache {
     pub fn new(project_dir: Option<PathBuf>) -> Self {
-        Self { project_dir, paths: HashMap::new(), samples: Mutex::new(HashMap::new()), fonts: Mutex::new(HashMap::new()), problems: Mutex::new(Vec::new()) }
+        Self { project_dir, paths: HashMap::new(), names: HashMap::new(), samples: Mutex::new(HashMap::new()), fonts: Mutex::new(HashMap::new()), problems: Mutex::new(Vec::new()) }
     }
 
     /// Point the cache at a (possibly new) project; keeps decoded data for ids that still resolve.
@@ -54,10 +55,12 @@ impl ProjectAssetCache {
             self.project_dir = project_dir;
         }
         self.paths.clear();
+        self.names.clear();
         if let Some(dir) = &self.project_dir {
             for a in &project.assets {
                 if let Some(p) = rawdawg_project::assets::asset_path(dir, a) {
                     self.paths.insert(a.id.clone(), p);
+                    self.names.insert(a.id.clone(), a.source_name.clone());
                 }
             }
         }
@@ -93,7 +96,10 @@ impl AssetResolver for ProjectAssetCache {
         }
         let result = match self.paths.get(id) {
             Some(path) => match rawdawg_sampler::decode_file(path) {
-                Ok(a) => Some(a),
+                Ok(a) => Some(match self.names.get(id) {
+                    Some(n) if !n.is_empty() => Arc::new(SampleAsset { name: n.clone(), sample_rate: a.sample_rate, channels: a.channels.clone() }),
+                    _ => a,
+                }),
                 Err(e) => {
                     self.note(format!("sample {} could not be decoded: {e}", path.display()));
                     None

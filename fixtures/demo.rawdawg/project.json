@@ -56,6 +56,17 @@
             "release_s": 0.20000000298023224,
             "sustain": 0.0
           },
+          "graph": {
+            "global": {
+              "edges": [],
+              "nodes": []
+            },
+            "version": 1,
+            "voice": {
+              "edges": [],
+              "nodes": []
+            }
+          },
           "layers": [
             {
               "coarse_semitones": 0,

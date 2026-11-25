@@ -1,5 +1,6 @@
 //! The `native.synth` processor.
 
+use crate::graph::{self, CompiledGraph, GraphState, Workspace};
 use crate::modulation::LfoState;
 use crate::params::{self, DESCRIPTORS, ParamBlock};
 use crate::patch::{FmAlgorithm, Generator, GrainWindow, Layer, LfoShape, MAX_LAYERS, MAX_LFOS, MAX_MOD_ROUTES, ModRoute, ModSource, ModTarget, Patch, VoiceMode};
@@ -56,6 +57,12 @@ pub struct Synth {
     global_lfo_values: [f32; MAX_LFOS],
     lfo_rng: DeterministicRng,
     tempo_bpm: f64,
+    /// Compiled modular graphs (None = pass-through) and their scratch workspaces.
+    voice_graph: Option<CompiledGraph>,
+    global_graph: Option<CompiledGraph>,
+    voice_ws: Workspace,
+    global_ws: Workspace,
+    global_state: Option<GraphState>,
 }
 
 impl Default for Synth {
@@ -89,7 +96,29 @@ impl Synth {
             global_lfo_values: [0.0; MAX_LFOS],
             lfo_rng: DeterministicRng::new(0x1F0, 0),
             tempo_bpm: 120.0,
+            voice_graph: None,
+            global_graph: None,
+            voice_ws: Workspace::default(),
+            global_ws: Workspace::default(),
+            global_state: None,
         }
+    }
+
+    /// Compiled voice/global graphs (for tests and UI diagnostics).
+    pub fn compiled_graphs(&self) -> (Option<&CompiledGraph>, Option<&CompiledGraph>) {
+        (self.voice_graph.as_ref(), self.global_graph.as_ref())
+    }
+
+    /// Expression diagnostics summed over all voices and the global graph.
+    pub fn expr_diagnostics(&self) -> crate::expr::ExprDiagnostics {
+        let mut d = self.global_state.as_ref().map(|g| g.expr_diagnostics()).unwrap_or_default();
+        for v in &self.voices {
+            let x = v.expr_diagnostics();
+            d.division_by_zero += x.division_by_zero;
+            d.domain_errors += x.domain_errors;
+            d.nonfinite += x.nonfinite;
+        }
+        d
     }
 
     pub fn patch(&self) -> &Patch {
@@ -133,14 +162,21 @@ impl Synth {
         if self.tables.is_none() {
             self.tables = Some(BasicTables::build());
         }
+        // Graphs were validated with the patch; an empty subgraph is a pass-through.
+        self.voice_graph = if self.patch.graph.voice.is_empty() { None } else { graph::compile(&self.patch.graph.voice, graph::Scope::Voice).ok() };
+        self.global_graph = if self.patch.graph.global.is_empty() { None } else { graph::compile(&self.patch.graph.global, graph::Scope::Global).ok() };
+        self.voice_ws = self.voice_graph.as_ref().map(Workspace::new).unwrap_or_default();
+        self.global_ws = self.global_graph.as_ref().map(Workspace::new).unwrap_or_default();
+        self.global_state = self.global_graph.as_ref().map(|g| GraphState::new(g, self.sample_rate as f32, 0x6107));
         let wanted = self.patch.max_voices as usize + SPARE_VOICES;
         if self.voices.len() != wanted {
-            self.voices = (0..wanted).map(|i| Voice::new(self.sample_rate, &self.patch, i)).collect();
+            self.voices = (0..wanted).map(|i| Voice::new(self.sample_rate, &self.patch, i, self.voice_graph.as_ref())).collect();
         } else {
             for v in &mut self.voices {
                 v.kill();
                 v.set_sample_rate(self.sample_rate);
                 v.set_envelopes(self.patch.amp_env, self.patch.filter_env);
+                v.set_graph(self.voice_graph.as_ref());
             }
         }
         self.master.snap(rawdawg_dsp::math::db_to_lin(self.patch.master_db));
@@ -343,6 +379,9 @@ impl Synth {
     fn hard_reset(&mut self) {
         for v in self.voices.iter_mut() {
             v.kill();
+        }
+        if let Some(g) = &mut self.global_state {
+            g.reset();
         }
         self.held.clear();
         self.sustain.clear();
@@ -634,11 +673,32 @@ impl Synth {
             {
                 let tables = self.tables.as_ref().expect("checked above");
                 let lfo_vals = self.global_lfo_values;
+                let graph = self.voice_graph.as_ref();
                 for v in self.voices.iter_mut() {
                     if v.is_active() {
-                        v.render_add(&mut out_l[pos..end], &mut out_r[pos..end], &self.patch, &self.layers, tables, &lfo_vals, self.tempo_bpm);
+                        v.render_add(&mut out_l[pos..end], &mut out_r[pos..end], &self.patch, &self.layers, tables, &lfo_vals, self.tempo_bpm, graph, &mut self.voice_ws);
                     }
                 }
+            }
+            if let (Some(g), Some(state)) = (self.global_graph.as_ref(), self.global_state.as_mut()) {
+                let tables = self.tables.as_ref().expect("checked above");
+                let mut in_l = [0.0f32; CONTROL_INTERVAL];
+                let mut in_r = [0.0f32; CONTROL_INTERVAL];
+                in_l[..chunk].copy_from_slice(&out_l[pos..end]);
+                in_r[..chunk].copy_from_slice(&out_r[pos..end]);
+                let src = graph::Sources {
+                    mix_l: &in_l,
+                    mix_r: &in_r,
+                    pitch_norm: 69.0 / 127.0,
+                    gate: &in_l,
+                    velocity: 1.0,
+                    amp_env: 1.0,
+                    filter_env: 1.0,
+                    lfo: self.global_lfo_values,
+                    a4_hz: self.patch.tuning.a4_hz,
+                    tables,
+                };
+                g.run(state, &mut self.global_ws, &src, &mut out_l[pos..end], &mut out_r[pos..end]);
             }
             self.tick_xfades(chunk);
             pos = end;
@@ -662,6 +722,25 @@ impl Processor for Synth {
         let Some(old) = old.as_any_mut().downcast_mut::<Synth>() else { return };
         if !old.prepared || !self.prepared || old.sample_rate != self.sample_rate || old.voices.len() != self.voices.len() {
             return;
+        }
+        // Voice graph state: carry over when the node layout is unchanged, otherwise move the
+        // fresh (silent) states of this instance into the live voices (bounded swaps, no allocation).
+        let carry = match (&self.voice_graph, &old.voice_graph) {
+            (Some(a), Some(b)) => a.state_compatible(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !carry {
+            for (n, o) in self.voices.iter_mut().zip(old.voices.iter_mut()) {
+                n.swap_graph_state(o);
+            }
+        }
+        let carry_global = match (&self.global_graph, &old.global_graph) {
+            (Some(a), Some(b)) => a.state_compatible(b),
+            _ => false,
+        };
+        if carry_global {
+            std::mem::swap(&mut self.global_state, &mut old.global_state);
         }
         std::mem::swap(&mut self.voices, &mut old.voices);
         std::mem::swap(&mut self.sustain, &mut old.sustain);

@@ -662,6 +662,9 @@ pub struct Patch {
     /// Randomization provenance and locks (persisted with the sound).
     #[serde(default)]
     pub mutation: MutationInfo,
+    /// Optional modular graph (SYN-07); empty = pass-through.
+    #[serde(default)]
+    pub graph: crate::graph::Graph,
 }
 
 /// Randomization bookkeeping stored in the patch (PROJECT_FORMAT.md §4).
@@ -756,6 +759,7 @@ impl Default for Patch {
             lfos: default_lfos(),
             mod_routes: vec![],
             mutation: MutationInfo::default(),
+            graph: crate::graph::Graph::default(),
         }
     }
 }
@@ -789,6 +793,7 @@ impl Patch {
         if !self.master_db.is_finite() || !(-60.0..=12.0).contains(&self.master_db) {
             return Err("master gain out of range".into());
         }
+        self.graph.validate().map_err(|e| format!("graph: {e}"))?;
         if !self.velocity_sensitivity.is_finite() || !(0.0..=1.0).contains(&self.velocity_sensitivity) {
             return Err("velocity sensitivity out of range".into());
         }

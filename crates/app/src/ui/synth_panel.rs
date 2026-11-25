@@ -20,11 +20,12 @@ pub(crate) struct SynthPanelState {
     pub waveform: super::waveform::WaveformState,
     pub evolve: super::evolve::EvolveState,
     pub presets: super::presets::PresetBrowserState,
+    pub graph: super::graph_editor::GraphEditorState,
 }
 
 impl Default for SynthPanelState {
     fn default() -> Self {
-        Self { gesture: None, advanced: false, waveform: Default::default(), evolve: super::evolve::EvolveState::new(), presets: Default::default() }
+        Self { gesture: None, advanced: false, waveform: Default::default(), evolve: super::evolve::EvolveState::new(), presets: Default::default(), graph: Default::default() }
     }
 }
 
@@ -124,6 +125,13 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Modulation matrix").show(ui, |ui| {
             mod_matrix(app, ui, instance_id, &patch);
         });
+        let header = egui::CollapsingHeader::new("Modular graph").default_open(!patch.graph.is_empty()).show(ui, |ui| {
+            super::graph_editor::show(app, ui, instance_id, &patch);
+        });
+        if app.synth_panel.graph.focus_frames > 0 {
+            app.synth_panel.graph.focus_frames -= 1;
+            header.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
     }
     apply_edits(app, instance_id, edits);
     ui.separator();

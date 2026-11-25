@@ -168,6 +168,41 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok((format!("{} frames, beat 1 fundamental {f:.2} Hz, peak {:.3}", stats.frames, stats.peak), Some(dir.display().to_string())))
     }));
+    checks.push(check("HL-09 modular graph demo (delayed feedback, expression node) renders finite and audible", &["SYN-07", "QUAL-02"], || {
+        let dir = root.join("fixtures/demo-graph.rawdawg");
+        let p = rawdawg_project::load_project_dir(&dir)?;
+        let state = &p.channels[0].instrument.state;
+        let patch: rawdawg_synthesizer::Patch = serde_json::from_value(state.clone())?;
+        let voice = rawdawg_synthesizer::graph::compile(&patch.graph.voice, rawdawg_synthesizer::graph::Scope::Voice)?;
+        let global = rawdawg_synthesizer::graph::compile(&patch.graph.global, rawdawg_synthesizer::graph::Scope::Global)?;
+        if voice.feedback_edges.is_empty() {
+            bail!("the demo voice graph should contain an explicit feedback edge");
+        }
+        let opts = OfflineOptions { tail_seconds: 1.0, ..Default::default() };
+        let (l, r, stats) = render_project(&p, &opts)?;
+        if stats.nonfinite_blocks > 0 {
+            bail!("nonfinite blocks");
+        }
+        let level = rawdawg_dsp::math::rms(&l[2000..40_000]);
+        if level < 0.03 {
+            bail!("graph demo is too quiet: rms {level:.4}");
+        }
+        let tail = rawdawg_dsp::math::rms(&l[l.len() - 24_000..]);
+        let wav = out.join("hl-09-graph-demo.wav");
+        rawdawg_audio_engine::offline::write_wav(&l, &r, 48_000, WavFormat::Pcm16, &wav)?;
+        Ok((
+            format!(
+                "voice cost {}/{} ({} feedback edge), global cost {}/{}, rms {level:.3}, tail rms {tail:.4}, peak {:.3}",
+                voice.cost,
+                rawdawg_synthesizer::graph::MAX_VOICE_COST,
+                voice.feedback_edges.len(),
+                global.cost,
+                rawdawg_synthesizer::graph::MAX_GLOBAL_COST,
+                stats.peak
+            ),
+            Some(wav.display().to_string()),
+        ))
+    }));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");

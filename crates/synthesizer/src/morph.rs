@@ -30,6 +30,7 @@ pub fn compatible(corners: &[&Patch; 4]) -> bool {
                     }
             })
             && p.mod_routes.len() == a.mod_routes.len()
+            && p.graph.same_topology(&a.graph)
     })
 }
 
@@ -66,6 +67,11 @@ pub fn morph(corners: &[&Patch; 4], x: f32, y: f32) -> Option<Patch> {
         target.set_param(d.id, v);
     }
     out = target.patch().clone();
+    // modular graph: same topology (checked above), interpolate node parameters
+    if !out.graph.is_empty() {
+        let graphs: Vec<&crate::graph::Graph> = corners.iter().map(|p| &p.graph).collect();
+        crate::graph::morph_params(&graphs, &w, &mut out.graph);
+    }
     // waveforms: time-domain blend with aligned phase
     for (li, layer) in out.layers.iter_mut().enumerate() {
         match &mut layer.generator {

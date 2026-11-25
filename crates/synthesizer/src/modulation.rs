@@ -9,11 +9,12 @@ pub struct LfoState {
     phase: f64,
     held: f32,
     last_cycle: u64,
+    last: f32,
 }
 
 impl Default for LfoState {
     fn default() -> Self {
-        Self { phase: 0.0, held: 0.0, last_cycle: u64::MAX }
+        Self { phase: 0.0, held: 0.0, last_cycle: u64::MAX, last: 0.0 }
     }
 }
 
@@ -55,7 +56,13 @@ impl LfoState {
                 self.held
             }
         };
-        v * lfo.depth
+        self.last = v * lfo.depth;
+        self.last
+    }
+
+    /// Most recent value returned by [`advance`](Self::advance).
+    pub fn value(&self) -> f32 {
+        self.last
     }
 }
 

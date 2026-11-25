@@ -82,6 +82,11 @@ pub struct Args {
     /// Delay before the screenshot is captured.
     #[arg(long, default_value_t = 2000)]
     pub screenshot_delay_ms: u64,
+
+    /// Start with a UI state preset (verification aid): `advanced` opens the synth's
+    /// advanced sections, `graph` additionally focuses the modular graph editor.
+    #[arg(long, value_name = "NAME")]
+    pub ui_preset: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +173,7 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
         buffer: args.buffer,
         no_audio: args.no_audio,
         screenshot: args.screenshot.clone().map(|p| (p, std::time::Duration::from_millis(args.screenshot_delay_ms))),
+        ui_preset: args.ui_preset.clone(),
     })?;
     Ok(0)
 }

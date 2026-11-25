@@ -2,6 +2,7 @@
 //! amp envelope → filter, with control-rate modulation.
 
 use crate::generators::{AdditiveState, FmState, GranularState, PluckState, read_frames, unison_detune, unison_gain, unison_pan};
+use crate::graph::{CompiledGraph, GraphState, Sources, Workspace};
 use crate::modulation::{LfoState, ModInputs, ModOutputs};
 use crate::patch::{Generator, Lfo, MAX_LAYERS, MAX_LFOS, MAX_UNISON, ModTarget, Patch};
 use crate::registry::NoteKey;
@@ -268,10 +269,14 @@ pub struct Voice {
     control_counter: usize,
     mods: ModOutputs,
     seed: u64,
+    /// Per-voice modular graph state (None when the voice graph is empty).
+    graph: Option<GraphState>,
+    /// Force a gate rising edge on the next sub-block (retrigger).
+    gate_pulse: bool,
 }
 
 impl Voice {
-    pub fn new(sample_rate: f64, patch: &Patch, index: usize) -> Self {
+    pub fn new(sample_rate: f64, patch: &Patch, index: usize, graph: Option<&CompiledGraph>) -> Self {
         let sr = sample_rate as f32;
         let seed = 0x0B00_B1E5 + index as u64;
         let layers = (0..MAX_LAYERS)
@@ -306,7 +311,27 @@ impl Voice {
             control_counter: 0,
             mods: ModOutputs::default(),
             seed,
+            graph: graph.map(|g| GraphState::new(g, sr, seed)),
+            gate_pulse: false,
         }
+    }
+
+    /// Non-RT: (re)build the per-voice graph state for a new compiled graph.
+    pub fn set_graph(&mut self, graph: Option<&CompiledGraph>) {
+        self.graph = graph.map(|g| GraphState::new(g, self.sample_rate as f32, self.seed));
+    }
+
+    /// RT: exchange graph states with another voice slot (bounded move, no allocation).
+    pub fn swap_graph_state(&mut self, other: &mut Voice) {
+        std::mem::swap(&mut self.graph, &mut other.graph);
+    }
+
+    pub fn has_graph_state(&self) -> bool {
+        self.graph.is_some()
+    }
+
+    pub fn expr_diagnostics(&self) -> crate::expr::ExprDiagnostics {
+        self.graph.as_ref().map(|g| g.expr_diagnostics()).unwrap_or_default()
     }
 
     pub fn is_active(&self) -> bool {
@@ -347,6 +372,10 @@ impl Voice {
             }
             self.amp.note_on();
             self.fenv.note_on();
+            self.gate_pulse = true;
+            if let Some(g) = &mut self.graph {
+                g.reset();
+            }
             for l in &mut self.lfo {
                 l.reset();
             }
@@ -496,14 +525,17 @@ impl Voice {
         tables: &BasicTables,
         global_lfo: &[f32; MAX_LFOS],
         tempo_bpm: f64,
+        graph: Option<&CompiledGraph>,
+        ws: &mut Workspace,
     ) -> bool {
         if self.key.is_none() {
             return false;
         }
+        let n = out_l.len().min(CONTROL_INTERVAL);
         if self.control_counter == 0 {
             self.update_control(patch, layers, global_lfo, tempo_bpm);
         }
-        self.control_counter += out_l.len();
+        self.control_counter += n;
         if self.control_counter >= CONTROL_INTERVAL {
             self.control_counter = 0;
         }
@@ -515,14 +547,21 @@ impl Voice {
         let grain_mod = self.mods.get(ModTarget::GrainPosition);
         let level_mods =
             [self.mods.get(ModTarget::LayerLevel1), self.mods.get(ModTarget::LayerLevel2), self.mods.get(ModTarget::LayerLevel3), self.mods.get(ModTarget::LayerLevel4)];
-        for i in 0..out_l.len() {
+        // Envelopes and pitch glide first; `alive` samples remain before the amp envelope ends.
+        let mut env = [0.0f32; CONTROL_INTERVAL];
+        let mut alive = n;
+        for (i, e) in env.iter_mut().enumerate().take(n) {
             self.pitch.next();
-            let env = self.amp.next();
+            *e = self.amp.next();
             self.fenv.next();
             if !self.amp.is_active() {
-                self.kill();
-                return false;
+                alive = i;
+                break;
             }
+        }
+        let mut sl = [0.0f32; CONTROL_INTERVAL];
+        let mut sr_buf = [0.0f32; CONTROL_INTERVAL];
+        for i in 0..alive {
             let mut l = 0.0f32;
             let mut r = 0.0f32;
             for (li, (lv, le)) in self.layers.iter_mut().zip(layers.iter()).enumerate() {
@@ -574,7 +613,7 @@ impl Voice {
                     }
                     LayerKind::Granular { settings, source } => {
                         let hz = lv.osc[0].increment() * self.sample_rate;
-                        let pos = (grain_mod + 0.5 * (1.0 + self.random * 0.0)).clamp(0.0, 1.0);
+                        let pos = (grain_mod + 0.5).clamp(0.0, 1.0);
                         let s = lv.granular.next(settings, source, hz, pos) * gain;
                         l += s * le.pan_l;
                         r += s * le.pan_r;
@@ -588,13 +627,55 @@ impl Voice {
                     }
                 }
             }
+            sl[i] = l;
+            sr_buf[i] = r;
+        }
+        // Per-voice modular graph between the generators and the filter/amp stage.
+        if let (Some(g), Some(state)) = (graph, self.graph.as_mut()) {
+            let mut gate = [0.0f32; CONTROL_INTERVAL];
+            let held = if self.released { 0.0 } else { 1.0 };
+            gate[..alive].fill(held);
+            if self.gate_pulse && alive > 0 {
+                gate[0] = 0.0;
+                self.gate_pulse = false;
+            }
+            let mut lfo_vals = *global_lfo;
+            for (i, lfo) in patch.lfos.iter().enumerate().take(MAX_LFOS) {
+                if lfo.per_voice {
+                    lfo_vals[i] = self.lfo[i].value();
+                }
+            }
+            let src = Sources {
+                mix_l: &sl,
+                mix_r: &sr_buf,
+                pitch_norm: (self.pitch.current() + self.bend_semitones) / 127.0,
+                gate: &gate,
+                velocity: self.velocity,
+                amp_env: self.amp.level(),
+                filter_env: self.fenv.level(),
+                lfo: lfo_vals,
+                a4_hz: patch.tuning.a4_hz,
+                tables,
+            };
+            let mut gl = [0.0f32; CONTROL_INTERVAL];
+            let mut gr = [0.0f32; CONTROL_INTERVAL];
+            g.run(state, ws, &src, &mut gl[..alive], &mut gr[..alive]);
+            sl[..alive].copy_from_slice(&gl[..alive]);
+            sr_buf[..alive].copy_from_slice(&gr[..alive]);
+        }
+        for i in 0..alive {
+            let (mut l, mut r) = (sl[i], sr_buf[i]);
             if use_filter {
                 l = self.filter_l.process(l);
                 r = self.filter_r.process(r);
             }
-            let g = env * vel_gain;
+            let g = env[i] * vel_gain;
             out_l[i] += l * g;
             out_r[i] += r * g;
+        }
+        if alive < n {
+            self.kill();
+            return false;
         }
         true
     }

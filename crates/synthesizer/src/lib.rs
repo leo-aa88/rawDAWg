@@ -7,7 +7,9 @@
 //! Later milestones add the remaining generators, modulation and mutation.
 
 pub mod audition;
+pub mod expr;
 pub mod generators;
+pub mod graph;
 pub mod modulation;
 pub mod morph;
 pub mod mutate;

@@ -234,6 +234,10 @@ pub fn mutate_once(parent: &Patch, seed: u64, chaos: f32, locks: &Locks) -> Patc
             }
         }
     }
+    // Modular graph node parameters (topology is never changed by mutation; locked nodes stay).
+    if !p.graph.is_empty() {
+        crate::graph::mutate_params(&mut p.graph, amount, &mut rng, &|c| locks.is_category_locked(c));
+    }
     // Continuous/discrete parameter perturbation through the descriptors.
     let mut synth = crate::synth::Synth::new(p.clone());
     let candidates = mutable_descriptors(&p, locks);
@@ -335,6 +339,14 @@ pub fn breed(a: &Patch, b: &Patch, seed: u64, locks: &Locks) -> Patch {
                 child.layers.push(l.clone());
             }
         }
+    }
+    // modular graph: identical topology → blend node parameters, otherwise inherit one parent's graph
+    if child.graph.same_topology(&b.graph) {
+        let t = rng.unit_f32();
+        let graphs = [&a.graph, &b.graph];
+        crate::graph::morph_params(&graphs, &[1.0 - t, t], &mut child.graph);
+    } else if !locks.is_category_locked(ParamCategory::Topology) && rng.chance(0.5) {
+        child.graph = b.graph.clone();
     }
     // continuous parameters: lerp with a random t per parameter; discrete: pick a parent
     let _ = synth_a.set_patch(child.clone());
