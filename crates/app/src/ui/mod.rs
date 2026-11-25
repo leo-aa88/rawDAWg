@@ -6,6 +6,7 @@ mod graph_editor;
 mod instrument_panel;
 mod keyboard;
 mod piano_roll;
+mod playlist;
 mod presets;
 mod sequencer;
 mod settings;
@@ -66,6 +67,7 @@ pub(crate) struct App {
     pub history: History,
     pub project_path: Option<PathBuf>,
     pub piano_roll: piano_roll::PianoRollState,
+    pub playlist: playlist::PlaylistState,
     pub sequencer: sequencer::StepState,
     pub transport_mode: TransportMode,
     pub loop_enabled: bool,
@@ -189,6 +191,7 @@ impl App {
             screenshot_requested: false,
             prefs,
             piano_roll: Default::default(),
+            playlist: Default::default(),
             sequencer: Default::default(),
             transport_mode: TransportMode::Pattern,
             loop_enabled: true,
@@ -198,6 +201,10 @@ impl App {
         match opts.ui_preset.as_deref() {
             Some("advanced") => app.synth_panel.advanced = true,
             Some("rack") => app.editor_view = EditorView::Rack,
+            Some("song") => {
+                app.editor_view = EditorView::Rack;
+                app.transport_mode = TransportMode::Song;
+            }
             Some("piano-roll") => app.editor_view = EditorView::PianoRoll,
             Some("graph") => {
                 app.synth_panel.advanced = true;
@@ -476,7 +483,7 @@ impl App {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F8),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F9),
                 // Escape cancels a piano-roll gesture first; otherwise it is the panic key
-                if self.piano_roll.gesture_active() { false } else { i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) },
+                if self.piano_roll.gesture_active() || self.playlist.gesture_active() { false } else { i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) },
             )
         });
         if redo {
@@ -1071,14 +1078,7 @@ impl eframe::App for App {
             });
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Playlist");
-            ui.separator();
-            ui.label(
-                egui::RichText::new(
-                    "Arrangement (clips on tracks) arrives in the next M3 slice. Pattern mode loops the selected pattern; edit it in the Rack or the Piano roll (F6/F7).",
-                )
-                .color(theme::TEXT_SECONDARY),
-            );
+            egui::ScrollArea::vertical().id_salt("playlist-scroll").show(ui, |ui| playlist::show(self, ui));
         });
         if self.show_settings {
             settings::show(self, ui.ctx());

@@ -39,6 +39,14 @@ pub enum Command {
         index: usize,
         us_per_quarter: UsPerQuarter,
     },
+    /// Replace the whole tempo map (validated: sorted, first point at tick 0, ranges).
+    SetTempoMap {
+        tempo: Vec<TempoPoint>,
+    },
+    /// Replace the whole meter map (validated).
+    SetMeterMap {
+        meter: Vec<MeterPoint>,
+    },
     AddChannel {
         channel: Channel,
         index: Option<usize>,
@@ -248,6 +256,28 @@ impl Command {
                 let t = p.tempo.get_mut(index).ok_or_else(|| unknown("tempo point", index))?;
                 let old = std::mem::replace(&mut t.us_per_quarter, us_per_quarter);
                 Ok(Command::SetTempo { index, us_per_quarter: old })
+            }
+            Command::SetTempoMap { tempo } => {
+                if tempo.is_empty() || tempo.iter().any(|t| !t.us_per_quarter.is_valid() || t.tick.0 < 0) {
+                    return Err(CommandError::Invalid("tempo map".into()));
+                }
+                let old = std::mem::replace(&mut p.tempo, tempo);
+                if let Err(e) = p.tempo_map() {
+                    p.tempo = old;
+                    return Err(CommandError::Invalid(format!("tempo map: {e}")));
+                }
+                Ok(Command::SetTempoMap { tempo: old })
+            }
+            Command::SetMeterMap { meter } => {
+                if meter.is_empty() || meter.iter().any(|m| !m.meter().is_valid() || m.tick.0 < 0) {
+                    return Err(CommandError::Invalid("meter map".into()));
+                }
+                let old = std::mem::replace(&mut p.meter, meter);
+                if let Err(e) = p.meter_map() {
+                    p.meter = old;
+                    return Err(CommandError::Invalid(format!("meter map: {e}")));
+                }
+                Ok(Command::SetMeterMap { meter: old })
             }
             Command::AddChannel { channel, index } => {
                 if p.channel(channel.id).is_some() {
@@ -704,6 +734,8 @@ impl Command {
         match self {
             Command::RenameProject { .. } => "Rename project",
             Command::SetTempo { .. } => "Change tempo",
+            Command::SetTempoMap { .. } => "Edit tempo map",
+            Command::SetMeterMap { .. } => "Edit time signatures",
             Command::AddChannel { .. } => "Add channel",
             Command::RemoveChannel { .. } => "Delete channel",
             Command::RenameChannel { .. } => "Rename channel",

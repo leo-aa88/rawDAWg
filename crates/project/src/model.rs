@@ -291,6 +291,12 @@ pub struct Clip {
     pub content: ClipContent,
 }
 
+impl Clip {
+    pub fn end_tick(&self) -> Tick {
+        self.start_tick + self.length_ticks
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendTap {

@@ -69,7 +69,14 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Toolbar second row: Pattern/Song mode, Loop toggle, pattern selector, Rack/Piano roll/Synth (F6/F7/F8). `--ui-preset rack|piano-roll`.
 - Engine: `editing_notes_while_playing_keeps_note_offs_and_picks_up_new_notes` (schedule swap mid-note: the removed note's note-off still fires, the added note plays, no hanging note).
 - Unit tests for snapping/quantize/scale/chord helpers. Screenshots `m3-rack.png`, `m3-piano-roll.png`.
-- Not yet: playlist/arrangement UI (song mode is engine-ready), recording, MIDI learn, count-in, tempo/meter editing, expression lanes (next slices).
+- Not yet (slice 1): playlist/arrangement UI, recording, MIDI learn, count-in, tempo/meter editing, expression lanes.
+
+### Slice 2 — playlist / arrangement (CORE-04, CORE-01 maps)
+
+- `crates/app/src/ui/playlist.rs`: tracks (add, rename by double-click, mute/solo, delete with clips), bar ruler with click-to-seek and drag → loop range (`SetLoop`), tempo and time-signature markers (click to edit BPM / numerator / denominator, right-click the marker row to add at a bar, remove), pattern clips painted with the selected pattern (click, drag brushes repeats), move (grid snap, Alt bypass, Ctrl-drag copies), start trim (keeps source offset), end resize, right-click delete / right-drag erase, box select (Ctrl-drag), Shift multi-select, Delete, Ctrl+A, Ctrl+D duplicate by grid-rounded span, S / "Split at playhead", "Make unique" (clones the pattern under a new id), clip context menu (mute, loop pattern inside the clip, make unique, open in piano roll, split, delete), note miniatures with loop repetition lines, song playhead. Move/trim/resize previews are history gestures. Audio clips are drawn ("plays in M5"); automation clips come with the automation slice.
+- Project commands `SetTempoMap` / `SetMeterMap` (whole-map replacement validated through the tempo/meter map builders, exact undo). `Clip::end_tick`.
+- Fixture `fixtures/demo-song.rawdawg` (two tracks, plain + looped clips, second pattern, tempo change to 130 BPM at bar 3) and HL-10 (song-mode render: length follows the tempo map within 2 frames, bar 2 fundamental 65.41 Hz). `--ui-preset song`. Screenshot `m3-playlist.png`.
+- Not yet: recording (IO-03), count-in, MIDI learn, automation lanes/clips (CORE-08), expression lanes, channel reorder/duplicate in the rack, audio clip playback (M5).
 
 ## M1 additions (2026-11-25)
 
@@ -125,6 +132,6 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M3 continues (slice 1 done: rack steps + piano roll), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M3 continues (slices 1–2 done: rack steps + piano roll, playlist), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M3 remainder: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
 Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).

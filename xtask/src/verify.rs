@@ -203,6 +203,29 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             Some(wav.display().to_string()),
         ))
     }));
+    checks.push(check("HL-10 song demo renders clips through the tempo map (song mode)", &["CORE-01", "CORE-04"], || {
+        let dir = root.join("fixtures/demo-song.rawdawg");
+        let p = rawdawg_project::load_project_dir(&dir)?;
+        let opts = OfflineOptions { mode: rawdawg_audio_engine::TransportMode::Song, tail_seconds: 0.0, ..Default::default() };
+        let (l, _, stats) = render_project(&p, &opts)?;
+        if stats.nonfinite_blocks > 0 {
+            bail!("nonfinite blocks");
+        }
+        // bars 1–2 at 120 BPM (4.0 s) + bars 3–4 at 130 BPM (3.692 s) = 369 231 frames at 48 kHz
+        let expected = 48_000.0 * (4.0 + 2.0 * 4.0 * 60.0 / 130.0);
+        if (stats.frames as f64 - expected).abs() > 2.0 {
+            bail!("song length {} frames, expected ≈{expected:.0} (tempo change at bar 3)", stats.frames);
+        }
+        // bar 2 holds only the looped bass clip; its first note is C2 ≈ 65.4 Hz (frames 96 000..114 000)
+        let f = dominant_frequency(&l[98_000..112_000], 48_000.0);
+        if (f - 65.41).abs() > 1.0 {
+            bail!("bar 2 should be the bass pattern at 65.4 Hz, measured {f:.2} Hz");
+        }
+        if rawdawg_dsp::math::rms(&l[200_000..300_000]) < 0.03 {
+            bail!("bars 3–4 (both clips) are too quiet");
+        }
+        Ok((format!("{} frames (tempo change honoured), bar 2 fundamental {f:.2} Hz, peak {:.3}", stats.frames, stats.peak), Some(dir.display().to_string())))
+    }));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");
