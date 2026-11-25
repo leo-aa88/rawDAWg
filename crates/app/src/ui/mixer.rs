@@ -6,9 +6,13 @@
 use super::{App, AudioState, EditorView};
 use crate::theme;
 use egui::{Sense, pos2, vec2};
+use rawdawg_audio_engine::commands::EngineCommand;
+use rawdawg_dsp::processor::Processor;
+use rawdawg_effects::rack::{self, RackLocks};
 use rawdawg_project::{Command, Instance, MixerChannel, Send, SendTap};
+use rawdawg_types::params::ParamCategory;
 use rawdawg_types::units::{Db, Pan};
-use rawdawg_types::{InstanceId, MixerChannelId};
+use rawdawg_types::{InstanceId, MixerChannelId, ParamId};
 use std::collections::HashMap;
 
 const STRIP_W: f32 = 118.0;
@@ -23,6 +27,69 @@ pub(crate) struct MixerState {
     rename: Option<(MixerChannelId, String)>,
     add_search: String,
     pub add_open: bool,
+    /// Rack randomisation: chaos 0–100 and locks (mix/safety/routing locked by default).
+    pub chaos: f32,
+    pub locks: RackLocks,
+    seed: u64,
+    /// Four morph slots per channel: the chain's parameter snapshot (instance → params).
+    pub morph_slots: HashMap<MixerChannelId, [Option<RackSnapshot>; 4]>,
+    pub morph_xy: (f32, f32),
+    /// Morph drag in progress: the chain's states before the gesture.
+    morph_gesture: Option<Vec<(InstanceId, String, Vec<u8>)>>,
+}
+
+pub(crate) type RackSnapshot = Vec<(InstanceId, Vec<(ParamId, f32)>)>;
+
+impl MixerState {
+    pub(crate) fn new() -> Self {
+        Self { chaos: 35.0, ..Default::default() }
+    }
+}
+
+/// Parameter snapshot of every native insert of a channel.
+pub(crate) fn rack_snapshot(app: &App, m: &MixerChannel) -> RackSnapshot {
+    m.inserts
+        .iter()
+        .filter_map(|ins| {
+            let p = app.other_mirrors.get(&ins.id)?;
+            Some((ins.id, p.descriptors().iter().filter_map(|d| p.param(d.id).map(|v| (d.id, v))).collect()))
+        })
+        .collect()
+}
+
+/// Push parameter values into the mirrors and the engine; with `commit`, record one undo
+/// step holding every changed insert's new state.
+pub(crate) fn apply_rack_values(app: &mut App, values: &[(InstanceId, Vec<(ParamId, f32)>)], before: Option<&[(InstanceId, String, Vec<u8>)]>, commit: bool) {
+    for (iid, params) in values {
+        for (id, v) in params {
+            if let Some(m) = app.other_mirrors.get_mut(iid) {
+                m.set_param(*id, *v);
+            }
+            app.send(EngineCommand::Param { instance: *iid, id: *id, value: *v });
+        }
+    }
+    if !commit {
+        return;
+    }
+    let mut cmds = Vec::new();
+    for (iid, _) in values {
+        let Some(m) = app.other_mirrors.get(iid) else { continue };
+        let after = m.save_state();
+        let type_id = Processor::type_id(m.as_ref()).to_owned();
+        if before.is_some_and(|b| b.iter().any(|(i, _, s)| i == iid && *s == after)) {
+            continue;
+        }
+        let state: serde_json::Value = serde_json::from_slice(&after).unwrap_or(serde_json::Value::Null);
+        app.mark_live_state(*iid, &type_id, &state);
+        cmds.push(Command::SetInstanceState { instance_id: *iid, state_version: 1, state });
+    }
+    if !cmds.is_empty() {
+        app.apply(Command::Batch { commands: cmds });
+    }
+}
+
+fn chain_states(app: &App, m: &MixerChannel) -> Vec<(InstanceId, String, Vec<u8>)> {
+    m.inserts.iter().filter_map(|ins| app.other_mirrors.get(&ins.id).map(|p| (ins.id, Processor::type_id(p.as_ref()).to_owned(), p.save_state()))).collect()
 }
 
 /// Read and reset the engine's per-mixer-channel peak meters (called once per frame).
@@ -247,7 +314,8 @@ fn gesture_slider(app: &mut App, r: &egui::Response, cmd: impl Fn() -> Command, 
 
 fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: &[MixerChannel], cmds: &mut Vec<Command>) {
     let Some(m) = app.project.mixer_channel(id).cloned() else { return };
-    let half = (ui.available_width() * 0.5 - 12.0).max(260.0);
+    // three columns: inserts, rack tools, sends
+    let half = (ui.available_width() / 3.0 - 12.0).max(240.0);
     ui.horizontal_top(|ui| {
         // ---- inserts
         ui.vertical(|ui| {
@@ -329,9 +397,15 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
             }
         });
         ui.separator();
-        // ---- sends
+        // ---- rack tools: randomize / morph / parallel branch (FX-03)
         ui.vertical(|ui| {
             ui.set_width(half);
+            rack_tools(app, ui, &m, cmds);
+        });
+        ui.separator();
+        // ---- sends (takes what is left)
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - 8.0).max(220.0));
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Sends").strong());
                 let targets: Vec<&MixerChannel> = all.iter().filter(|c| c.id != id).collect();
@@ -384,6 +458,169 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
     if let Some(e) = &app.plan_error {
         ui.colored_label(theme::ERROR, e);
     }
+}
+
+/// Main-thread mirrors for every native insert of a channel (the rack tools and the
+/// morph snapshots read and write them; the effect editor creates them lazily otherwise).
+pub(crate) fn ensure_rack_mirrors(app: &mut App, m: &MixerChannel) {
+    for ins in &m.inserts {
+        let _ = super::effect_panel::ensure_mirror(app, ins.id);
+    }
+}
+
+fn rack_tools(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, cmds: &mut Vec<Command>) {
+    let id = m.id;
+    ensure_rack_mirrors(app, m);
+    ui.label(egui::RichText::new("Rack").strong());
+    ui.horizontal(|ui| {
+        let can = !m.inserts.is_empty();
+        if ui
+            .add_enabled(can, egui::Button::new("Randomize rack"))
+            .on_hover_text("Deterministic random changes to every insert's parameters, bounded by Chaos and the locks (one undo step)")
+            .clicked()
+        {
+            let changed = randomize_rack(app, id);
+            app.status_line = format!("Rack randomized ({changed} effects changed)");
+        }
+        ui.add(egui::Slider::new(&mut app.mixer.chaos, 0.0..=100.0).text("Chaos").show_value(true));
+        ui.menu_button("Locks", |ui| {
+            for (c, label) in [
+                (ParamCategory::Mix, "Mix / output levels"),
+                (ParamCategory::Topology, "Modes and topology"),
+                (ParamCategory::Effects, "Effect parameters"),
+                (ParamCategory::Modulation, "Modulation"),
+                (ParamCategory::Pitch, "Pitch"),
+                (ParamCategory::Filter, "Filter / EQ"),
+            ] {
+                let mut locked = app.mixer.locks.categories.contains(&c);
+                if ui.checkbox(&mut locked, label).changed() {
+                    app.mixer.locks.set_category(c, locked);
+                }
+            }
+            if ui.button("Reset locks").clicked() {
+                app.mixer.locks = RackLocks::default();
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.label("Morph");
+        let filled: [bool; 4] = std::array::from_fn(|i| app.mixer.morph_slots.get(&id).is_some_and(|s| s[i].is_some()));
+        for (i, name) in ["A", "B", "C", "D"].iter().enumerate() {
+            let text = if filled[i] { format!("{name} (stored)") } else { format!("{name} store") };
+            if ui.small_button(text).on_hover_text("Store the rack's current settings in this corner").clicked() {
+                let snap = rack_snapshot(app, m);
+                app.mixer.morph_slots.entry(id).or_default()[i] = Some(snap);
+            }
+        }
+        let slots = app.mixer.morph_slots.entry(id).or_default();
+        let ready = slots.iter().all(|s| s.as_ref().is_some_and(|s| s.len() == m.inserts.len() && s.iter().zip(&m.inserts).all(|((a, _), b)| *a == b.id)));
+        if !ready {
+            ui.label(egui::RichText::new("store A–D to morph").color(theme::TEXT_SECONDARY).small())
+                .on_hover_text("Store the rack's settings in all four corners (same chain), then drag on the pad");
+        }
+    });
+    // XY pad
+    let (_, rect) = ui.allocate_space(vec2(120.0, 120.0));
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, theme::BACKGROUND);
+    ui.interact(rect, egui::Id::unique(("morph-pad", id)), Sense::click_and_drag());
+    let (x, y) = app.mixer.morph_xy;
+    let p = pos2(rect.min.x + x * rect.width(), rect.max.y - y * rect.height());
+    painter.circle_filled(p, 5.0, theme::ACCENT);
+    for (i, (dx, dy)) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].iter().enumerate() {
+        painter.text(
+            pos2(rect.min.x + 6.0 + dx * (rect.width() - 12.0), rect.max.y - 6.0 - dy * (rect.height() - 12.0)),
+            egui::Align2::CENTER_CENTER,
+            ["A", "B", "C", "D"][i],
+            egui::FontId::proportional(10.0),
+            theme::TEXT_SECONDARY,
+        );
+    }
+    let ptr = super::PointerState::read(ui);
+    let over = ptr.pos.is_some_and(|p| rect.contains(p));
+    let ready = app
+        .mixer
+        .morph_slots
+        .get(&id)
+        .is_some_and(|slots| slots.iter().all(|s| s.as_ref().is_some_and(|s| s.len() == m.inserts.len() && s.iter().zip(&m.inserts).all(|((a, _), b)| *a == b.id))));
+    if ready && ptr.primary_pressed && over {
+        app.mixer.morph_gesture = Some(chain_states(app, m));
+    }
+    if app.mixer.morph_gesture.is_some()
+        && ptr.primary_down
+        && let Some(p) = ptr.pos
+    {
+        let x = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+        let y = ((rect.max.y - p.y) / rect.height()).clamp(0.0, 1.0);
+        app.mixer.morph_xy = (x, y);
+        let slots = app.mixer.morph_slots.get(&id).cloned().unwrap_or_default();
+        let mut values = Vec::new();
+        for (k, ins) in m.inserts.iter().enumerate() {
+            let corners: Option<[&[(ParamId, f32)]; 4]> =
+                (|| Some([&slots[0].as_ref()?[k].1[..], &slots[1].as_ref()?[k].1[..], &slots[2].as_ref()?[k].1[..], &slots[3].as_ref()?[k].1[..]]))();
+            let (Some(corners), Some(p)) = (corners, app.other_mirrors.get(&ins.id)) else { continue };
+            values.push((ins.id, rack::morph(p.descriptors(), corners, x, y)));
+        }
+        apply_rack_values(app, &values, None, false);
+    }
+    if app.mixer.morph_gesture.is_some() && (ptr.primary_released || !ptr.primary_down) {
+        let before = app.mixer.morph_gesture.take().unwrap_or_default();
+        let values: Vec<(InstanceId, Vec<(ParamId, f32)>)> = m.inserts.iter().map(|ins| (ins.id, Vec::new())).collect();
+        apply_rack_values(app, &values, Some(&before), true);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .button("+ Parallel branch")
+            .on_hover_text("A new bus fed by a post-fader send at 0 dB and summed into this channel's output: build a parallel effect path on it (latency is aligned at the sum)")
+            .clicked()
+        {
+            let bus_id = add_parallel_branch(m, cmds);
+            app.mixer.selected = Some(bus_id);
+        }
+    });
+}
+
+/// Randomise every native insert of a mixer channel (one undo step). Returns how many changed.
+pub(crate) fn randomize_rack(app: &mut App, id: MixerChannelId) -> usize {
+    let Some(m) = app.project.mixer_channel(id).cloned() else { return 0 };
+    ensure_rack_mirrors(app, &m);
+    let before = chain_states(app, &m);
+    let snap = rack_snapshot(app, &m);
+    app.mixer.seed = app.mixer.seed.wrapping_add(1);
+    let mut rng = rawdawg_dsp::rng::DeterministicRng::new(app.mixer.seed ^ 0x7ac4, id.0.as_u128() as u64);
+    let mut values = Vec::new();
+    for (iid, current) in &snap {
+        let Some(p) = app.other_mirrors.get(iid) else { continue };
+        let edits = rack::randomize(p.descriptors(), current, &mut rng, app.mixer.chaos, &app.mixer.locks);
+        if !edits.is_empty() {
+            values.push((*iid, edits));
+        }
+    }
+    apply_rack_values(app, &values, Some(&before), true);
+    values.len()
+}
+
+/// Queue the commands for a parallel branch bus of `m`: fed by a 0 dB post-fader send and
+/// routed to the same output, so effects on it sum with the channel (latency aligned at the
+/// sum). One undo step; the new bus id is returned.
+pub(crate) fn add_parallel_branch(m: &MixerChannel, cmds: &mut Vec<Command>) -> MixerChannelId {
+    let bus = MixerChannel {
+        id: MixerChannelId::new(),
+        name: format!("{} ∥", m.name),
+        color: m.color,
+        gain_db: Db(0.0),
+        pan: Pan(0.0),
+        mute: false,
+        solo: false,
+        inserts: vec![],
+        sends: vec![],
+        output_id: m.output_id,
+    };
+    let bus_id = bus.id;
+    let mut sends = m.sends.clone();
+    sends.push(Send { target_id: bus_id, level_db: Db(0.0), tap: SendTap::PostFader, sidechain: false });
+    cmds.push(Command::Batch { commands: vec![Command::AddMixerChannel { channel: bus, index: None }, Command::SetMixerSends { id: m.id, sends }] });
+    bus_id
 }
 
 fn insert_latency(app: &App, id: InstanceId) -> Option<u32> {

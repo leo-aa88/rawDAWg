@@ -128,6 +128,10 @@ pub struct Plan {
     pub meter: MeterMap,
     pub any_solo: bool,
     pub solo_mixer: Vec<bool>,
+    /// Mixer nodes that are not on a soloed path but feed one through a sidechain send
+    /// (and everything upstream of them): they keep processing and delivering to those
+    /// dependencies, while their own output to the mix stays silent.
+    pub solo_feed: Vec<bool>,
     /// Processor slots (events and meters are addressed by slot index).
     pub slots: Vec<Slot>,
     pub slot_instances: Vec<InstanceId>,
@@ -460,6 +464,29 @@ pub fn compile(
             }
         }
     }
+    // Solo keeps sidechain dependencies: a node sidechain-sending into a soloed node feeds it,
+    // and so does anything whose main output or send lands in a feeding node (bounded fixpoint).
+    let mut solo_feed = vec![false; mixer.len()];
+    if any_solo {
+        let index_of = |id: rawdawg_types::MixerChannelId| project.mixer.channels.iter().position(|c| c.id == id);
+        for _ in 0..mixer.len() + 1 {
+            let mut changed = false;
+            for (i, m) in project.mixer.channels.iter().enumerate() {
+                if solo_mixer[i] || solo_feed[i] {
+                    continue;
+                }
+                let via_sends = m.sends.iter().any(|snd| index_of(snd.target_id).is_some_and(|t| if snd.sidechain { solo_mixer[t] || solo_feed[t] } else { solo_feed[t] }));
+                let via_output = mixer[i].output_index.is_some_and(|o| solo_feed[o]);
+                if via_sends || via_output {
+                    solo_feed[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
     let tempo = project.tempo_map().map_err(|e| CompileError::Invalid(e.to_string()))?;
     let meter = project.meter_map().map_err(|e| CompileError::Invalid(e.to_string()))?;
     let pattern_schedule =
@@ -483,6 +510,7 @@ pub fn compile(
         meter,
         any_solo,
         solo_mixer,
+        solo_feed,
         slots,
         slot_instances: slot_instances.clone(),
         fx_in: AudioBuffer::new(2, max_frames),
@@ -532,6 +560,7 @@ impl Plan {
             meter: MeterMap::default(),
             any_solo: false,
             solo_mixer: vec![false],
+            solo_feed: vec![false],
             slots: vec![],
             slot_instances: vec![],
             fx_in: AudioBuffer::new(2, max_frames),

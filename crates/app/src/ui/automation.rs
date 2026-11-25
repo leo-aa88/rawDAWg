@@ -68,26 +68,63 @@ fn automation_track(app: &App) -> Option<TrackId> {
 /// Create a curve for `target` with a 4-bar clip at the playhead bar (or bar 1) and open the editor.
 pub(crate) fn create_clip_for(app: &mut App, instance_id: InstanceId, param_id: u32) {
     let target = AutomationTarget { instance_id, param_id };
-    let current = app
-        .synth_mirrors
-        .get(&instance_id)
-        .and_then(|s| s.param(ParamId(param_id)))
-        .or_else(|| app.other_mirrors.get(&instance_id).and_then(|o| o.param(ParamId(param_id))))
-        .unwrap_or(0.5);
-    let bar = app.project.meter_map().ok().map(|m| m.bar_start_tick(1).0).filter(|t| *t > 0).unwrap_or(PPQ * 4);
-    let at = app.playhead_tick().map(|t| t.div_euclid(bar) * bar).unwrap_or(0).max(0);
+    let current = current_value(app, &target);
+    let len = bar_ticks(app) * 4;
+    let points = vec![
+        AutomationPoint { id: PointId::new(), tick: Tick::ZERO, value: current, interpolation: Interpolation::Linear },
+        AutomationPoint { id: PointId::new(), tick: Tick(len), value: current, interpolation: Interpolation::Linear },
+    ];
+    place_curve(app, target, points, len);
+}
+
+/// LFO shapes for generated modulation curves.
+pub(crate) const LFO_SHAPES: [&str; 4] = ["Sine", "Triangle", "Square", "Saw"];
+
+/// Create a periodic ("LFO") automation clip over four bars: `cycles_per_bar` cycles of
+/// `shape` (0 sine, 1 triangle, 2 square, 3 saw) swinging ±`depth` around the current value.
+/// Modulation of effect parameters rides on the automation system (FX-03), so it is
+/// editable, undoable and rendered identically offline.
+pub(crate) fn create_lfo_for(app: &mut App, instance_id: InstanceId, param_id: u32, shape: usize, cycles_per_bar: f32, depth: f32) {
+    let target = AutomationTarget { instance_id, param_id };
+    let centre = current_value(app, &target);
+    let bar = bar_ticks(app);
     let len = bar * 4;
-    let curve = AutomationCurve {
-        id: CurveId::new(),
-        name: target_label(app, &target),
-        target,
-        points: vec![
-            AutomationPoint { id: PointId::new(), tick: Tick::ZERO, value: current, interpolation: Interpolation::Linear },
-            AutomationPoint { id: PointId::new(), tick: Tick(len), value: current, interpolation: Interpolation::Linear },
-        ],
-        mode: AutomationMode::Read,
-        disabled: false,
-    };
+    let cycles = (cycles_per_bar.max(0.0625) * 4.0).max(0.25);
+    let per_cycle = 16usize;
+    let n = ((cycles * per_cycle as f32).round() as usize).clamp(4, 512);
+    let mut points = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let t = i as f32 / n as f32; // 0..1 over the clip
+        let ph = (t * cycles).fract();
+        let (v, interp) = match shape {
+            1 => (1.0 - 4.0 * (ph - 0.5).abs(), Interpolation::Linear),
+            2 => (if ph < 0.5 { 1.0 } else { -1.0 }, Interpolation::Step),
+            3 => (1.0 - 2.0 * ph, Interpolation::Linear),
+            _ => ((std::f32::consts::TAU * ph).sin(), Interpolation::Linear),
+        };
+        let tick = ((len as f32) * t).round() as i64;
+        points.push(AutomationPoint { id: PointId::new(), tick: Tick(tick), value: (centre + v * depth).clamp(0.0, 1.0), interpolation: interp });
+    }
+    place_curve(app, target, points, len);
+}
+
+fn current_value(app: &App, target: &AutomationTarget) -> f32 {
+    app.synth_mirrors
+        .get(&target.instance_id)
+        .and_then(|s| s.param(ParamId(target.param_id)))
+        .or_else(|| app.other_mirrors.get(&target.instance_id).and_then(|o| o.param(ParamId(target.param_id))))
+        .unwrap_or(0.5)
+}
+
+fn bar_ticks(app: &App) -> i64 {
+    app.project.meter_map().ok().map(|m| m.bar_start_tick(1).0).filter(|t| *t > 0).unwrap_or(PPQ * 4)
+}
+
+/// Add a curve with `points` as a clip starting at the current bar on the automation track.
+fn place_curve(app: &mut App, target: AutomationTarget, points: Vec<AutomationPoint>, len: i64) {
+    let bar = bar_ticks(app);
+    let at = app.playhead_tick().map(|t| t.div_euclid(bar) * bar).unwrap_or(0).max(0);
+    let curve = AutomationCurve { id: CurveId::new(), name: target_label(app, &target), target, points, mode: AutomationMode::Read, disabled: false };
     let cid = curve.id;
     let mut batch = vec![Command::AddAutomationCurve { curve }];
     let track_id = match automation_track(app) {

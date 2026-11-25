@@ -472,6 +472,247 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             Ok((format!("recorded note tick 962/dur 471, undo/redo exact, song {} frames with tempo change, loop wrapped to tick {tick_now}", stats.frames), None))
         },
     ));
+    checks.push(check(
+        "E2E-05 (headless subset) insert chain, EQ band edit, sidechain compressor, hall + convolution sends, latency-bearing effect, parallel branch, automation, randomize, morph, bypass, undo",
+        &["CORE-05", "CORE-08", "FX-01", "FX-02", "FX-03", "QUAL-02"],
+        || {
+            use rawdawg_audio_engine::commands::TransportMode;
+            use rawdawg_effects::{convolution, dynamics::compressor, eq, rack, reverb, testfx};
+            use rawdawg_project::{
+                AutomationCurve, AutomationMode, AutomationPoint, AutomationTarget, Channel, Clip, ClipContent, Command, History, Instance, Interpolation, MixerChannel, Note, Project,
+                Send, SendTap, Track,
+            };
+            use rawdawg_types::units::{Db, PPQ, Pan, Tick};
+            use rawdawg_types::{ChannelId, ClipId, CurveId, MixerChannelId, NoteId, ParamId, PointId, TrackId};
+            let dir = out.join("e2e-05.rawdawg");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            // an effect state from (key, physical value) pairs, through the real processor
+            let fx_state = |type_id: &str, values: &[(&str, f64)]| -> anyhow::Result<serde_json::Value> {
+                let mut p = rawdawg_effects::make_effect(type_id, None).map_err(anyhow::Error::msg)?;
+                for (key, v) in values {
+                    let d = p.descriptors().iter().find(|d| d.key == *key).copied().ok_or_else(|| anyhow::anyhow!("no param {key}"))?;
+                    p.set_param(d.id, d.to_normalized(*v));
+                }
+                Ok(serde_json::from_slice(&p.save_state())?)
+            };
+            let patch = serde_json::to_value(rawdawg_synthesizer::Patch::default())?;
+            let mut project = Project::new_default("e2e-05", patch.clone());
+            let mut history = History::new();
+            let ch_a = project.channels[0].id;
+            let mix_a = project.channels[0].mixer_id;
+            let pattern = project.patterns[0].id;
+            // channel B on its own mixer channel: a held bass note that the sidechain will duck
+            let mix_b = MixerChannelId::new();
+            // `output_id: None` means "no output" (the master); every other channel routes somewhere
+            let master = project.mixer.master_id;
+            let bus = |id: MixerChannelId, name: &str| MixerChannel { id, name: name.into(), color: None, gain_db: Db(0.0), pan: Pan(0.0), mute: false, solo: false, inserts: vec![], sends: vec![], output_id: Some(master) };
+            history.apply(&mut project, Command::AddMixerChannel { channel: bus(mix_b, "B"), index: None })?;
+            let ch_b = ChannelId::new();
+            let mut inst_b = Instance::native(rawdawg_types::ids::native_types::SYNTH, patch);
+            inst_b.display_name = "B".into();
+            history.apply(
+                &mut project,
+                Command::AddChannel { channel: Channel { id: ch_b, name: "B".into(), color: None, instrument: inst_b, gain_db: Db(0.0), pan: Pan(0.0), mute: false, solo: false, mixer_id: mix_b }, index: None },
+            )?;
+            let eighths: Vec<Note> = (0..8).map(|k| Note { id: NoteId::new(), tick: Tick(k * PPQ / 2), duration_ticks: Tick(PPQ / 4), pitch: 72, velocity: 0.9, channel: 0 }).collect();
+            history.apply(&mut project, Command::AddNotes { pattern_id: pattern, channel_id: ch_a, notes: eighths })?;
+            history.apply(
+                &mut project,
+                Command::AddNotes { pattern_id: pattern, channel_id: ch_b, notes: vec![Note { id: NoteId::new(), tick: Tick(0), duration_ticks: Tick(PPQ * 4), pitch: 36, velocity: 0.8, channel: 0 }] },
+            )?;
+            // 1. insert chain on A: EQ (band 0 "dragged" to 300 Hz / +6 dB) then a latency-bearing effect (1 000 frames)
+            let mut eq_inst = Instance::native(eq::TYPE_ID, fx_state(eq::TYPE_ID, &[("band0.on", 1.0), ("band0.freq", 300.0), ("band0.gain", 6.0)])?);
+            eq_inst.display_name = "EQ".into();
+            let eq_id = eq_inst.id;
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_a, instance: eq_inst, index: None })?;
+            let mut lat_inst = Instance::native(testfx::TYPE_ID, fx_state(testfx::TYPE_ID, &[("latency", 1000.0)])?);
+            lat_inst.display_name = "Latency".into();
+            let lat_id = lat_inst.id;
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_a, instance: lat_inst, index: None })?;
+            // 2. sends: hall reverb bus and a convolution bus (impulse IR = identity, imported into the project)
+            let (mix_verb, mix_conv) = (MixerChannelId::new(), MixerChannelId::new());
+            history.apply(&mut project, Command::AddMixerChannel { channel: bus(mix_verb, "Verb"), index: None })?;
+            history.apply(&mut project, Command::AddMixerChannel { channel: bus(mix_conv, "Conv"), index: None })?;
+            let mut hall = Instance::native(reverb::TYPE_ID, fx_state(reverb::TYPE_ID, &[("mode", 1.0), ("decay", 2.0), ("mix", 100.0)])?);
+            hall.display_name = "Hall".into();
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_verb, instance: hall, index: None })?;
+            rawdawg_project::save_project_dir(&dir, &project)?;
+            let asset = rawdawg_project::assets::import_asset(&dir, &root.join("fixtures/impulse_48k.wav"))?;
+            let ir_id = asset.id.to_string();
+            history.apply(&mut project, Command::AddAsset { asset })?;
+            let mut conv_state = fx_state(convolution::TYPE_ID, &[("mix", 100.0)])?;
+            conv_state["ir_asset"] = serde_json::Value::String(ir_id);
+            let mut conv = Instance::native(convolution::TYPE_ID, conv_state);
+            conv.display_name = "Convolution".into();
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_conv, instance: conv, index: None })?;
+            // 3. compressor on B listening to A through a sidechain send
+            let duck = rawdawg_effects::presets(compressor::TYPE_ID).iter().find(|p| p.name.to_lowercase().contains("duck") || p.name.to_lowercase().contains("sidechain")).ok_or_else(|| anyhow::anyhow!("no sidechain preset"))?;
+            let duck_state: serde_json::Value = serde_json::from_slice(&rawdawg_effects::preset_state(compressor::TYPE_ID, duck).ok_or_else(|| anyhow::anyhow!("preset state"))?)?;
+            let mut comp = Instance::native(compressor::TYPE_ID, duck_state.clone());
+            comp.display_name = "Duck".into();
+            let comp_id = comp.id;
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_b, instance: comp, index: None })?;
+            let sends_a = vec![
+                Send { target_id: mix_verb, level_db: Db(-12.0), tap: SendTap::PostFader, sidechain: false },
+                Send { target_id: mix_conv, level_db: Db(-12.0), tap: SendTap::PostFader, sidechain: false },
+                Send { target_id: mix_b, level_db: Db(0.0), tap: SendTap::PreFader, sidechain: true },
+            ];
+            history.apply(&mut project, Command::SetMixerSends { id: mix_a, sends: sends_a.clone() })?;
+            // 4. parallel branch of A (the mixer's "+ Parallel branch"): bus fed by a 0 dB post-fader send, flat EQ on it
+            let mix_par = MixerChannelId::new();
+            let mut par_sends = sends_a.clone();
+            par_sends.push(Send { target_id: mix_par, level_db: Db(0.0), tap: SendTap::PostFader, sidechain: false });
+            history.apply(&mut project, Command::Batch { commands: vec![Command::AddMixerChannel { channel: bus(mix_par, "A ∥"), index: None }, Command::SetMixerSends { id: mix_a, sends: par_sends.clone() }] })?;
+            let mut flat = Instance::native(eq::TYPE_ID, fx_state(eq::TYPE_ID, &[("band0.on", 0.0), ("band1.on", 0.0)])?);
+            flat.display_name = "Flat".into();
+            history.apply(&mut project, Command::AddInsert { mixer_id: mix_par, instance: flat, index: None })?;
+            // 5. song arrangement (two bars) with an automation clip sweeping EQ band 0 gain
+            let track = TrackId::new();
+            history.apply(&mut project, Command::AddTrack { track: Track { id: track, name: "Song".into(), color: None, mute: false, solo: false, height: None }, index: None })?;
+            history.apply(
+                &mut project,
+                Command::AddClip {
+                    clip: Clip { id: ClipId::new(), track_id: track, start_tick: Tick(0), length_ticks: Tick(PPQ * 8), muted: false, content: ClipContent::Pattern { pattern_id: pattern, source_offset_ticks: Tick::ZERO, looped: true } },
+                },
+            )?;
+            let gain_param = eq::band_param(0, eq::B_GAIN);
+            let curve = AutomationCurve {
+                id: CurveId::new(),
+                name: "EQ gain".into(),
+                target: AutomationTarget { instance_id: eq_id, param_id: gain_param },
+                points: vec![
+                    AutomationPoint { id: PointId::new(), tick: Tick(0), value: 0.5, interpolation: Interpolation::Linear },
+                    AutomationPoint { id: PointId::new(), tick: Tick(PPQ * 8), value: 0.75, interpolation: Interpolation::Linear },
+                ],
+                mode: AutomationMode::Read,
+                disabled: false,
+            };
+            let curve_id = curve.id;
+            history.apply(&mut project, Command::Batch { commands: vec![
+                Command::AddAutomationCurve { curve },
+                Command::AddClip { clip: Clip { id: ClipId::new(), track_id: track, start_tick: Tick(0), length_ticks: Tick(PPQ * 8), muted: false, content: ClipContent::Automation { curve_id, source_offset_ticks: Tick::ZERO, looped: false } } },
+            ] })?;
+            let opts = OfflineOptions { mode: TransportMode::Song, end_tick: Some(Tick(PPQ * 8)), tail_seconds: 0.3, project_dir: Some(dir.clone()), ..Default::default() };
+            // full mix: finite, no clipped samples, under full scale (master protection on)
+            let (l, r, stats) = render_project(&project, &opts)?;
+            if stats.nonfinite_blocks > 0 || stats.clipped_samples > 0 || stats.peak > 1.0 {
+                bail!("full mix: nonfinite {} clipped {} peak {:.3}", stats.nonfinite_blocks, stats.clipped_samples, stats.peak);
+            }
+            let full_rms = rawdawg_dsp::math::rms(&l[..]).max(rawdawg_dsp::math::rms(&r[..]));
+            if full_rms < 0.02 {
+                bail!("full mix too quiet: rms {full_rms:.4}");
+            }
+            // sidechain action in the full mix: B ducks under A's eighth notes, so the mix gets quieter
+            let mut no_sc = duck_state.clone();
+            // effect state = { version, params: { key: normalized } }; a toggle off is 0
+            no_sc["params"]["sidechain"] = serde_json::json!(0.0);
+            history.apply(&mut project, Command::SetInstanceState { instance_id: comp_id, state_version: 1, state: no_sc.clone() })?;
+            let (l_mix_free, _, _) = render_project(&project, &opts)?;
+            history.undo(&mut project)?;
+            let mix_free = rawdawg_dsp::math::rms(&l_mix_free[24_000..144_000]);
+            let mix_duck = rawdawg_dsp::math::rms(&l[24_000..144_000]);
+            // B is a small share of the full mix, so only the direction is judged here; the
+            // soloed render below measures the ducking itself
+            if mix_duck >= mix_free {
+                bail!("sidechain compressor did not lower the full mix: with {mix_duck:.4}, without {mix_free:.4}");
+            }
+            // solo B: solo keeps the sidechain feed from A, so B still ducks while A stays out of the
+            // mix. Reference = B soloed with the compressor bypassed (uncompressed).
+            history.apply(&mut project, Command::SetMixerSolo { id: mix_b, solo: true })?;
+            let (l_duck, _, _) = render_project(&project, &opts)?;
+            history.apply(&mut project, Command::SetInstanceBypass { instance_id: comp_id, bypass: true })?;
+            let (l_free, _, _) = render_project(&project, &opts)?;
+            history.undo(&mut project)?; // compressor back on
+            history.undo(&mut project)?; // solo off
+            let (rms_duck, rms_free) = (rawdawg_dsp::math::rms(&l_duck[24_000..144_000]), rawdawg_dsp::math::rms(&l_free[24_000..144_000]));
+            if rms_duck >= rms_free * 0.85 {
+                bail!("solo did not keep the sidechain feed: soloed B ducked {rms_duck:.4} vs uncompressed {rms_free:.4}");
+            }
+            // the ducking follows A's eighth notes: B is quieter while A sounds than just after it stops
+            let on = rawdawg_dsp::math::rms(&l_duck[96_000 + 1000..96_000 + 5500]);
+            let off = rawdawg_dsp::math::rms(&l_duck[96_000 + 7500..96_000 + 11_500]);
+            if on >= off {
+                bail!("ducking does not follow the sidechain rhythm: during A {on:.4}, after A {off:.4}");
+            }
+            // A itself must not be heard in the soloed mix: its fundamental (C5) is absent
+            let spec = rawdawg_dsp::analysis::magnitude_spectrum(&l_duck[48_000..48_000 + 16_384]);
+            let bin = |hz: f64| (hz / 48_000.0 * 16_384.0).round() as usize;
+            let (a_level, b_level) = (spec[bin(523.25)], spec[bin(65.41)]);
+            if a_level > b_level * 0.05 {
+                bail!("soloing B leaked A into the mix: A fundamental {a_level:.5} vs B {b_level:.5}");
+            }
+            // parallel alignment: A (latency 1 000 frames) + its branch (no latency) must sum coherently (≈ 2×)
+            for id in [mix_b, mix_verb, mix_conv] {
+                history.apply(&mut project, Command::SetMixerMute { id, mute: true })?;
+            }
+            let (l_par, _, _) = render_project(&project, &opts)?;
+            history.apply(&mut project, Command::SetMixerSends { id: mix_a, sends: sends_a.clone() })?;
+            let (l_single, _, _) = render_project(&project, &opts)?;
+            history.undo(&mut project)?;
+            for _ in 0..3 {
+                history.undo(&mut project)?;
+            }
+            let ratio = rawdawg_dsp::math::rms(&l_par[24_000..144_000]) / rawdawg_dsp::math::rms(&l_single[24_000..144_000]).max(1e-9);
+            if (ratio - 2.0).abs() > 0.15 {
+                bail!("parallel branch not aligned with the latency-bearing chain: level ratio {ratio:.3} (expected ≈ 2.0)");
+            }
+            // randomize the rack of A deterministically (mix locked), one undo step restores it
+            let before_eq = project.instance(eq_id).unwrap().state.clone();
+            let mut p = rawdawg_effects::make_effect(eq::TYPE_ID, Some(&serde_json::to_vec(&before_eq)?)).map_err(anyhow::Error::msg)?;
+            let current: Vec<(ParamId, f32)> = p.descriptors().iter().filter_map(|d| p.param(d.id).map(|v| (d.id, v))).collect();
+            let edits = rack::randomize(p.descriptors(), &current, &mut rawdawg_dsp::rng::DeterministicRng::new(5, 5), 60.0, &rack::RackLocks::default());
+            if edits.is_empty() {
+                bail!("randomize produced no edits");
+            }
+            for (id, v) in &edits {
+                p.set_param(*id, *v);
+            }
+            let randomized: serde_json::Value = serde_json::from_slice(&p.save_state())?;
+            history.apply(&mut project, Command::SetInstanceState { instance_id: eq_id, state_version: 1, state: randomized.clone() })?;
+            if project.instance(eq_id).unwrap().state == before_eq {
+                bail!("randomize did not change the EQ state");
+            }
+            history.undo(&mut project)?;
+            if project.instance(eq_id).unwrap().state != before_eq {
+                bail!("undo did not restore the EQ state");
+            }
+            // morph halfway between the original and the randomized EQ: continuous params land in the middle
+            let rand_params: Vec<(ParamId, f32)> = {
+                let q = rawdawg_effects::make_effect(eq::TYPE_ID, Some(&serde_json::to_vec(&randomized)?)).map_err(anyhow::Error::msg)?;
+                q.descriptors().iter().filter_map(|d| q.param(d.id).map(|v| (d.id, v))).collect()
+            };
+            let mid = rack::morph(p.descriptors(), [&current, &rand_params, &current, &rand_params], 0.5, 0.0);
+            let (gid, _) = edits.iter().find(|(id, _)| !matches!(p.descriptors().iter().find(|d| d.id == *id).unwrap().mapping, rawdawg_types::params::ParamMapping::Toggle | rawdawg_types::params::ParamMapping::Discrete { .. })).ok_or_else(|| anyhow::anyhow!("no continuous edit"))?;
+            let (a, b, m) = (
+                current.iter().find(|(i, _)| i == gid).unwrap().1,
+                rand_params.iter().find(|(i, _)| i == gid).unwrap().1,
+                mid.iter().find(|(i, _)| i == gid).unwrap().1,
+            );
+            if (m - (a + b) * 0.5).abs() > 1e-5 {
+                bail!("morph midpoint {m} is not between {a} and {b}");
+            }
+            // bypass the latency effect (alignment kept by true bypass) and undo it
+            history.apply(&mut project, Command::SetInstanceBypass { instance_id: lat_id, bypass: true })?;
+            let (_, _, stats_byp) = render_project(&project, &opts)?;
+            if stats_byp.nonfinite_blocks > 0 || stats_byp.clipped_samples > 0 {
+                bail!("bypassed render clipped or nonfinite");
+            }
+            history.undo(&mut project)?;
+            if project.instance(lat_id).unwrap().bypass {
+                bail!("undo did not clear the bypass");
+            }
+            rawdawg_project::save_project_dir(&dir, &project)?;
+            Ok((
+                format!(
+                    "full mix peak {:.3} rms {full_rms:.3}, soloed B ducked {rms_duck:.4} vs uncompressed {rms_free:.4} (during A {on:.4} / after {off:.4}), parallel ratio {ratio:.3}, {} randomized params, morph midpoint exact, bypass/undo ok",
+                    stats.peak,
+                    edits.len()
+                ),
+                Some(dir.display().to_string()),
+            ))
+        },
+    ));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");

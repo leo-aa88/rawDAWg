@@ -229,3 +229,116 @@ fn multiband_canvas_paints_one_band_per_gesture_and_undo_restores_it() {
     assert_eq!(bands(&mut h)[1].0, 0.0, "undo restores the band in one step");
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }
+
+#[test]
+fn rack_randomize_morph_pad_and_parallel_branch_are_single_undo_steps() {
+    use rawdawg_effects::reverb;
+    let mut h = Harness::with_preset(Some("../../fixtures/demo-song.rawdawg"), Some(&format!("effect:{}", reverb::TYPE_ID)));
+    let iid = h.app.effect_editor.expect("the preset opened a fresh insert");
+    let mixer_id = h.app.project.mixer.channels.first().unwrap().id;
+    h.app.editor_view = EditorView::Mixer;
+    h.app.mixer.selected = Some(mixer_id);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // mirrors are rebuilt lazily after undo: always go through the effect panel's ensure
+    let param = |h: &mut Harness, id: u32| {
+        super::effect_panel::ensure_mirror(&mut h.app, iid).unwrap();
+        h.app.other_mirrors[&iid].param(rawdawg_types::ParamId(id)).unwrap()
+    };
+    let before_decay = param(&mut h, reverb::P_DECAY);
+    let before_mix = param(&mut h, reverb::P_MIX);
+    let undo_depth = |h: &Harness| h.app.history.undo_len();
+    let depth0 = undo_depth(&h);
+    // randomize at full chaos: something moves, mix stays (locked by default), one undo step restores
+    h.app.mixer.chaos = 100.0;
+    let changed = super::mixer::randomize_rack(&mut h.app, mixer_id);
+    assert_eq!(changed, 1, "the one insert changed");
+    let snap: Vec<f32> = reverb::DESCRIPTORS.iter().map(|d| param(&mut h, d.id.0)).collect();
+    let base: Vec<f32> = reverb::DESCRIPTORS.iter().map(|d| d.default_normalized).collect();
+    assert_ne!(snap, base, "randomize changed parameters");
+    assert_eq!(param(&mut h, reverb::P_MIX), before_mix, "mix is locked by default");
+    assert_eq!(undo_depth(&h), depth0 + 1, "one undo entry");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    h.frame(vec![]);
+    assert_eq!(param(&mut h, reverb::P_DECAY), before_decay, "undo restores the rack");
+    // morph: store A..D with different decays, drag on the pad, release → one undo entry
+    let set_decay = |h: &mut Harness, v: f32| {
+        super::effect_panel::ensure_mirror(&mut h.app, iid).unwrap();
+        super::mixer::apply_rack_values(&mut h.app, &[(iid, vec![(rawdawg_types::ParamId(reverb::P_DECAY), v)])], None, false);
+    };
+    for (i, v) in [0.1f32, 0.9, 0.1, 0.9].iter().enumerate() {
+        set_decay(&mut h, *v);
+        let m = h.app.project.mixer_channel(mixer_id).cloned().unwrap();
+        let snap = super::mixer::rack_snapshot(&h.app, &m);
+        h.app.mixer.morph_slots.entry(mixer_id).or_default()[i] = Some(snap);
+    }
+    set_decay(&mut h, 0.5);
+    h.frame(vec![]);
+    let depth1 = undo_depth(&h);
+    let pad = h.rect(egui::Id::unique(("morph-pad", mixer_id)));
+    // drag from the left edge (A/C: decay 0.1) to the right edge (B/D: decay 0.9)
+    h.drag(egui::pos2(pad.min.x + 2.0, pad.center().y), egui::pos2(pad.max.x - 2.0, pad.center().y), egui::PointerButton::Primary);
+    let decay = param(&mut h, reverb::P_DECAY);
+    assert!(decay > 0.85, "morph moved the decay toward the right corners: {decay}");
+    assert_eq!(undo_depth(&h), depth1 + 1, "the whole morph drag is one undo entry");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    h.frame(vec![]);
+    assert!((param(&mut h, reverb::P_DECAY) - 0.5).abs() < 1e-6, "undo restores the pre-drag rack");
+    // parallel branch: a new bus fed by a 0 dB post-fader send, routed like the channel
+    let m = h.app.project.mixer_channel(mixer_id).cloned().unwrap();
+    let mut cmds = Vec::new();
+    let bus = super::mixer::add_parallel_branch(&m, &mut cmds);
+    for c in cmds {
+        h.app.apply(c);
+    }
+    let src = h.app.project.mixer_channel(mixer_id).unwrap();
+    assert!(src.sends.iter().any(|s| s.target_id == bus && s.level_db.0 == 0.0 && s.tap == rawdawg_project::SendTap::PostFader));
+    let b = h.app.project.mixer_channel(bus).unwrap();
+    assert_eq!(b.output_id, src.output_id);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h.app.project.mixer_channel(bus).is_none(), "one undo removes the branch and its send");
+    assert!(!h.app.project.mixer_channel(mixer_id).unwrap().sends.iter().any(|s| s.target_id == bus));
+}
+
+#[test]
+fn midi_learn_maps_a_cc_to_an_effect_parameter_and_lfo_clips_modulate_it() {
+    use rawdawg_effects::reverb;
+    use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
+    let mut h = Harness::with_preset(Some("../../fixtures/demo-song.rawdawg"), Some(&format!("effect:{}", reverb::TYPE_ID)));
+    let iid = h.app.effect_editor.expect("the preset opened a fresh insert");
+    super::effect_panel::ensure_mirror(&mut h.app, iid).unwrap();
+    // learn: arm, then the next controller event binds CC 74 to the decay
+    h.app.arm_midi_learn(iid, reverb::P_DECAY);
+    let cc = |value: f32| TimedEvent::new(0, EventSource::MidiDevice(0), 0, EventKind::Control { cc: 74, value });
+    assert!(h.app.handle_midi_control(&cc(0.3)), "the learning event is consumed");
+    let mapping = h.app.midi_mapping_for(iid, reverb::P_DECAY).cloned().expect("mapping stored in the project");
+    assert_eq!(mapping.cc, 74);
+    assert!(h.app.handle_midi_control(&cc(0.9)), "mapped events are consumed");
+    super::effect_panel::ensure_mirror(&mut h.app, iid).unwrap();
+    let decay = h.app.other_mirrors[&iid].param(rawdawg_types::ParamId(reverb::P_DECAY)).unwrap();
+    assert!((decay - 0.9).abs() < 1e-6, "the controller moves the parameter: {decay}");
+    assert!(!h.app.handle_midi_control(&TimedEvent::new(0, EventSource::MidiDevice(0), 0, EventKind::Control { cc: 1, value: 0.5 })), "unmapped CCs pass through");
+    // LFO clip: a sine, one cycle per bar over four bars, ±0.25 around the current value (0.5)
+    assert!(h.app.handle_midi_control(&cc(0.5)));
+    let curves = h.app.project.automation.len();
+    let clips = h.app.project.clips.len();
+    super::automation::create_lfo_for(&mut h.app, iid, reverb::P_DECAY, 0, 1.0, 0.25);
+    assert_eq!(h.app.project.automation.len(), curves + 1);
+    assert_eq!(h.app.project.clips.len(), clips + 1);
+    let curve = h.app.project.automation.last().unwrap();
+    assert_eq!(curve.target.instance_id, iid);
+    assert_eq!(curve.target.param_id, reverb::P_DECAY);
+    assert_eq!(curve.points.len(), 65, "16 points per cycle × 4 cycles + end point");
+    let (lo, hi) = curve.points.iter().fold((1.0f32, 0.0f32), |(a, b), p| (a.min(p.value), b.max(p.value)));
+    assert!((hi - lo - 0.5).abs() < 0.02, "swing ±0.25: {lo}..{hi}");
+    assert!(curve.points.windows(2).all(|w| w[1].tick >= w[0].tick), "ticks are monotonic");
+    assert_eq!(h.app.editor_view, EditorView::Automation);
+    // square shape uses step interpolation; undo removes clip and curve together
+    super::automation::create_lfo_for(&mut h.app, iid, reverb::P_DECAY, 2, 4.0, 0.1);
+    assert!(h.app.project.automation.last().unwrap().points.iter().all(|p| p.interpolation == rawdawg_project::Interpolation::Step));
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.automation.len(), curves);
+    assert_eq!(h.app.project.clips.len(), clips);
+}

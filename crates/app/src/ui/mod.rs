@@ -266,7 +266,7 @@ impl App {
             record: Default::default(),
             automation: Default::default(),
             key_target: KeyTarget::None,
-            mixer: Default::default(),
+            mixer: mixer::MixerState::new(),
             effect_panel: Default::default(),
             effect_editor: None,
             editor_height_hint: None,

@@ -494,7 +494,7 @@ impl Engine {
 
     /// Copy a mixer channel's buffer into its send targets (main input or sidechain), with
     /// per-send gain and latency compensation. `pre` selects the pre- or post-fader taps.
-    fn run_sends(plan: &mut Plan, mi: usize, frames: usize, pre: bool, audible: bool) {
+    fn run_sends(plan: &mut Plan, mi: usize, frames: usize, pre: bool, audible: bool, feed: bool) {
         let n_sends = plan.mixer[mi].sends.len();
         for si in 0..n_sends {
             let (target, is_pre, sidechain, comp) = {
@@ -502,6 +502,12 @@ impl Engine {
                 (snd.target_index, snd.pre_fader, snd.sidechain, snd.comp_frames)
             };
             if is_pre != pre || target == mi {
+                continue;
+            }
+            // under solo a feeding node delivers sidechain sends to soloed/feeding targets and
+            // ordinary sends to feeding targets only
+            let deliver = audible || (feed && if sidechain { plan.solo_mixer[target] || plan.solo_feed[target] } else { plan.solo_feed[target] });
+            if !deliver {
                 continue;
             }
             let (src, dst) = if mi < target {
@@ -516,7 +522,8 @@ impl Engine {
             let (dl, dr) = if sidechain { dst.sidechain.stereo_mut(frames) } else { dst.buffer.stereo_mut(frames) };
             let mute = src.mute && !pre; // a muted channel still feeds pre-fader sends
             for i in 0..frames {
-                let g = snd.gain.next() * if mute || !audible { 0.0 } else { 1.0 };
+                // `deliver` already covers the solo gating for this edge
+                let g = snd.gain.next() * if mute { 0.0 } else { 1.0 };
                 let (mut l, mut r) = (sl[i] * g, sr[i] * g);
                 if comp > 0 {
                     snd.comp[0].push(l);
@@ -681,7 +688,7 @@ impl Engine {
                 ch.comp[0].delay_block(sl, ch.comp_frames);
                 ch.comp[1].delay_block(sr, ch.comp_frames);
             }
-            let audible = !ch.mute && (!plan.any_solo || plan.solo_mixer[ch.mixer_index]);
+            let audible = !ch.mute && (!plan.any_solo || plan.solo_mixer[ch.mixer_index] || plan.solo_feed[ch.mixer_index]);
             let mut peak = 0.0f32;
             let dest = &mut plan.mixer[ch.mixer_index].buffer;
             let (dl, dr) = dest.stereo_mut(frames);
@@ -703,6 +710,8 @@ impl Engine {
         for oi in 0..plan.mixer_order.len() {
             let mi = plan.mixer_order[oi];
             let audible = !plan.any_solo || plan.solo_mixer[mi];
+            // a sidechain dependency of a soloed node keeps running; only its deliveries are gated
+            let feed = !audible && plan.solo_feed[mi];
             // inserts
             for ii in 0..plan.mixer[mi].inserts.len() {
                 let slot = plan.mixer[mi].inserts[ii].slot;
@@ -776,7 +785,7 @@ impl Engine {
                 }
             }
             // pre-fader sends (tap after the inserts)
-            Self::run_sends(plan, mi, frames, true, audible);
+            Self::run_sends(plan, mi, frames, true, audible, feed);
             // fader / pan / meters
             let mute = plan.mixer[mi].mute;
             let gain_pl = plan.mixer[mi].pan_l * std::f32::consts::SQRT_2;
@@ -787,7 +796,7 @@ impl Engine {
                 let m = &mut plan.mixer[mi];
                 let (bl, br) = m.buffer.stereo_mut(frames);
                 for i in 0..frames {
-                    let g = m.gain.next() * if mute || !audible { 0.0 } else { 1.0 };
+                    let g = m.gain.next() * if mute || !(audible || feed) { 0.0 } else { 1.0 };
                     bl[i] *= g * gain_pl;
                     br[i] *= g * gain_pr;
                     pk_l = pk_l.max(bl[i].abs());
@@ -801,11 +810,14 @@ impl Engine {
                 b.fetch_max(pk_r);
             }
             // post-fader sends
-            Self::run_sends(plan, mi, frames, false, audible);
+            Self::run_sends(plan, mi, frames, false, audible, feed);
             // main output
             let out_idx = plan.mixer[mi].output_index;
+            // a feeding node's main output reaches only other feeding nodes, never the mix
+            let deliver_out = out_idx.is_some_and(|oi| audible || (feed && plan.solo_feed[oi]));
             if let Some(oi) = out_idx
                 && oi != mi
+                && deliver_out
             {
                 let (src, dst) = if mi < oi {
                     let (a, b) = plan.mixer.split_at_mut(oi);

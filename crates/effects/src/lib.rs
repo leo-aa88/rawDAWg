@@ -13,6 +13,7 @@ pub mod granular;
 pub mod modulation;
 pub mod oversample;
 pub mod pitch;
+pub mod rack;
 pub mod reverb;
 pub mod spectral;
 pub mod stereo;

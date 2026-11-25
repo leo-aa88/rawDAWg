@@ -934,6 +934,10 @@ impl History {
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty() && self.gesture.is_none()
     }
+    /// Number of undo entries (tests: "one gesture = one entry").
+    pub fn undo_len(&self) -> usize {
+        self.undo.len()
+    }
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty() && self.gesture.is_none()
     }

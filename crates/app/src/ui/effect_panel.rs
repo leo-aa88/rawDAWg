@@ -24,7 +24,7 @@ pub(crate) struct EffectPanelState {
     paint_active: bool,
 }
 
-fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
+pub(crate) fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
     if app.other_mirrors.contains_key(&instance_id) {
         return Ok(());
     }
@@ -216,6 +216,16 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
                         super::automation::create_clip_for(app, instance_id, d.id.0);
                         ui.close();
                     }
+                    ui.menu_button("Modulate with an LFO clip", |ui| {
+                        for (shape, label) in super::automation::LFO_SHAPES.iter().enumerate() {
+                            for (cycles, rate) in [(0.25, "slow, 1 per 4 bars"), (1.0, "1 per bar"), (4.0, "1 per beat")] {
+                                if ui.button(format!("{label}, {rate}")).clicked() {
+                                    super::automation::create_lfo_for(app, instance_id, d.id.0, shape, cycles, 0.25);
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                     if ui.button("Reset to default").clicked() {
                         edits.push((d.id, d.default_normalized, true, true));
                         ui.close();
