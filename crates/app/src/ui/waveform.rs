@@ -7,9 +7,9 @@ use crate::theme;
 use rawdawg_dsp::processor::Processor;
 use rawdawg_dsp::wavetable::{CYCLE_LEN, MipTable, TableBuilder, cycles};
 use rawdawg_project::Command;
-use rawdawg_synthesizer::patch::Generator;
+use rawdawg_synthesizer::patch::{Generator, MAX_FRAMES};
 use rawdawg_synthesizer::sculpt::{self, Brush, BrushSettings, StrokePoint};
-use rawdawg_types::InstanceId;
+use rawdawg_types::{InstanceId, ParamId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum CanvasMode {
@@ -22,12 +22,14 @@ pub(crate) struct WaveformState {
     pub mode: CanvasMode,
     pub settings: BrushSettings,
     pub layer: usize,
+    /// Motion frame being edited (wavetable layers).
+    pub frame: usize,
     pub spectrum_db: bool,
     builder: TableBuilder,
     /// Active stroke: instance, pre-stroke state bytes, last pointer sample, dab counter.
     stroke: Option<Stroke>,
-    /// A table built but not yet accepted by the queue (coalesced retry).
-    pending_table: Option<(InstanceId, usize, Box<MipTable>)>,
+    /// A table built but not yet accepted by the queue (coalesced retry): instance, layer, frame.
+    pending_table: Option<(InstanceId, usize, usize, Box<MipTable>)>,
     scope: Vec<f32>,
     seed: u64,
     pub status_tip: String,
@@ -54,6 +56,7 @@ impl Default for WaveformState {
             mode: CanvasMode::Waveform,
             settings: BrushSettings::default(),
             layer: 0,
+            frame: 0,
             spectrum_db: false,
             builder: TableBuilder::new(),
             stroke: None,
@@ -91,8 +94,9 @@ pub(crate) fn additive_cycle(a: &rawdawg_synthesizer::patch::AdditiveSettings) -
 fn layer_cycle(app: &App, instance: InstanceId, layer: usize) -> Option<(Vec<f32>, bool)> {
     let patch = app.synth_mirrors.get(&instance)?.patch();
     let l = patch.layers.get(layer)?;
+    let frame = app.synth_panel.waveform.frame;
     Some(match &l.generator {
-        Generator::Wavetable { cycle, frames, .. } => (frames.first().cloned().unwrap_or_else(|| cycle.clone()), true),
+        Generator::Wavetable { cycle, frames, .. } => (frames.get(frame.min(frames.len().saturating_sub(1))).cloned().unwrap_or_else(|| cycle.clone()), true),
         Generator::Basic { wave, .. } => (basic_cycle(*wave), false),
         Generator::Granular { source, .. } => (source.clone(), true),
         Generator::Additive(a) => (crate::ui::waveform::additive_cycle(a), false),
@@ -103,12 +107,14 @@ fn layer_cycle(app: &App, instance: InstanceId, layer: usize) -> Option<(Vec<f32
 /// Push a cycle into the live synth (table handoff) and into the mirror patch.
 fn apply_cycle_live(app: &mut App, instance: InstanceId, layer: usize, cycle: &[f32]) {
     let table = Box::new(app.synth_panel.waveform.builder.build(cycle, true));
+    let mut frame = app.synth_panel.waveform.frame;
     if let Some(m) = app.synth_mirrors.get_mut(&instance) {
         let mut patch = m.patch().clone();
         if let Some(l) = patch.layers.get_mut(layer) {
             match &mut l.generator {
                 Generator::Wavetable { cycle: c, frames, .. } => {
-                    if let Some(f) = frames.first_mut() {
+                    frame = frame.min(frames.len().saturating_sub(1));
+                    if let Some(f) = frames.get_mut(frame) {
                         *f = cycle.to_vec();
                     } else {
                         *c = cycle.to_vec();
@@ -120,22 +126,107 @@ fn apply_cycle_live(app: &mut App, instance: InstanceId, layer: usize, cycle: &[
             let _ = m.set_patch(patch);
         }
     }
-    send_table(app, instance, layer, table);
+    send_table(app, instance, layer, frame, table);
 }
 
-fn send_table(app: &mut App, instance: InstanceId, layer: usize, table: Box<MipTable>) {
+fn send_table(app: &mut App, instance: InstanceId, layer: usize, frame: usize, table: Box<MipTable>) {
     // keep only the newest pending table (coalescing)
     let table = match app.table_senders.get_mut(&instance) {
-        Some(s) => s.send(layer, 0, table).err(),
+        Some(s) => s.send(layer, frame, table).err(),
         None => None,
     };
-    app.synth_panel.waveform.pending_table = table.map(|t| (instance, layer, t));
+    app.synth_panel.waveform.pending_table = table.map(|t| (instance, layer, frame, t));
 }
 
 /// Retry a pending table send (called every frame).
 pub(crate) fn flush_pending(app: &mut App) {
-    if let Some((instance, layer, table)) = app.synth_panel.waveform.pending_table.take() {
-        send_table(app, instance, layer, table);
+    if let Some((instance, layer, frame, table)) = app.synth_panel.waveform.pending_table.take() {
+        send_table(app, instance, layer, frame, table);
+    }
+}
+
+/// Motion-frame strip for wavetable layers: select, add (duplicate), remove, reorder
+/// frames and scrub the playback position (SYN-06). Structure changes are undoable
+/// patch commits (voices carry over); the position is a live parameter gesture.
+fn frame_strip(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer: usize) {
+    let Some(patch) = app.synth_mirrors.get(&instance).map(|m| m.patch().clone()) else { return };
+    let Some(Generator::Wavetable { cycle, frames, position, .. }) = patch.layers.get(layer).map(|l| &l.generator) else { return };
+    let count = frames.len().max(1);
+    let st = &mut app.synth_panel.waveform;
+    st.frame = st.frame.min(count - 1);
+    let frame = st.frame;
+    let mut new_patch: Option<rawdawg_synthesizer::Patch> = None;
+    let mut edits: Vec<(ParamId, f32, bool, bool)> = Vec::new();
+    ui.horizontal(|ui| {
+        ui.label("Frames").on_hover_text("Motion frames: the wavetable position travels between them (modulate it with an LFO or envelope)");
+        for i in 0..count {
+            if ui.selectable_label(frame == i, format!("{}", i + 1)).clicked() {
+                app.synth_panel.waveform.frame = i;
+            }
+        }
+        if count < MAX_FRAMES && ui.button("+").on_hover_text("Add a frame after this one (copy of it)").clicked() {
+            let mut p = patch.clone();
+            if let Some(Generator::Wavetable { cycle, frames, .. }) = p.layers.get_mut(layer).map(|l| &mut l.generator) {
+                if frames.is_empty() {
+                    frames.push(cycle.clone());
+                }
+                let copy = frames[frame.min(frames.len() - 1)].clone();
+                frames.insert(frame + 1, copy);
+            }
+            app.synth_panel.waveform.frame = frame + 1;
+            new_patch = Some(p);
+        }
+        if count > 1 && ui.button("−").on_hover_text("Remove this frame").clicked() {
+            let mut p = patch.clone();
+            if let Some(Generator::Wavetable { cycle, frames, .. }) = p.layers.get_mut(layer).map(|l| &mut l.generator) {
+                frames.remove(frame);
+                if frames.len() == 1 {
+                    *cycle = frames.remove(0);
+                }
+            }
+            app.synth_panel.waveform.frame = frame.saturating_sub(1);
+            new_patch = Some(p);
+        }
+        if count > 1 && frame > 0 && ui.button("<").on_hover_text("Move this frame earlier").clicked() {
+            let mut p = patch.clone();
+            if let Some(Generator::Wavetable { frames, .. }) = p.layers.get_mut(layer).map(|l| &mut l.generator) {
+                frames.swap(frame, frame - 1);
+            }
+            app.synth_panel.waveform.frame = frame - 1;
+            new_patch = Some(p);
+        }
+        if count > 1 && frame + 1 < count && ui.button(">").on_hover_text("Move this frame later").clicked() {
+            let mut p = patch.clone();
+            if let Some(Generator::Wavetable { frames, .. }) = p.layers.get_mut(layer).map(|l| &mut l.generator) {
+                frames.swap(frame, frame + 1);
+            }
+            app.synth_panel.waveform.frame = frame + 1;
+            new_patch = Some(p);
+        }
+        if count > 1 {
+            ui.separator();
+            let id = ParamId(rawdawg_synthesizer::params::layer_param(layer as u32, rawdawg_synthesizer::params::L_WT_POSITION));
+            let current = app.synth_mirrors[&instance].param(id).unwrap_or(*position);
+            let mut n = current;
+            let resp =
+                ui.add(egui::Slider::new(&mut n, 0.0..=1.0).text("Position").show_value(false)).on_hover_text("Where playback sits between the frames (live; drag to scrub)");
+            let playing = n * (count - 1) as f32;
+            ui.label(egui::RichText::new(format!("{:.2} → frame {:.1}", n, playing + 1.0)).monospace().color(theme::TEXT_SECONDARY));
+            if resp.changed() && (n - current).abs() > 1e-7 {
+                edits.push((id, n, resp.drag_started() || !resp.dragged(), !resp.dragged()));
+            } else if resp.drag_stopped() {
+                edits.push((id, n, false, true));
+            }
+        } else {
+            let _ = cycle;
+            ui.label(egui::RichText::new("one frame — press + to add motion").color(theme::TEXT_SECONDARY));
+        }
+    });
+    if !edits.is_empty() {
+        super::synth_panel::apply_edits(app, instance, edits);
+    }
+    if let Some(p) = new_patch {
+        super::synth_panel::commit_patch(app, instance, p);
     }
 }
 
@@ -178,6 +269,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
             ui.label(egui::RichText::new("Editing turns this layer into a wavetable").color(theme::WARNING));
         }
     });
+    frame_strip(app, ui, instance, ws_layer);
     match app.synth_panel.waveform.mode {
         CanvasMode::Waveform => waveform_canvas(app, ui, instance, ws_layer),
         CanvasMode::Spectrum => spectrum_canvas(app, ui, instance, ws_layer),
@@ -213,6 +305,17 @@ fn waveform_canvas(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer
     };
     let to_pos = |i: usize, v: f32| egui::pos2(rect.min.x + rect.width() * i as f32 / CYCLE_LEN as f32, mid - v.clamp(-1.5, 1.5) * rect.height() * 0.45);
     let step = (CYCLE_LEN / (rect.width() as usize).max(1)).max(1);
+    // the other motion frames, faint, for context
+    if let Some(Generator::Wavetable { frames, .. }) = app.synth_mirrors.get(&instance).and_then(|m| m.patch().layers.get(layer)).map(|l| &l.generator) {
+        let cur = app.synth_panel.waveform.frame;
+        for (fi, f) in frames.iter().enumerate() {
+            if fi == cur || f.len() != CYCLE_LEN {
+                continue;
+            }
+            let pts: Vec<egui::Pos2> = (0..CYCLE_LEN).step_by(step).chain(std::iter::once(CYCLE_LEN - 1)).map(|i| to_pos(i, f[i])).collect();
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, theme::TEXT_SECONDARY.linear_multiply(0.25))));
+        }
+    }
     let pts: Vec<egui::Pos2> = (0..CYCLE_LEN).step_by(step).chain(std::iter::once(CYCLE_LEN - 1)).map(|i| to_pos(i, shown[i])).collect();
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, theme::ACCENT)));
     // brush cursor

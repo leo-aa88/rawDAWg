@@ -58,6 +58,16 @@ pub fn demo_project() -> Project {
 pub fn graph_demo_project() -> Project {
     use rawdawg_synthesizer::graph::{Edge, GraphNodeId as N, NodeKind, Scope, SubGraph};
     let mut synth = rawdawg_synthesizer::Patch { name: "Graph demo".into(), ..Default::default() };
+    // four motion frames on layer 1 so the frame editor has something to show
+    if let Some(l) = synth.layers.first_mut() {
+        use rawdawg_dsp::wavetable::cycles;
+        l.generator = rawdawg_synthesizer::patch::Generator::Wavetable {
+            cycle: cycles::soft_saw(),
+            remove_dc: true,
+            frames: vec![cycles::sine(), cycles::soft_saw(), cycles::square(), cycles::triangle()],
+            position: 0.35,
+        };
+    }
     let mut v = SubGraph::passthrough(Scope::Voice);
     v.node_mut(N(1)).unwrap().x = 20.0;
     v.node_mut(N(1)).unwrap().y = 20.0;

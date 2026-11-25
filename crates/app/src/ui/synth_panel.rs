@@ -263,7 +263,7 @@ fn param_grid(
     });
 }
 
-fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(ParamId, f32, bool, bool)>) {
+pub(crate) fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(ParamId, f32, bool, bool)>) {
     for (id, n, started, stopped) in edits {
         if started && app.synth_panel.gesture.is_none() {
             let before = app.synth_mirrors[&instance_id].save_state();

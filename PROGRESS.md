@@ -4,7 +4,7 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 
 ## Current state
 
-- **Milestone:** M0 complete; M1 implemented (hardware gates open); **M2 (flagship experimental synth) in progress** — sculpting canvas with live table handoff, all six generator types, unison, LFOs/mod matrix, randomize/chaos/locks, evolution/breed, XY morph (compatible structures), factory presets + `.rawdawgpreset`, sampler and SF2. Modular graph with bounded expression nodes (SYN-07) landed 2026-11-25 (see below). Remaining M2 items: motion-frame editor UI (model and playback exist), incompatible-topology morph crossfade, gesture-to-automation recording (M3 lanes). See "M2 additions" and "Open gates".
+- **Milestone:** M0 complete; M1 implemented (hardware gates open); **M2 (flagship experimental synth) in progress** — sculpting canvas with live table handoff, all six generator types, unison, LFOs/mod matrix, randomize/chaos/locks, evolution/breed, XY morph (compatible structures), factory presets + `.rawdawgpreset`, sampler and SF2. Modular graph with bounded expression nodes (SYN-07) and the motion-frame editor landed 2026-11-25 (see below). **M2 checkpoint reached** (automated gates T-OSC/VOICE/SCULPT/MUTATE/MORPH/GRAPH/SAMPLER subsets pass; listening/GUI gates open). Carried into later milestones: incompatible-topology morph crossfade (bounded parallel corner instances), gesture-to-automation recording (M3 lanes), sampler/FFT nodes inside the graph. See "M2 additions" and "Open gates".
 - **Environment used:** Ubuntu 22.04 (WSL2, WSLg), Rust 1.99.0, 16 cores. Audio output available through WSLg's PulseAudio bridge via ALSA (`Default Audio Device`), which is *not* a real Ubuntu desktop/hardware device. No Windows machine, no display screenshots captured, no MIDI hardware, no independent plugin hosts or validators installed.
 - **Build label:** intermediate build; not a release candidate.
 
@@ -14,10 +14,10 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 |---|---|
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 (after lint fixes; see git diff) |
-| `cargo test --workspace` | 145 tests, 0 failures (types 23, transport 10, rt 8+3, dsp 39, synthesizer 7+18, project 18, audio-io 4, audio-engine 1+10, plugin-clap 2, plugin-vst3 2) |
+| `cargo test --workspace` (2026-11-25) | 219 tests, 0 failures (types 23, transport 10, rt 8+3, dsp 39, synthesizer 35+24+13, project 23, sampler 8, audio-io 4+5, audio-engine 12+2, plugin-clap 2, plugin-vst3 2, …) |
 | `cargo build --workspace --release --locked` | exit 0 (3 m 08 s); `target/release/rawdawg`, `librawdawg_clap.so`, `librawdawg_vst3.so` |
 | `cargo xtask fixtures` | wrote `fixtures/demo.rawdawg` + 4 WAVs |
-| `cargo xtask verify --suite all` | HL-01..07 PASS, PL-01..02 PASS, PL-03/04/05 BLOCKED, HW-01 BLOCKED, GUI-01 BLOCKED → `target/verification/verify-all.json` |
+| `cargo xtask verify --suite all` | HL-01..09 PASS (headless suite re-run 2026-11-25), PL-01..02 PASS, PL-03/04/05 BLOCKED, HW-01 BLOCKED, GUI-01 BLOCKED → `target/verification/verify-all.json` |
 | `cargo xtask render --project fixtures/demo.rawdawg --output target/verification/demo.wav` | 144000 frames @ 48 kHz, peak 0.340, ~167× realtime |
 | `cargo run -p rawdawg -- --audio-smoke` | opened ALSA default 48 kHz F32 stereo, 134 callbacks / 68608 frames, 1 xrun (heuristic), engine peak 0.154, exit 0 |
 | `cargo run -p rawdawg -- --list-audio-devices` | ALSA host, 3 devices (null, default, …), JSON |
@@ -52,6 +52,11 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - T-GRAPH (`crates/synthesizer/tests/graph.rs`, 13 tests): type/missing/duplicate-input rejection, cycle path, delay feedback accepted and scheduled read-before/write-after, feed-forward delay not flagged, z⁻¹ cycles rejected, deterministic compile and buffer reuse, node/edge/cost/expression limits, pass-through sample-identical to no graph, expression scaling and counted domain errors, geometric echo decay (fb 0.5 ± 0.08) and bounded max feedback, per-voice vs global state (envelope restarts per note vs shared), oscillator node at voice pitch and global square LFO gating, patch round trip/legacy load/version rejection, migration carry-over vs reset, allocation-free process path with 17 node kinds, mutation/morph behaviour.
 - Not in this slice (documented): sampler and FFT nodes inside the graph (sampler assets arrive with M5 import flows; FFT nodes "where prepared" are deferred), graph node parameters are not exposed as stable `ParamId`s (edits commit the patch with voice carry-over; automation of node parameters is an M3 lane feature), mutation does not add/remove graph nodes.
 - Screenshot: `docs/verification/screenshots/m2-graph-editor.png`.
+
+### Motion-frame editor (2026-11-25)
+
+- Waveform canvas gains a **Frames** strip for wavetable layers: select the frame being sculpted, `+` duplicates the current frame after itself (≤16), `−` removes, `<`/`>` reorder; structure changes are one undo entry each (patch commit, voices carry over). Other frames are drawn faintly behind the edited one; strokes and table handoff target the selected frame (`TableSender::send(layer, frame, …)`). The **Position** slider scrubs the live wavetable position as a parameter gesture and shows the frame being played. Screenshot `docs/verification/screenshots/m2-motion-frames.png` (captured through X11/XWayland: the WSLg Wayland socket stopped answering winit's registry roundtrip during this session, an environment fault documented under known issues).
+- `fixtures/demo-graph.rawdawg` layer 1 now carries four frames (sine/soft saw/square/triangle) at position 0.35.
 
 ## M1 additions (2026-11-25)
 
@@ -103,11 +108,10 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Channel pan is applied as a stereo balance derived from equal-power gains; stereo width option deferred (M4).
 - The xrun detector is a callback-gap heuristic; backend-reported underruns are not surfaced by cpal 0.18 uniformly.
 - WSLg audio device is a bridge; latency/xrun numbers from this machine are not hardware evidence.
+- WSLg's Wayland socket stopped answering during the 2026-11-25 session (the app blocks inside winit's registry roundtrip before any rawDAWg code runs); screenshots since then are captured with `WAYLAND_DISPLAY` unset (XWayland). Not a rawDAWg defect; a real desktop session is required for GUI-01 anyway.
 
 ## Next action
 
-M2 remainder, then M3:
-1. Motion-frame editor (add/remove/reorder frames, position scrub) on the canvas; incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission.
-2. M2 gate pass: run the T-OSC/VOICE/SCULPT/MUTATE/MORPH/GRAPH/SAMPLER subsets, update the evidence table, commit the checkpoint.
-3. M3: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
+M3 (sequencing and recording), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+1. M3: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
 Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).
