@@ -203,10 +203,47 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     }
 }
 
+/// Most steps offered as a list of named choices (more get a step slider).
+pub(crate) const MAX_LISTED_STEPS: u32 = 64;
+
+/// Names of a discrete parameter's steps: the descriptor's own labels, otherwise the
+/// processor's text for every step (hosted plugins name their choices). `None` when neither
+/// is available or the steps are too many to list.
+pub(crate) fn step_labels(p: &dyn rawdawg_dsp::processor::Processor, d: &ParamDescriptor) -> Option<Vec<String>> {
+    let ParamMapping::Discrete { steps } = d.mapping else { return None };
+    if let Some(labels) = d.labels.filter(|l| l.len() >= steps as usize) {
+        return Some(labels.iter().take(steps as usize).map(|l| (*l).to_owned()).collect());
+    }
+    if steps > MAX_LISTED_STEPS {
+        return None;
+    }
+    (0..steps).map(|i| p.param_text(d.id, d.to_normalized(f64::from(i)))).collect()
+}
+
+/// A choice list for a discrete parameter; returns the response and the (new) value.
+pub(crate) fn step_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, d: &ParamDescriptor, labels: &[String], n: f32) -> (egui::Response, f32) {
+    let before = (d.to_physical(n).max(0.0) as usize).min(labels.len().saturating_sub(1));
+    let mut idx = before;
+    let mut r = egui::ComboBox::from_id_salt(salt)
+        .selected_text(labels.get(idx).map(String::as_str).unwrap_or(""))
+        .show_ui(ui, |ui| {
+            for (i, l) in labels.iter().enumerate() {
+                ui.selectable_value(&mut idx, i, l);
+            }
+        })
+        .response;
+    if idx != before {
+        r.mark_changed();
+        return (r, d.to_normalized(idx as f64));
+    }
+    (r, n)
+}
+
 fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descriptors: &[ParamDescriptor], edits: &mut Vec<(ParamId, f32, bool, bool)>) {
     egui::Grid::new(("fx-params", instance_id)).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
         for d in descriptors {
             let Some(current) = app.other_mirrors[&instance_id].param(d.id) else { continue };
+            let labels = step_labels(&*app.other_mirrors[&instance_id], d);
             ui.label(d.name);
             let mut n = current;
             let resp = match d.mapping {
@@ -216,23 +253,9 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
                     n = if b { 1.0 } else { 0.0 };
                     r
                 }
-                ParamMapping::Discrete { steps } if d.labels.is_some_and(|l| l.len() >= steps as usize) => {
-                    let labels = d.labels.unwrap_or_default();
-                    let mut idx = (d.to_physical(n).max(0.0) as usize).min(labels.len() - 1);
-                    let mut r = egui::ComboBox::from_id_salt(("fx-combo", instance_id, d.id.0))
-                        .selected_text(labels[idx])
-                        .show_ui(ui, |ui| {
-                            let mut changed = false;
-                            for (i, l) in labels.iter().enumerate() {
-                                changed |= ui.selectable_value(&mut idx, i, *l).changed();
-                            }
-                            changed
-                        })
-                        .response;
-                    if idx != d.to_physical(n).max(0.0) as usize {
-                        r.mark_changed();
-                    }
-                    n = d.to_normalized(idx as f64);
+                ParamMapping::Discrete { .. } if labels.is_some() => {
+                    let (r, v) = step_combo(ui, ("fx-combo", instance_id, d.id.0), d, labels.as_deref().unwrap_or_default(), n);
+                    n = v;
                     r
                 }
                 ParamMapping::Discrete { steps } => {
@@ -276,7 +299,8 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
                 })
                 .map(|r| r.response)
                 .unwrap_or(resp);
-            ui.label(egui::RichText::new(format!("{}{}{}", d.format(n), cc, if learning { " learn…" } else { "" })).monospace().color(if learning {
+            let readout = rawdawg_dsp::processor::display_value(&*app.other_mirrors[&instance_id], d, n);
+            ui.label(egui::RichText::new(format!("{readout}{cc}{}", if learning { " learn…" } else { "" })).monospace().color(if learning {
                 theme::WARNING
             } else {
                 theme::TEXT_SECONDARY

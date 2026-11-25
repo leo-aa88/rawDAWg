@@ -55,6 +55,16 @@ pub(crate) fn descriptor(app: &App, target: &AutomationTarget) -> Option<ParamDe
     descs.iter().find(|d| d.id.0 == target.param_id).copied()
 }
 
+/// Readout of a value of a curve's target: the processor's own text when it has one (hosted
+/// plugins), the descriptor's formatting otherwise, the bare value when the target is unknown.
+pub(crate) fn value_text(app: &App, target: &AutomationTarget, desc: Option<&ParamDescriptor>, v: f32) -> String {
+    match (desc, app.other_mirrors.get(&target.instance_id)) {
+        (Some(d), Some(m)) => rawdawg_dsp::processor::display_value(&**m, d, v),
+        (Some(d), None) => d.format(v),
+        (None, _) => format!("{v:.3}"),
+    }
+}
+
 pub(crate) fn target_label(app: &App, target: &AutomationTarget) -> String {
     let chan = app.project.channels.iter().find(|c| c.instrument.id == target.instance_id).map(|c| c.name.clone()).unwrap_or_else(|| "?".into());
     let param = descriptor(app, target).map(|d| d.name.to_owned()).unwrap_or_else(|| format!("param {}", target.param_id));
@@ -428,11 +438,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
                 cmds.push(Command::UpdateAutomationCurve { curve: c });
             }
-            ui.label(
-                egui::RichText::new(format!("point: {} = {}", pt.tick.0, desc.map(|d| d.format(pt.value)).unwrap_or_else(|| format!("{:.3}", pt.value))))
-                    .monospace()
-                    .color(theme::TEXT_SECONDARY),
-            );
+            ui.label(egui::RichText::new(format!("point: {} = {}", pt.tick.0, value_text(app, &curve.target, desc.as_ref(), pt.value))).monospace().color(theme::TEXT_SECONDARY));
         }
         if ui.button("Delete curve").on_hover_text("Removes the curve and its clips (undoable)").clicked() {
             let mut batch: Vec<Command> = app
@@ -494,7 +500,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         painter.text(
             pos2(area.min.x + 2.0, y - 1.0),
             egui::Align2::LEFT_BOTTOM,
-            desc.map(|d| d.format(frac)).unwrap_or_else(|| format!("{frac:.2}")),
+            value_text(app, &curve.target, desc.as_ref(), frac),
             egui::FontId::proportional(9.0),
             theme::TEXT_SECONDARY,
         );
@@ -591,7 +597,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         && area.contains(p)
     {
         let v = value_at(p.y);
-        resp.on_hover_text_at_pointer(format!("{} · {}", tick_at(p.x), desc.map(|d| d.format(v)).unwrap_or_else(|| format!("{v:.3}"))));
+        resp.on_hover_text_at_pointer(format!("{} · {}", tick_at(p.x), value_text(app, &curve.target, desc.as_ref(), v)));
     }
     for c in cmds {
         app.apply(c);

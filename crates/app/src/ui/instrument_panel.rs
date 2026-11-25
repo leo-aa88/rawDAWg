@@ -97,6 +97,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     egui::Grid::new(("instrument-params", instance_id)).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
         for d in &descriptors {
             let Some(current) = app.other_mirrors[&instance_id].param(d.id) else { continue };
+            let labels = super::effect_panel::step_labels(&*app.other_mirrors[&instance_id], d);
             ui.label(d.name);
             let mut n = current;
             let resp = match d.mapping {
@@ -104,6 +105,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                     let mut b = n >= 0.5;
                     let r = ui.checkbox(&mut b, "");
                     n = if b { 1.0 } else { 0.0 };
+                    r
+                }
+                ParamMapping::Discrete { .. } if labels.is_some() => {
+                    let (r, v) = super::effect_panel::step_combo(ui, ("inst-combo", instance_id, d.id.0), d, labels.as_deref().unwrap_or_default(), n);
+                    n = v;
                     r
                 }
                 ParamMapping::Discrete { steps } => {
@@ -129,7 +135,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                 })
                 .map(|r| r.response)
                 .unwrap_or(resp);
-            ui.label(egui::RichText::new(format!("{}{}{}", d.format(n), cc, if learning { " learn…" } else { "" })).monospace().color(if learning {
+            let readout = rawdawg_dsp::processor::display_value(&*app.other_mirrors[&instance_id], d, n);
+            ui.label(egui::RichText::new(format!("{readout}{cc}{}", if learning { " learn…" } else { "" })).monospace().color(if learning {
                 theme::WARNING
             } else {
                 theme::TEXT_SECONDARY

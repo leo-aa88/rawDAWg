@@ -269,3 +269,75 @@ fn realtime_param_events_reach_the_hosted_plugin_like_the_native_one() {
     let d = max_diff(&a, &b);
     assert!(d < 1e-5, "mid-flight parameter change matches (max diff {d})");
 }
+
+/// Values at which every readout is compared (discrete parameters snap to their steps).
+const TEXT_PROBES: [f32; 6] = [0.0, 0.13, 0.25, 0.5, 0.77, 1.0];
+
+/// Discrete and stepped parameters take whole steps through the ABI.
+fn snapped(d: &rawdawg_types::ParamDescriptor, n: f32) -> f32 {
+    match d.mapping {
+        rawdawg_types::ParamMapping::Discrete { .. } => d.to_normalized(d.to_physical(n)),
+        rawdawg_types::ParamMapping::Linear { .. } if d.flags.stepped => d.to_normalized(d.to_physical(n).round()),
+        _ => n,
+    }
+}
+
+#[test]
+fn hosted_readouts_are_the_plugins_own_text_and_discrete_parameters_keep_their_steps() {
+    use rawdawg_types::ParamMapping;
+    let mut fx = Fixture::new();
+    let (mut readouts, mut discrete, mut stepped_ranges) = (0usize, 0usize, 0usize);
+    for exported in rawdawg_plugin_api::exported_plugins() {
+        let mut inst = fx.instance(&exported.clap_id);
+        let mut native = exported.make().unwrap();
+        // prepared like the plugin's own main-thread instance (the synth sizes its voice pool)
+        native.prepare(&PrepareSpec::new(48_000.0, 512, BusLayout::Stereo)).unwrap();
+        let native_descs = native.descriptors();
+        let wrapper = rawdawg_plugin_api::wrap::wrapper_descriptors(exported.is_synth(), exported.has_mix);
+        for nd in native_descs.iter().filter(|d| !d.flags.hidden).chain(wrapper.iter()) {
+            let hd = inst.descriptors().iter().find(|d| d.id == nd.id).unwrap_or_else(|| panic!("{} {}", exported.clap_id, nd.key));
+            match nd.mapping {
+                ParamMapping::Discrete { steps } => {
+                    // declared as integer steps 0..steps-1, so hosts offer every choice (CLAP
+                    // cannot tell a two-way choice from a switch)
+                    let expected = if steps == 2 { ParamMapping::Toggle } else { ParamMapping::Discrete { steps } };
+                    assert_eq!(hd.mapping, expected, "{} {}", exported.clap_id, nd.key);
+                    // steps above 1 reach the plugin (a stepped 0..1 range would truncate them),
+                    // and read back as the native processor reads them back
+                    for step in [steps - 1, 2.min(steps - 1)] {
+                        let n = nd.to_normalized(f64::from(step));
+                        assert!(inst.set_param(nd.id, n));
+                        inst.refresh_values();
+                        native.set_param(nd.id, n);
+                        // synth layer slots the default patch does not use have no value
+                        let Some(expected) = native.param(nd.id) else { continue };
+                        assert!((inst.param(nd.id).unwrap() - expected).abs() < 1e-6, "{} {} step {step}: {:?} vs {expected}", exported.clap_id, nd.key, inst.param(nd.id));
+                        discrete += 1;
+                    }
+                }
+                ParamMapping::Toggle => assert_eq!(hd.mapping, ParamMapping::Toggle, "{} {}", exported.clap_id, nd.key),
+                ParamMapping::Linear { min, max } if nd.flags.stepped && min != 0.0 => {
+                    // stepped ranges keep their integer units (lookahead 1–10 ms, shimmer −12…+24)
+                    assert_eq!(hd.mapping, ParamMapping::Linear { min, max }, "{} {}", exported.clap_id, nd.key);
+                    assert!(hd.flags.stepped);
+                    let n = nd.to_normalized(min + 1.0);
+                    assert!(inst.set_param(nd.id, n));
+                    inst.refresh_values();
+                    assert!((inst.param(nd.id).unwrap() - n).abs() < 1e-6, "{} {} second step", exported.clap_id, nd.key);
+                    stepped_ranges += 1;
+                }
+                _ => {}
+            }
+            for n in TEXT_PROBES.map(|n| snapped(nd, n)) {
+                let text = inst.param_text(nd.id, n);
+                assert_eq!(text.as_deref(), Some(nd.format(n).as_str()), "{} {} at {n}", exported.clap_id, nd.key);
+                assert_eq!(rawdawg_dsp::processor::display_value(&inst, hd, n), nd.format(n));
+                readouts += 1;
+            }
+        }
+        assert_eq!(inst.param_text(rawdawg_types::ParamId(0xDEAD_BEEF), 0.5), None, "unknown ids have no text");
+    }
+    assert!(discrete >= 20, "discrete read-backs checked: {discrete}");
+    assert_eq!(stepped_ranges, 2, "limiter lookahead and reverb shimmer pitch");
+    assert!(readouts > 500, "readouts checked: {readouts}");
+}

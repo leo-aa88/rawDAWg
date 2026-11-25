@@ -4,6 +4,47 @@
 use crate::clap::ClapInstance;
 use crate::vst3::Vst3Instance;
 use rawdawg_dsp::processor::{PrepareSpec, Processor};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// Longest readout taken from a plugin's own value text (characters).
+pub const MAX_PARAM_TEXT_CHARS: usize = 48;
+
+/// Readouts already asked of the plugin, by (parameter id, value), so the UI asks again
+/// only for values it has not shown yet (the generic panel draws every row each frame, and
+/// a choice list asks for every step). Bounded: cleared when it reaches
+/// [`MAX_CACHED_TEXTS`]. Main thread only.
+#[derive(Default)]
+pub(crate) struct ParamTextCache(RefCell<HashMap<(u32, u32), Option<String>>>);
+
+/// Entries kept before the readout cache starts over.
+pub const MAX_CACHED_TEXTS: usize = 8192;
+
+impl ParamTextCache {
+    pub(crate) fn get_or(&self, id: u32, normalized: f32, ask: impl FnOnce() -> Option<String>) -> Option<String> {
+        let key = (id, normalized.to_bits());
+        if let Some(text) = self.0.borrow().get(&key) {
+            return text.clone();
+        }
+        let text = ask();
+        let mut map = self.0.borrow_mut();
+        if map.len() >= MAX_CACHED_TEXTS {
+            map.clear();
+        }
+        map.insert(key, text.clone());
+        text
+    }
+
+    /// Forget every readout (after a state load, which can change how a plugin formats).
+    pub(crate) fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+}
 
 pub trait HostedInstance: Processor {
     /// Produce the realtime half for a plan compiled with `spec` (activating if needed).
@@ -85,4 +126,32 @@ pub fn hosted_mut(p: &mut dyn Processor) -> Option<&mut dyn HostedInstance> {
         return any.downcast_mut::<ClapInstance>().map(|c| c as &mut dyn HostedInstance);
     }
     any.downcast_mut::<Vst3Instance>().map(|v| v as &mut dyn HostedInstance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CACHED_TEXTS, ParamTextCache};
+    use std::cell::Cell;
+
+    #[test]
+    fn readout_cache_asks_once_per_value_and_stays_bounded() {
+        let cache = ParamTextCache::default();
+        let asked = Cell::new(0);
+        let ask = |t: &str| {
+            asked.set(asked.get() + 1);
+            Some(t.to_owned())
+        };
+        assert_eq!(cache.get_or(1, 0.5, || ask("a")).as_deref(), Some("a"));
+        assert_eq!(cache.get_or(1, 0.5, || ask("b")).as_deref(), Some("a"), "cached");
+        assert_eq!(cache.get_or(1, 0.25, || ask("c")).as_deref(), Some("c"));
+        assert_eq!(cache.get_or(2, 0.5, || None), None);
+        assert_eq!(cache.get_or(2, 0.5, || ask("d")), None, "a missing text is cached too");
+        assert_eq!(asked.get(), 2);
+        for i in 0..(MAX_CACHED_TEXTS as u32 * 2) {
+            cache.get_or(3, i as f32, || Some(String::new()));
+            assert!(cache.len() <= MAX_CACHED_TEXTS);
+        }
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+    }
 }

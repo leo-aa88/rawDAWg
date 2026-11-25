@@ -296,3 +296,65 @@ fn hosted_instrument_plays_the_sequencer_notes() {
     assert_eq!(host.instances[&ext_id].problem_count(), 0);
     let _ = Format::Vst3;
 }
+
+/// Values at which every readout is compared (discrete and stepped parameters snap).
+const TEXT_PROBES: [f32; 6] = [0.0, 0.13, 0.25, 0.5, 0.77, 1.0];
+
+fn snapped(d: &rawdawg_types::ParamDescriptor, n: f32) -> f32 {
+    match d.mapping {
+        rawdawg_types::ParamMapping::Discrete { .. } => d.to_normalized(d.to_physical(n)),
+        rawdawg_types::ParamMapping::Linear { .. } if d.flags.stepped => d.to_normalized(d.to_physical(n).round()),
+        _ => n,
+    }
+}
+
+#[test]
+fn hosted_readouts_are_the_plugins_own_text_and_steps_match_the_native_parameters() {
+    use rawdawg_types::ParamMapping;
+    let mut fx = Fixture::new();
+    let (mut readouts, mut discrete, mut with_units) = (0usize, 0usize, 0usize);
+    for exported in rawdawg_plugin_api::exported_plugins() {
+        let mut inst = fx.instance(&exported.name);
+        let native = exported.make().unwrap();
+        let wrapper = rawdawg_plugin_api::wrap::wrapper_descriptors(exported.is_synth(), exported.has_mix);
+        for nd in native.descriptors().iter().filter(|d| !d.flags.hidden).chain(wrapper.iter()) {
+            let hd = inst.descriptors().iter().find(|d| d.id == nd.id).unwrap_or_else(|| panic!("{} {}", exported.name, nd.key));
+            let expected = match nd.mapping {
+                ParamMapping::Discrete { steps: 2 } | ParamMapping::Toggle => Some(ParamMapping::Toggle),
+                ParamMapping::Discrete { steps } => Some(ParamMapping::Discrete { steps }),
+                ParamMapping::Linear { min, max } if nd.flags.stepped => Some(ParamMapping::Discrete { steps: (max - min) as u32 + 1 }),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(hd.mapping, expected, "{} {}", exported.name, nd.key);
+                discrete += 1;
+            }
+            for n in TEXT_PROBES.map(|n| snapped(nd, n)) {
+                let native_text = nd.format(n);
+                let text = inst.param_text(nd.id, n).unwrap_or_else(|| panic!("{} {} at {n}: no text", exported.name, nd.key));
+                if text != native_text {
+                    // VST3 reports the unit apart from the value string; a bare number gets it
+                    let unit = text.strip_prefix(native_text.as_str()).and_then(|r| r.strip_prefix(' '));
+                    assert!(
+                        unit.is_some_and(|u| !u.is_empty() && !u.contains(' ')) && native_text.ends_with(|c: char| c.is_ascii_digit()),
+                        "{} {} at {n}: {text:?} vs {native_text:?}",
+                        exported.name,
+                        nd.key
+                    );
+                    with_units += 1;
+                }
+                assert_eq!(rawdawg_dsp::processor::display_value(&inst, hd, n), text);
+                readouts += 1;
+            }
+        }
+        assert_eq!(inst.param_text(rawdawg_types::ParamId(0xDEAD_BEEF), 0.5), None, "unknown ids have no text");
+        // a state load forgets cached readouts and still answers afterwards
+        let saved = inst.save_state();
+        inst.load_state(&saved).expect("reload own state");
+        let first = native.descriptors().iter().find(|d| !d.flags.hidden).unwrap();
+        assert_eq!(inst.param_text(first.id, 0.5).as_deref(), Some(first.format(0.5).as_str()));
+    }
+    assert!(discrete >= 30, "step mappings checked: {discrete}");
+    assert!(readouts > 500, "readouts checked: {readouts}");
+    assert!(with_units > 0 && with_units < readouts / 4, "unit labels appended to bare numbers: {with_units}");
+}

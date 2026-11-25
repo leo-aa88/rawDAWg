@@ -26,7 +26,7 @@ use rawdawg_dsp::{AudioBlock, BusLayout};
 use rawdawg_plugin_api::ExportedPlugin;
 use rawdawg_plugin_api::wrap::{EffectWrapper, parse_state, save_envelope, wrapper_descriptors};
 use rawdawg_types::events::{EventKind, EventSource, TimedEvent, sort_events};
-use rawdawg_types::{ParamDescriptor, ParamId};
+use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping};
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -245,14 +245,71 @@ pub struct AudioProcessor<'a> {
     is_synth: bool,
     has_sidechain: bool,
     sample_rate: f64,
+    /// Integer-stepped parameters (id, low, high) for plain-value conversion on the audio thread.
+    discrete: Vec<(u32, f64, f64)>,
     shared: &'a Shared<'a>,
+}
+
+/// CLAP plain values. CLAP's `IS_STEPPED` means integer values (hosts truncate a stepped
+/// 0..1 range to its two ends), so a parameter with integer steps (a discrete choice, or a
+/// stepped linear range such as lookahead 1–10 ms) is exposed in those integer units;
+/// every other parameter is exposed as its normalized 0..1 value.
+fn integer_range(d: &ParamDescriptor) -> Option<(f64, f64)> {
+    match d.mapping {
+        ParamMapping::Discrete { steps } if steps >= 2 => Some((0.0, f64::from(steps - 1))),
+        ParamMapping::Linear { min, max } if d.flags.stepped && min.fract() == 0.0 && max.fract() == 0.0 && max > min => Some((min, max)),
+        _ => None,
+    }
+}
+
+fn plain_bounds(d: &ParamDescriptor) -> (f64, f64) {
+    integer_range(d).unwrap_or((0.0, 1.0))
+}
+
+fn to_plain(d: &ParamDescriptor, normalized: f32) -> f64 {
+    if integer_range(d).is_some() { d.to_physical(normalized).round() } else { f64::from(normalized.clamp(0.0, 1.0)) }
+}
+
+/// Integer plain value → normalized: the step's position in its range.
+fn step_to_normalized(value: f64, lo: f64, hi: f64) -> f32 {
+    ((value.round().clamp(lo, hi) - lo) / (hi - lo)) as f32
+}
+
+/// Plain value from a host → normalized; `None` for non-finite values.
+fn from_plain(d: Option<&ParamDescriptor>, value: f64) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    Some(match d.and_then(integer_range) {
+        Some((lo, hi)) => step_to_normalized(value, lo, hi),
+        None => (value as f32).clamp(0.0, 1.0),
+    })
+}
+
+/// Integer ranges of a processor's stepped parameters (id, low, high), sorted by id, for
+/// allocation-free lookup on the audio thread.
+fn integer_table(descriptors: &[ParamDescriptor]) -> Vec<(u32, f64, f64)> {
+    let mut t: Vec<(u32, f64, f64)> = descriptors.iter().filter_map(|d| integer_range(d).map(|(lo, hi)| (d.id.0, lo, hi))).collect();
+    t.sort_unstable_by_key(|e| e.0);
+    t
+}
+
+/// Plain → normalized on the audio thread (`table` from [`integer_table`]).
+fn from_plain_rt(table: &[(u32, f64, f64)], id: u32, value: f64) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    Some(match table.binary_search_by_key(&id, |e| e.0) {
+        Ok(i) => step_to_normalized(value, table[i].1, table[i].2),
+        Err(_) => (value as f32).clamp(0.0, 1.0),
+    })
 }
 
 fn note_id_of(raw_note_id: i32, pitch: u8) -> u32 {
     if raw_note_id < 0 { u32::from(pitch) | 0x8000_0000 } else { raw_note_id as u32 }
 }
 
-fn translate_events(input: &InputEvents<'_>, out: &mut Vec<TimedEvent>, frames: u32) {
+fn translate_events(input: &InputEvents<'_>, out: &mut Vec<TimedEvent>, frames: u32, discrete: &[(u32, f64, f64)]) {
     use clack_plugin::events::event_types::{MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
     out.clear();
     for ev in input.iter() {
@@ -280,11 +337,10 @@ fn translate_events(input: &InputEvents<'_>, out: &mut Vec<TimedEvent>, frames: 
             let pitch = raw.key.clamp(0, 127) as u8;
             out.push(TimedEvent::note_off(time, EventSource::Host, raw.channel.clamp(0, 15) as u8, note_id_of(raw.note_id, pitch), pitch));
         } else if let Some(p) = ev.as_event::<ParamValueEvent>() {
-            if let Some(id) = p.param_id() {
-                let v = p.value() as f32;
-                if v.is_finite() {
-                    out.push(TimedEvent::new(time, EventSource::Host, 0, EventKind::Param { id: ParamId(id.get()), value: v.clamp(0.0, 1.0) }));
-                }
+            if let Some(id) = p.param_id()
+                && let Some(v) = from_plain_rt(discrete, id.get(), p.value())
+            {
+                out.push(TimedEvent::new(time, EventSource::Host, 0, EventKind::Param { id: ParamId(id.get()), value: v }));
             }
         } else if let Some(m) = ev.as_event::<MidiEvent>() {
             let data = m.data();
@@ -382,6 +438,7 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
             wrapper.prepare(latency, config.sample_rate, shared.mix());
             wrapper.bypass = shared.bypass.load(Ordering::Relaxed);
         }
+        let discrete = integer_table(processor.descriptors());
         Ok(Self {
             processor,
             events: Vec::with_capacity(MAX_EVENTS),
@@ -395,6 +452,7 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
             is_synth,
             has_sidechain: shared.exported.has_sidechain,
             sample_rate: config.sample_rate,
+            discrete,
             shared,
         })
     }
@@ -402,7 +460,7 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
     fn process(&mut self, process: Process, mut audio: Audio, events: Events) -> Result<ProcessStatus, PluginError> {
         let frames = audio.frames_count();
         let total = frames as usize;
-        translate_events(events.input, &mut self.events, frames);
+        translate_events(events.input, &mut self.events, frames, &self.discrete);
         if !self.is_synth {
             self.wrapper.take_wrapper_events(&mut self.events);
         }
@@ -577,7 +635,7 @@ impl PluginMainThreadParams for MainThread<'_> {
         if d.flags.modulatable {
             flags |= ParamInfoFlags::IS_MODULATABLE;
         }
-        if d.flags.stepped {
+        if d.flags.stepped || integer_range(d).is_some() {
             flags |= ParamInfoFlags::IS_STEPPED;
         }
         if d.flags.is_bypass {
@@ -596,9 +654,9 @@ impl PluginMainThreadParams for MainThread<'_> {
             cookie: Default::default(),
             name: d.name.as_bytes(),
             module,
-            min_value: 0.0,
-            max_value: 1.0,
-            default_value: f64::from(d.default_normalized),
+            min_value: plain_bounds(d).0,
+            max_value: plain_bounds(d).1,
+            default_value: to_plain(d, d.default_normalized),
         });
     }
 
@@ -608,7 +666,8 @@ impl PluginMainThreadParams for MainThread<'_> {
             WRAP_MIX if self.shared.exported.has_mix => Some(f64::from(self.shared.mix())),
             id => {
                 let s = self.shared.main.lock().ok()?;
-                s.param(ParamId(id)).map(f64::from)
+                let d = s.descriptors().iter().find(|d| d.id.0 == id)?;
+                s.param(ParamId(id)).map(|n| to_plain(d, n))
             }
         }
     }
@@ -616,12 +675,13 @@ impl PluginMainThreadParams for MainThread<'_> {
     fn value_to_text(&self, param_id: ClapId, value: f64, writer: &mut ParamDisplayWriter) -> std::fmt::Result {
         use std::fmt::Write;
         let d = self.shared.descriptor_by_id(param_id.get()).ok_or(std::fmt::Error)?;
-        write!(writer, "{}", d.format(value as f32))
+        let n = from_plain(Some(d), value).ok_or(std::fmt::Error)?;
+        write!(writer, "{}", d.format(n))
     }
 
     fn text_to_value(&self, param_id: ClapId, text: &CStr) -> Option<f64> {
         let d = self.shared.descriptor_by_id(param_id.get())?;
-        d.parse(text.to_str().ok()?).map(f64::from)
+        d.parse(text.to_str().ok()?).map(|n| to_plain(d, n))
     }
 
     fn flush(&self, input: &InputEvents, _output: &mut OutputEvents) {
@@ -630,11 +690,10 @@ impl PluginMainThreadParams for MainThread<'_> {
         for ev in input.iter() {
             if let Some(p) = ev.as_event::<clack_plugin::events::event_types::ParamValueEvent>()
                 && let Some(id) = p.param_id()
+                && let Some(v) = from_plain(s.descriptors().iter().find(|d| d.id.0 == id.get()), p.value())
+                && !self.shared.set_wrapper_param(id.get(), v)
             {
-                let v = p.value() as f32;
-                if !self.shared.set_wrapper_param(id.get(), v) {
-                    s.set_param(ParamId(id.get()), v);
-                }
+                s.set_param(ParamId(id.get()), v);
             }
         }
     }
@@ -655,11 +714,10 @@ impl PluginAudioProcessorParams for AudioProcessor<'_> {
         for ev in input.iter() {
             if let Some(p) = ev.as_event::<clack_plugin::events::event_types::ParamValueEvent>()
                 && let Some(id) = p.param_id()
+                && let Some(v) = from_plain_rt(&self.discrete, id.get(), p.value())
+                && (self.is_synth || !self.wrapper.apply_param(id.get(), v))
             {
-                let v = p.value() as f32;
-                if self.is_synth || !self.wrapper.apply_param(id.get(), v) {
-                    self.processor.set_param(ParamId(id.get()), v);
-                }
+                self.processor.set_param(ParamId(id.get()), v);
             }
         }
     }

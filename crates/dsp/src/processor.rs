@@ -120,6 +120,12 @@ pub trait Processor: Send + std::any::Any {
     }
     /// Current normalized value of a parameter (non-RT query).
     fn param(&self, id: rawdawg_types::ParamId) -> Option<f32>;
+    /// Display text the processor itself supplies for `normalized` (non-RT, main thread).
+    /// Hosted plugins answer with their own formatting; `None` means the caller formats
+    /// with the descriptor ([`display_value`]). Default: `None`.
+    fn param_text(&self, _id: rawdawg_types::ParamId, _normalized: f32) -> Option<String> {
+        None
+    }
     /// Set the base normalized value of a parameter (non-RT path; the RT path
     /// uses `EventKind::Param` events).
     fn set_param(&mut self, id: rawdawg_types::ParamId, normalized: f32) -> bool;
@@ -129,7 +135,49 @@ pub trait Processor: Send + std::any::Any {
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), String>;
 }
 
+/// Readout for a parameter value: the processor's own text when it supplies one (hosted
+/// plugins), otherwise the descriptor's formatting.
+pub fn display_value(p: &dyn Processor, d: &ParamDescriptor, normalized: f32) -> String {
+    p.param_text(d.id, normalized).unwrap_or_else(|| d.format(normalized))
+}
+
+/// Make text from untrusted code safe to show in one label: control characters become
+/// spaces, surrounding whitespace is trimmed, and at most `max_chars` characters are kept
+/// (an ellipsis marks the cut). Empty results are `None`.
+pub fn sanitize_display_text(text: &str, max_chars: usize) -> Option<String> {
+    let cleaned: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let t = cleaned.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().count() <= max_chars {
+        return Some(t.to_owned());
+    }
+    let mut cut: String = t.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    Some(cut)
+}
+
 /// Helper: find the descriptor for an id in a static slice.
 pub fn find_descriptor(descs: &'static [ParamDescriptor], id: rawdawg_types::ParamId) -> Option<&'static ParamDescriptor> {
     descs.iter().find(|d| d.id == id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_display_text;
+
+    #[test]
+    fn display_text_from_plugins_is_cleaned_and_bounded() {
+        assert_eq!(sanitize_display_text("  -6.0 dB ", 32).as_deref(), Some("-6.0 dB"));
+        assert_eq!(sanitize_display_text("a\nb\tc\u{7}", 32).as_deref(), Some("a b c"));
+        assert_eq!(sanitize_display_text(" \n\t", 32), None);
+        assert_eq!(sanitize_display_text("", 32), None);
+        let long = "x".repeat(100);
+        let cut = sanitize_display_text(&long, 10).unwrap();
+        assert_eq!(cut.chars().count(), 10);
+        assert!(cut.ends_with('…'));
+        // multi-byte characters are cut on character boundaries
+        assert_eq!(sanitize_display_text("ééééé", 3).as_deref(), Some("éé…"));
+    }
 }

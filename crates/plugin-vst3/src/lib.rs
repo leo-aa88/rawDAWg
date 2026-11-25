@@ -752,6 +752,9 @@ impl IEditControllerTrait for Controller {
         info.stepCount = match d.mapping {
             ParamMapping::Toggle => 1,
             ParamMapping::Discrete { steps } => steps.saturating_sub(1) as i32,
+            // stepped integer ranges (lookahead 1–10 ms): VST3 steps are evenly spaced in the
+            // normalized value, exactly like the linear mapping
+            ParamMapping::Linear { min, max } if d.flags.stepped && min.fract() == 0.0 && max.fract() == 0.0 && max > min => (max - min) as i32,
             _ => 0,
         };
         info.defaultNormalizedValue = f64::from(d.default_normalized);

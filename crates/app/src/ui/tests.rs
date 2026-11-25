@@ -51,6 +51,21 @@ impl Harness {
         out.textures_delta.clear();
     }
 
+    /// Every label and value drawn in one frame, read from egui's accessibility tree.
+    fn drawn_texts(&mut self) -> Vec<String> {
+        self.ctx.enable_accesskit();
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))), ..Default::default() };
+        let app = &mut self.app;
+        let parts = self.parts;
+        let mut out = self.ctx.run_ui(input, |ui| {
+            app.step(ui.ctx());
+            app.draw_parts(ui, parts);
+        });
+        out.textures_delta.clear();
+        let update = out.platform_output.accesskit_update.expect("accessibility tree");
+        update.nodes.iter().flat_map(|(_, n)| n.label().into_iter().chain(n.value())).map(str::to_owned).collect()
+    }
+
     fn rect(&self, id: egui::Id) -> egui::Rect {
         self.ctx.read_response(id).unwrap_or_else(|| panic!("no widget with id {id:?} was drawn")).rect
     }
@@ -857,4 +872,49 @@ fn open_accepts_preset_files_and_the_project_marker() {
     let h = Harness::new(Some(marker.to_str().unwrap()));
     assert_eq!(h.app.project.project_id, p.project_id, "{}", h.app.status_line);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hosted_effect_panel_shows_the_plugins_value_text_and_named_choices() {
+    let mut h = Harness::new(None);
+    let lib = hosted_catalog();
+    let module_path = lib.path.clone();
+    h.app.plugin_host.catalog.insert_library(lib);
+    let master = h.app.project.mixer.master_id;
+    let delay = h.app.plugin_host.catalog.find(rawdawg_plugin_host::Format::Clap, "rawdawg.fx.delay", None).map(|(_, p)| p.clone()).unwrap();
+    h.app.add_catalog_plugin(&delay, &module_path, master);
+    let ext = h.app.project.mixer_channel(master).unwrap().inserts[0].clone();
+    assert_eq!(h.app.effect_editor, Some(ext.id));
+    h.frame(vec![]);
+    let native = rawdawg_effects::make_effect("native.fx.delay", None).unwrap();
+    let mirror = h.app.other_mirrors.get(&ext.id).expect("hosted mirror");
+    let hosted: Vec<rawdawg_types::ParamDescriptor> = mirror.descriptors().to_vec();
+    let find = |key: &str| {
+        let nd = *native.descriptors().iter().find(|d| d.key == key).unwrap();
+        (nd, *hosted.iter().find(|d| d.id == nd.id).unwrap())
+    };
+    // hosted descriptors carry no labels; the step names come from the plugin itself
+    let (sync_native, sync) = find("sync");
+    assert!(sync.labels.is_none());
+    let names = super::effect_panel::step_labels(&**mirror, &sync).expect("the plugin names every step");
+    let expected: Vec<String> = sync_native.labels.unwrap().iter().map(|l| (*l).to_owned()).collect();
+    assert_eq!(names, expected);
+    // readouts in the drawn panel are the plugin's text, not a bare 0..1 number
+    let (time_native, time) = find("time");
+    let time_value = mirror.param(time.id).unwrap();
+    let time_text = rawdawg_dsp::processor::display_value(&**mirror, &time, time_value);
+    assert_eq!(time_text, time_native.format(time_value));
+    assert_ne!(time_text, time.format(time_value), "the descriptor alone would show {}", time.format(time_value));
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t.contains(&time_text)), "{time_text:?} not drawn in {texts:?}");
+    let sync_now = names[sync.to_physical(h.app.other_mirrors[&ext.id].param(sync.id).unwrap()) as usize].clone();
+    assert!(texts.iter().any(|t| t == &sync_now), "the choice list shows {sync_now:?}");
+    // choosing another step reaches the plugin and the list follows
+    let third = sync.to_normalized(3.0);
+    assert!(h.app.other_mirrors.get_mut(&ext.id).unwrap().set_param(sync.id, third));
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t == &names[3]), "{:?} not drawn after the change", names[3]);
+    // automation readouts use the same text
+    let target = rawdawg_project::AutomationTarget { instance_id: ext.id, param_id: time.id.0 };
+    assert_eq!(super::automation::value_text(&h.app, &target, Some(&time), 0.5), time_native.format(0.5));
 }

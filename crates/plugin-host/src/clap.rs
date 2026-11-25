@@ -15,6 +15,7 @@
 //! and processing errors are caught, zeroed and counted.
 
 use crate::catalog::PluginDescription;
+use crate::hosted::{MAX_PARAM_TEXT_CHARS, ParamTextCache};
 use crate::main_thread::MainThreadCell;
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::latency::PluginLatency;
@@ -25,7 +26,7 @@ use clack_host::events::event_types::{MidiEvent, NoteExpressionEvent, NoteExpres
 use clack_host::events::{EventFlags, EventHeader, Match};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
-use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail};
+use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail, sanitize_display_text};
 use rawdawg_types::events::{EventKind, NoteExpression, TimedEvent};
 use rawdawg_types::params::ParamCategory;
 use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping, ParamUnit};
@@ -133,7 +134,7 @@ fn descriptors_for(plugin_id: &str, handle: &PluginMainThreadHandle, params: Opt
             let (min, max) =
                 if info.min_value.is_finite() && info.max_value.is_finite() && info.max_value > info.min_value { (info.min_value, info.max_value) } else { (0.0, 1.0) };
             let default = (((info.default_value - min) / (max - min)) as f32).clamp(0.0, 1.0);
-            let mapping = if info.flags.contains(ParamInfoFlags::IS_STEPPED) && max - min <= 1.0 && min == 0.0 { ParamMapping::Toggle } else { ParamMapping::Linear { min, max } };
+            let mapping = stepped_mapping(info.flags.contains(ParamInfoFlags::IS_STEPPED), min, max);
             let mut d = ParamDescriptor::continuous(info.id.get(), key, name, ParamUnit::None, mapping, if default.is_finite() { default } else { 0.0 }, ParamCategory::Effects);
             d.flags.automatable = info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE);
             d.flags.modulatable = info.flags.contains(ParamInfoFlags::IS_MODULATABLE);
@@ -147,6 +148,22 @@ fn descriptors_for(plugin_id: &str, handle: &PluginMainThreadHandle, params: Opt
     let leaked: &'static [ParamDescriptor] = Box::leak(out.into_boxed_slice());
     cache.insert(plugin_id.to_owned(), leaked);
     leaked
+}
+
+/// Largest integer range shown as discrete steps; wider stepped ranges stay linear (rounded).
+pub const MAX_DISCRETE_STEPS: u32 = 1024;
+
+/// Mapping for a plugin parameter's plain range. CLAP stepped parameters take integer
+/// values: 0..1 is a switch, 0..N (N ≤ [`MAX_DISCRETE_STEPS`] − 1) a choice of N + 1 steps,
+/// anything else a linear range that is rounded when sent.
+fn stepped_mapping(stepped: bool, min: f64, max: f64) -> ParamMapping {
+    if stepped && min == 0.0 && max <= 1.0 {
+        ParamMapping::Toggle
+    } else if stepped && min == 0.0 && max.fract() == 0.0 && max < f64::from(MAX_DISCRETE_STEPS) {
+        ParamMapping::Discrete { steps: max as u32 + 1 }
+    } else {
+        ParamMapping::Linear { min, max }
+    }
 }
 
 /// Audio port layout as declared by the plugin (channel counts per port).
@@ -172,6 +189,8 @@ pub struct ClapInstance {
     layout: PortLayout,
     /// Cached normalized values (refreshed from the plugin on the main thread).
     values: Vec<f32>,
+    /// Readouts from the plugin's `value_to_text`.
+    texts: ParamTextCache,
     /// Activation currently out on the RT thread, if any.
     active: Option<(f64, usize)>,
     latency: u32,
@@ -229,6 +248,7 @@ impl ClapInstance {
             descriptors,
             layout,
             values,
+            texts: ParamTextCache::default(),
             active: None,
             latency,
             return_tx,
@@ -407,6 +427,7 @@ fn to_normalized(d: &ParamDescriptor, value: f64) -> f32 {
                 0.0
             }
         }
+        ParamMapping::Discrete { .. } => d.to_normalized(value.round()),
         _ => (value as f32).clamp(0.0, 1.0),
     }
 }
@@ -445,6 +466,19 @@ impl Processor for ClapInstance {
     }
     fn param(&self, id: ParamId) -> Option<f32> {
         self.descriptors.iter().position(|d| d.id == id).map(|i| self.values[i])
+    }
+    fn param_text(&self, id: ParamId, normalized: f32) -> Option<String> {
+        let d = self.descriptors.iter().find(|d| d.id == id)?;
+        let value = to_plugin_value(d, normalized.clamp(0.0, 1.0));
+        self.texts.get_or(id.0, normalized, || {
+            self.with_handle(|handle| {
+                let params = handle.get_extension::<PluginParams>()?;
+                let mut buf = [0u8; 256];
+                let text = params.value_to_text(handle, ClapId::new(id.0), value, &mut buf).ok()?;
+                sanitize_display_text(&String::from_utf8_lossy(text), MAX_PARAM_TEXT_CHARS)
+            })
+            .flatten()
+        })
     }
     fn set_param(&mut self, id: ParamId, normalized: f32) -> bool {
         let Some(i) = self.descriptors.iter().position(|d| d.id == id) else { return false };
@@ -491,6 +525,7 @@ impl Processor for ClapInstance {
         }
         let Some(b64) = obj.get(STATE_KEY).and_then(|s| s.as_str()) else { return Ok(()) };
         let raw = crate::b64::decode(b64)?;
+        self.texts.clear();
         self.load_plugin_state(&raw)
     }
 }

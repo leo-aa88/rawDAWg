@@ -145,6 +145,5 @@ The default patch's polyphony is 32 voices per instance, so 64 requested notes s
 
 - UI frame times, dense-playlist frame rate, waveform mouse-to-audible latency (need a display
   session: GUI-01).
-- 30-minute stress soak with resident-memory tracking (M8 slice 3).
 - 64- and 1024-frame buffers, rates above 48 kHz.
 - Windows numbers.

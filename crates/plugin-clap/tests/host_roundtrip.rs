@@ -228,7 +228,15 @@ fn exercise_every_effect(entry: &PluginEntry) {
             let pid = info.id;
             seen_bypass_flag |= info.flags.contains(clack_extensions::params::ParamInfoFlags::IS_BYPASS);
             let v = params.get_value(&handle, pid).unwrap_or_else(|| panic!("{id} value of {pid:?}"));
-            assert!((0.0..=1.0).contains(&v), "{id} {pid:?} = {v}");
+            assert!(info.min_value < info.max_value, "{id} {pid:?} range");
+            assert!((info.min_value..=info.max_value).contains(&v), "{id} {pid:?} = {v} outside {}..{}", info.min_value, info.max_value);
+            assert!((info.min_value..=info.max_value).contains(&info.default_value), "{id} {pid:?} default");
+            if info.flags.contains(clack_extensions::params::ParamInfoFlags::IS_STEPPED) {
+                // CLAP stepped parameters take whole numbers only
+                assert!(v.fract() == 0.0 && info.min_value.fract() == 0.0 && info.max_value.fract() == 0.0, "{id} {pid:?} = {v} is stepped");
+            } else {
+                assert_eq!((info.min_value, info.max_value), (0.0, 1.0), "{id} {pid:?} continuous parameters are normalized");
+            }
             let mut tbuf = [0u8; 96];
             let text = params.value_to_text(&handle, pid, v, &mut tbuf).unwrap_or_else(|_| panic!("{id} text of {pid:?}"));
             assert!(!text.is_empty(), "{id} {pid:?}");

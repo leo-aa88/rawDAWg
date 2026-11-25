@@ -13,8 +13,9 @@
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use crate::catalog::{Format, PluginDescription, ScannedLibrary};
+use crate::hosted::{MAX_PARAM_TEXT_CHARS, ParamTextCache};
 use crate::main_thread::MainThreadCell;
-use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail};
+use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail, sanitize_display_text};
 use rawdawg_types::events::{EventKind, TimedEvent};
 use rawdawg_types::params::ParamCategory;
 use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping, ParamUnit};
@@ -681,18 +682,22 @@ pub unsafe fn describe_vst3_module(path: &Path) -> Result<ScannedLibrary, String
 // ---------------------------------------------------------------------------------------------
 // main-thread instance
 
-fn descriptor_cache() -> &'static Mutex<HashMap<String, &'static [ParamDescriptor]>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, &'static [ParamDescriptor]>>> = OnceLock::new();
+/// Descriptors and, per descriptor, the plugin's unit label (`ParameterInfo::units`).
+type DescriptorTable = (&'static [ParamDescriptor], &'static [&'static str]);
+
+fn descriptor_cache() -> &'static Mutex<HashMap<String, DescriptorTable>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, DescriptorTable>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn descriptors_for(cid_hex: &str, controller: &ComPtr<IEditController>) -> &'static [ParamDescriptor] {
+fn descriptors_for(cid_hex: &str, controller: &ComPtr<IEditController>) -> DescriptorTable {
     let mut cache = descriptor_cache().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(d) = cache.get(cid_hex) {
-        return d;
+        return *d;
     }
     let count = unsafe { controller.getParameterCount() }.max(0) as usize;
     let mut out = Vec::new();
+    let mut units = Vec::new();
     for i in 0..count.min(MAX_PARAMS) {
         let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { controller.getParameterInfo(i as i32, &mut info) } != kResultOk {
@@ -715,10 +720,25 @@ fn descriptors_for(cid_hex: &str, controller: &ComPtr<IEditController>) -> &'sta
         d.flags.read_only = f & ParameterInfo_::ParameterFlags_::kIsReadOnly != 0;
         d.flags.is_bypass = f & ParameterInfo_::ParameterFlags_::kIsBypass != 0;
         out.push(d);
+        units.push(crate::clap::leak_str(&sanitize_display_text(&wstr_field(&info.units), 16).unwrap_or_default()));
     }
-    let leaked: &'static [ParamDescriptor] = Box::leak(out.into_boxed_slice());
-    cache.insert(cid_hex.to_owned(), leaked);
-    leaked
+    let table: DescriptorTable = (Box::leak(out.into_boxed_slice()), Box::leak(units.into_boxed_slice()));
+    cache.insert(cid_hex.to_owned(), table);
+    table
+}
+
+/// A VST3 readout: the controller's string for the value, followed by the parameter's unit
+/// label when the string is a bare number. VST3 keeps the two apart and plugins differ in
+/// whether the string repeats the unit; a word such as "Off" or a value that already ends
+/// with its unit is shown as it is.
+pub(crate) fn vst3_readout(text: &str, units: &str) -> Option<String> {
+    let text = text.trim_end();
+    let bare_number = text.chars().last().is_some_and(|c| c.is_ascii_digit());
+    if units.is_empty() || !bare_number || text.ends_with(units) {
+        sanitize_display_text(text, MAX_PARAM_TEXT_CHARS)
+    } else {
+        sanitize_display_text(&format!("{text} {units}"), MAX_PARAM_TEXT_CHARS)
+    }
 }
 
 /// Bus layout negotiated with the plugin.
@@ -739,8 +759,12 @@ pub struct Vst3Instance {
     plugin_id: String,
     type_id: &'static str,
     descriptors: &'static [ParamDescriptor],
+    /// Unit label per descriptor.
+    units: &'static [&'static str],
     layout: Vst3Layout,
     values: Vec<f32>,
+    /// Readouts from the controller's `getParamStringByValue`.
+    texts: ParamTextCache,
     active: Option<(f64, usize)>,
     latency: u32,
     /// Parameter sets made while no RT half exists (applied as queue points on activation).
@@ -825,7 +849,7 @@ impl Vst3Instance {
                 unsafe { controller.setComponentState(p.as_ptr()) };
             }
         }
-        let descriptors = descriptors_for(&info.plugin_id, &controller);
+        let (descriptors, units) = descriptors_for(&info.plugin_id, &controller);
         let values: Vec<f32> = descriptors.iter().map(|d| (unsafe { controller.getParamNormalized(d.id.0) } as f32).clamp(0.0, 1.0)).collect();
         let mut layout = Vst3Layout::default();
         let audio = MediaTypes_::kAudio as MediaType;
@@ -846,8 +870,10 @@ impl Vst3Instance {
             type_id: crate::clap::leak_str(&format!("vst3:{}", info.plugin_id)),
             plugin_id: info.plugin_id.clone(),
             descriptors,
+            units,
             layout,
             values,
+            texts: ParamTextCache::default(),
             active: None,
             latency,
             pending: Vec::new(),
@@ -1078,6 +1104,19 @@ impl Processor for Vst3Instance {
     fn param(&self, id: ParamId) -> Option<f32> {
         self.descriptors.iter().position(|d| d.id == id).map(|i| self.values[i])
     }
+    fn param_text(&self, id: ParamId, normalized: f32) -> Option<String> {
+        let i = self.descriptors.iter().position(|d| d.id == id)?;
+        let units = self.units.get(i).copied().unwrap_or("");
+        self.texts.get_or(id.0, normalized, || {
+            let m = self.cell.get()?;
+            let mut text: String128 = [0; 128];
+            // SAFETY: main thread (MainThreadCell), live controller, `text` is a valid String128.
+            if unsafe { m.controller.getParamStringByValue(id.0, f64::from(normalized.clamp(0.0, 1.0)), &mut text) } != kResultOk {
+                return None;
+            }
+            vst3_readout(&wstr_field(&text), units)
+        })
+    }
     fn set_param(&mut self, id: ParamId, normalized: f32) -> bool {
         let Some(i) = self.descriptors.iter().position(|d| d.id == id) else { return false };
         let v = normalized.clamp(0.0, 1.0);
@@ -1111,6 +1150,7 @@ impl Processor for Vst3Instance {
         let Some(c) = obj.get(COMPONENT_STATE_KEY).and_then(|s| s.as_str()) else { return Ok(()) };
         let component = crate::b64::decode(c)?;
         let controller = obj.get(CONTROLLER_STATE_KEY).and_then(|s| s.as_str()).map(crate::b64::decode).transpose()?;
+        self.texts.clear();
         self.load_plugin_state(&component, controller.as_deref())?;
         if let Some(pending) = obj.get("pending").and_then(|p| p.as_object()) {
             for (id, v) in pending {
@@ -1457,5 +1497,21 @@ impl Drop for Vst3Processor {
         if let Some(p) = self.processor.take() {
             let _ = self.return_tx.send(Returned(p));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vst3_readout;
+
+    #[test]
+    fn unit_labels_follow_bare_numbers_only() {
+        assert_eq!(vst3_readout("-6.0", "dB").as_deref(), Some("-6.0 dB"));
+        assert_eq!(vst3_readout("-6.0 dB", "dB").as_deref(), Some("-6.0 dB"));
+        assert_eq!(vst3_readout("1.20 kHz", "Hz").as_deref(), Some("1.20 kHz"));
+        assert_eq!(vst3_readout("Off", "Hz").as_deref(), Some("Off"));
+        assert_eq!(vst3_readout("4.00:1", ":1").as_deref(), Some("4.00:1"));
+        assert_eq!(vst3_readout("0.500", "").as_deref(), Some("0.500"));
+        assert_eq!(vst3_readout("  ", "dB"), None);
     }
 }

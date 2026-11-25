@@ -34,7 +34,8 @@ Every input that ever failed is kept in `fixtures/fuzz-regressions/<target>/` an
 
 ### Findings and fixes
 
-Two campaigns, both on debug builds: seed 1 with 2,000 inputs per target, then seed 7 with 30,000.
+Findings 1–5 came from two campaigns, both on debug builds: seed 1 with 2,000 inputs per target,
+then seed 7 with 30,000. Finding 6 came from the first run of the later `expr-grammar` target.
 
 | # | Target | What failed | Cause | Fix |
 |---|---|---|---|---|
@@ -43,7 +44,6 @@ Two campaigns, both on debug builds: seed 1 with 2,000 inputs per target, then s
 | 3 | project | Overflow panic in `Note::end_tick` during validation | Validation added tick + duration before checking either was in range | Every tick-valued field (tempo, meter, patterns, notes, controllers, automation, clips, loop) is checked against `MAX_TICK` = 2⁴⁰; audio clip frame fields against `MAX_CLIP_FRAMES` = 2³⁷; end positions saturate |
 | 4 | smf | Overflow panic inside `midly` 0.5.3 | A header claiming SMPTE timing with frame-rate byte `0x80` makes the library negate `i8::MIN` | SMPTE timing is unsupported anyway, so the header bit is checked before the library runs; any other parser panic becomes an import error |
 | 5 | audio | Overflow panic inside `symphonia-format-riff` 0.6.1 | An implausible channel count in a WAV header makes the library shift by 32 or more | All decoder entry points (whole-file, in-memory, streaming open/seek/decode) contain panics and return "the audio decoder failed on malformed data" |
-
 | 6 | expr-grammar | Panic in the expression evaluator for `clamp` with a NaN bound (for example `clamp(0.5, x, x)` when an input is NaN) | `f32::clamp` panics on NaN bounds; the evaluator only reordered reversed bounds. **The evaluator runs on the audio thread** inside the synth's modular graph | A NaN bound leaves that side open; unit test in `expr.rs`. An audit of every other `clamp` with computed bounds in the real-time crates found no other hazard (bounds constant, ordered, or guarded) |
 
 Findings 4 and 5 are bugs in third-party crates. In release builds they wrap silently rather than
