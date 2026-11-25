@@ -16,6 +16,7 @@ pub mod filter;
 pub mod limiter;
 pub mod math;
 pub mod oscillator;
+pub mod pitch;
 pub mod processor;
 pub mod rng;
 pub mod smooth;

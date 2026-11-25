@@ -11,6 +11,7 @@ use crate::common::{Params, Preset};
 use rawdawg_dsp::biquad::{Biquad, BiquadKind, Coeffs};
 use rawdawg_dsp::delayline::DelayLine;
 use rawdawg_dsp::math::fast_tanh;
+use rawdawg_dsp::pitch::TapShifter;
 use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail};
 use rawdawg_types::events::EventKind;
 use rawdawg_types::params::{ParamCategory, ParamMapping, ParamUnit};
@@ -172,32 +173,6 @@ impl Allpass {
     }
 }
 
-/// Granular two-tap pitch shifter (feedback-loop shimmer).
-struct PitchShifter {
-    line: DelayLine,
-    phase: f32,
-    window: f32,
-    ratio: f32,
-}
-
-impl PitchShifter {
-    fn new(cap: usize, window: f32) -> Self {
-        Self { line: DelayLine::new(cap), phase: 0.0, window, ratio: 2.0 }
-    }
-    #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        self.line.push(x);
-        let inc = (1.0 - self.ratio) / self.window; // phase moves backwards for upward shifts
-        self.phase = (self.phase + inc).rem_euclid(1.0);
-        let p2 = (self.phase + 0.5).rem_euclid(1.0);
-        let d1 = self.phase * self.window;
-        let d2 = p2 * self.window;
-        let w1 = (std::f32::consts::PI * self.phase).sin();
-        let w2 = (std::f32::consts::PI * p2).sin();
-        self.line.read_frac(d1) * w1 + self.line.read_frac(d2) * w2
-    }
-}
-
 pub struct Reverb {
     params: Params,
     sr: f32,
@@ -210,7 +185,7 @@ pub struct Reverb {
     spring_ap: [Biquad; 4],
     spring_loop: DelayLine,
     spring_z: f32,
-    shifter: PitchShifter,
+    shifter: TapShifter,
     mode_cached: usize,
     /// Scratch for the FDN mixing (fixed size).
     v: [f32; CHANNELS],
@@ -240,7 +215,7 @@ impl Reverb {
             spring_ap: [Biquad::new(); 4],
             spring_loop: DelayLine::new(ms(120.0)),
             spring_z: 0.0,
-            shifter: PitchShifter::new(ms(120.0), 0.08 * sr),
+            shifter: TapShifter::new(ms(120.0), 0.08 * sr),
             mode_cached: usize::MAX,
             v: [0.0; CHANNELS],
         }
@@ -472,7 +447,7 @@ impl Processor for Reverb {
         }
         self.spring_loop.reset();
         self.spring_z = 0.0;
-        self.shifter.line.reset();
+        self.shifter.reset();
         self.mod_phase = 0.0;
         self.params.snap_all();
         let mode = self.mode();
