@@ -5,7 +5,9 @@ mod evolve;
 mod graph_editor;
 mod instrument_panel;
 mod keyboard;
+mod piano_roll;
 mod presets;
+mod sequencer;
 mod settings;
 mod synth_panel;
 mod waveform;
@@ -13,7 +15,7 @@ mod waveform;
 use crate::audio::AudioSystem;
 use crate::prefs::Preferences;
 use crate::theme;
-use rawdawg_audio_engine::commands::EngineCommand;
+use rawdawg_audio_engine::commands::{EngineCommand, TransportMode};
 use rawdawg_audio_engine::plan::compile;
 use rawdawg_audio_io::stream::StreamConfigRequest;
 use rawdawg_audio_io::{DeviceSnapshot, enumerate};
@@ -55,6 +57,7 @@ pub(crate) enum AudioState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EditorView {
     Rack,
+    PianoRoll,
     Synth,
 }
 
@@ -62,6 +65,10 @@ pub(crate) struct App {
     pub project: Project,
     pub history: History,
     pub project_path: Option<PathBuf>,
+    pub piano_roll: piano_roll::PianoRollState,
+    pub sequencer: sequencer::StepState,
+    pub transport_mode: TransportMode,
+    pub loop_enabled: bool,
     pub devices: DeviceSnapshot,
     pub audio: AudioState,
     pub limits: EngineLimits,
@@ -181,11 +188,17 @@ impl App {
             started: std::time::Instant::now(),
             screenshot_requested: false,
             prefs,
+            piano_roll: Default::default(),
+            sequencer: Default::default(),
+            transport_mode: TransportMode::Pattern,
+            loop_enabled: true,
         };
         app.rebuild_mirrors();
         app.recompile();
         match opts.ui_preset.as_deref() {
             Some("advanced") => app.synth_panel.advanced = true,
+            Some("rack") => app.editor_view = EditorView::Rack,
+            Some("piano-roll") => app.editor_view = EditorView::PianoRoll,
             Some("graph") => {
                 app.synth_panel.advanced = true;
                 app.synth_panel.graph.scope = rawdawg_synthesizer::graph::Scope::Voice;
@@ -452,7 +465,7 @@ impl App {
         if text_focused {
             return;
         }
-        let (undo, redo, space, f6, f7, f9, esc) = ctx.input_mut(|i| {
+        let (undo, redo, space, f6, f7, f8, f9, esc) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z)),
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z))
@@ -460,8 +473,10 @@ impl App {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F6),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F7),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::F8),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F9),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                // Escape cancels a piano-roll gesture first; otherwise it is the panic key
+                if self.piano_roll.gesture_active() { false } else { i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) },
             )
         });
         if redo {
@@ -476,7 +491,10 @@ impl App {
         if f6 {
             self.editor_view = EditorView::Rack;
         }
-        if f7 || f9 {
+        if f7 {
+            self.editor_view = EditorView::PianoRoll;
+        }
+        if f8 || f9 {
             self.editor_view = EditorView::Synth;
         }
         if esc {
@@ -502,6 +520,14 @@ impl App {
         match &self.audio {
             AudioState::Running(s) => s.handle.status.playing.load(std::sync::atomic::Ordering::Relaxed),
             _ => false,
+        }
+    }
+
+    /// Engine playhead in project ticks (None without a running engine).
+    pub(crate) fn playhead_tick(&self) -> Option<i64> {
+        match &self.audio {
+            AudioState::Running(s) => Some(s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed)),
+            _ => None,
         }
     }
 
@@ -594,8 +620,6 @@ impl App {
                 self.redo();
             }
             ui.separator();
-            ui.selectable_value(&mut self.editor_view, EditorView::Rack, "Rack").on_hover_text("F6");
-            ui.selectable_value(&mut self.editor_view, EditorView::Synth, "Synth").on_hover_text("F7");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
@@ -629,6 +653,28 @@ impl App {
                     ui.label(egui::RichText::new("Safe mode").color(theme::WARNING));
                 }
             });
+        });
+        ui.horizontal(|ui| {
+            let mut song = self.transport_mode == TransportMode::Song;
+            let mode_label = if song { "Song" } else { "Pattern" };
+            if ui.toggle_value(&mut song, mode_label).on_hover_text("Pattern mode loops the selected pattern; Song mode plays the playlist").changed() {
+                self.transport_mode = if song { TransportMode::Song } else { TransportMode::Pattern };
+                self.send(EngineCommand::SetMode(self.transport_mode));
+            }
+            let mut lp = self.loop_enabled;
+            if ui.toggle_value(&mut lp, "Loop").on_hover_text("Repeat the pattern (or the loop range / song)").changed() {
+                self.loop_enabled = lp;
+                self.send(EngineCommand::SetLoopEnabled(lp));
+            }
+            let mut cmds = Vec::new();
+            sequencer::pattern_selector(self, ui, &mut cmds);
+            for c in cmds {
+                self.apply(c);
+            }
+            ui.separator();
+            ui.selectable_value(&mut self.editor_view, EditorView::Rack, "Rack").on_hover_text("F6");
+            ui.selectable_value(&mut self.editor_view, EditorView::PianoRoll, "Piano roll").on_hover_text("F7");
+            ui.selectable_value(&mut self.editor_view, EditorView::Synth, "Synth").on_hover_text("F8");
         });
     }
 
@@ -705,7 +751,7 @@ impl App {
         for ch in &channels {
             ui.horizontal(|ui| {
                 let selected = self.selected_channel == Some(ch.id);
-                if ui.selectable_label(selected, "●").on_hover_text("Route typing/MIDI/on-screen keys here").clicked() {
+                if ui.selectable_label(selected, "IN").on_hover_text("Route typing/MIDI/on-screen keys here").clicked() {
                     select = Some(ch.id);
                 }
                 let mut mute = ch.mute;
@@ -773,6 +819,8 @@ impl App {
                     other => other,
                 };
                 ui.label(egui::RichText::new(kind).color(theme::TEXT_SECONDARY));
+                ui.separator();
+                sequencer::step_row(self, ui, ch.id, &mut cmds);
             });
         }
         if let Some(id) = select {
@@ -782,7 +830,10 @@ impl App {
             self.apply(cmd);
         }
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("Step sequencer, piano roll and playlist arrive in M3. Keys play the selected (●) channel.").color(theme::TEXT_SECONDARY));
+        ui.label(
+            egui::RichText::new("Keys play the channel marked IN. Steps toggle notes of the selected pattern; the piano roll (F7) edits the same notes.")
+                .color(theme::TEXT_SECONDARY),
+        );
     }
 
     /// Gain/pan previews during a drag: recompile is cheap enough at M1 scale and keeps
@@ -1005,6 +1056,7 @@ impl eframe::App for App {
         egui::Panel::bottom("editor").resizable(true).default_size(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.editor_view {
                 EditorView::Rack => self.rack(ui),
+                EditorView::PianoRoll => piano_roll::show(self, ui),
                 EditorView::Synth => {
                     let is_synth =
                         self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);
@@ -1022,8 +1074,10 @@ impl eframe::App for App {
             ui.heading("Playlist");
             ui.separator();
             ui.label(
-                egui::RichText::new("Arrangement arrives in M3. Play loops the selected pattern; hold typing keys or a MIDI keyboard to hear the synth.")
-                    .color(theme::TEXT_SECONDARY),
+                egui::RichText::new(
+                    "Arrangement (clips on tracks) arrives in the next M3 slice. Pattern mode loops the selected pattern; edit it in the Rack or the Piano roll (F6/F7).",
+                )
+                .color(theme::TEXT_SECONDARY),
             );
         });
         if self.show_settings {

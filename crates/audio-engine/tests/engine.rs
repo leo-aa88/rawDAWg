@@ -400,3 +400,46 @@ fn sampler_channel_renders_imported_asset_from_project_folder() {
     assert_eq!(peak(&l2), 0.0);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn editing_notes_while_playing_keeps_note_offs_and_picks_up_new_notes() {
+    use std::collections::HashMap;
+    // one long note sounding; the edit removes it and adds a later note
+    let p = project_with_notes(&[(0, 1920, 60)]);
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let first = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
+    let live = first.fingerprints.clone();
+    engine.install_plan(first.plan);
+    handle.send(EngineCommand::Play).unwrap();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    for _ in 0..20 {
+        engine.render_block(&mut l, &mut r);
+    }
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1);
+    // edit: the sounding note is deleted, a new note starts at beat 3 (tick 1920 = frame 48000)
+    let mut p2 = p.clone();
+    p2.patterns[0].lanes[0].notes.clear();
+    p2.patterns[0].lanes[0].notes.push(Note { id: NoteId::new(), tick: Tick(1920), duration_ticks: Tick(480), pitch: 72, velocity: 0.9, channel: 0 });
+    let second = compile(&p2, 2, 256, &limits, &live, &rawdawg_audio_engine::NoAssets).unwrap();
+    assert!(second.plan.channels[0].carry_over, "instrument untouched: voices carry over");
+    assert!(handle.publish_plan(second.plan).is_ok());
+    // render up to frame 48000 (block 187): the deleted note's note-off at frame 48000 must still arrive
+    let mut out = Vec::new();
+    while engine.position_frame() < 48_000 + 6_000 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    // the deleted note was released at its original end (its release tail is fading) and the new note (C5) dominates
+    let f = dominant_frequency(&out[out.len() - 4_000..], 48_000.0);
+    assert!((f - 523.25).abs() < 2.0, "new note plays after the edit: {f} Hz");
+    // once the release tail is over only the new voice remains: no hanging note from the removed one
+    while engine.position_frame() < 48_000 + 11_000 {
+        engine.render_block(&mut l, &mut r);
+    }
+    assert_eq!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed), 1, "old voice released (no hanging note), new voice active");
+    assert_eq!(engine.status().dropped_events.get(), 0);
+}

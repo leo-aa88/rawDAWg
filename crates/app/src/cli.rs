@@ -84,7 +84,8 @@ pub struct Args {
     pub screenshot_delay_ms: u64,
 
     /// Start with a UI state preset (verification aid): `advanced` opens the synth's
-    /// advanced sections, `graph` additionally focuses the modular graph editor.
+    /// advanced sections, `graph` additionally focuses the modular graph editor,
+    /// `rack` and `piano-roll` open those editors.
     #[arg(long, value_name = "NAME")]
     pub ui_preset: Option<String>,
 }

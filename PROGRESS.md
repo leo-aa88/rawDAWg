@@ -58,6 +58,19 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Waveform canvas gains a **Frames** strip for wavetable layers: select the frame being sculpted, `+` duplicates the current frame after itself (≤16), `−` removes, `<`/`>` reorder; structure changes are one undo entry each (patch commit, voices carry over). Other frames are drawn faintly behind the edited one; strokes and table handoff target the selected frame (`TableSender::send(layer, frame, …)`). The **Position** slider scrubs the live wavetable position as a parameter gesture and shows the frame being played. Screenshot `docs/verification/screenshots/m2-motion-frames.png` (captured through X11/XWayland: the WSLg Wayland socket stopped answering winit's registry roundtrip during this session, an environment fault documented under known issues).
 - `fixtures/demo-graph.rawdawg` layer 1 now carries four frames (sine/soft saw/square/triangle) at position 0.35.
 
+## M3 additions (2026-11-25)
+
+### Slice 1 — step sequencer and piano roll (CORE-02, CORE-03 subset)
+
+223 automated tests pass, clippy clean.
+
+- `crates/app/src/ui/sequencer.rs`: pattern selector (choose, new, rename, length 1/2/4/8 bars, step size 1/4…1/32, delete) shared by the toolbar, rack and piano roll; step rows per channel (groups of four, click toggles, drag paints, right-click velocity/pitch, playing-step highlight, off-grid markers + count; notes never moved by the step view).
+- `crates/app/src/ui/piano_roll.rs`: keyboard ruler (click auditions), bar/beat ruler, grid with snap lines (Off/Bar/Beat/1/2…1/32 + 1/8T, 1/16T; Alt bypasses), notes with velocity shade and selection outline, draw (click + drag sets length; last length reused), move with grid snap, right-edge resize, right-click delete, right-drag erase, Shift add to selection, box selection (Select tool or Ctrl+drag), Delete, Ctrl+A/C/X/V (paste relative to the playhead), Ctrl+D duplicate by grid-rounded selection length, arrow nudges (grid / semitone / Shift octave), Escape cancels the gesture (before it is the panic key), wheel scroll / Shift horizontal / Ctrl zoom around the pointer (Shift+Ctrl zooms rows), velocity lane draw/ramp, scale highlight + explicit scale snap (8 modes, 12 roots), chord insertion (11 chords) at the pointer, Quantize dialog with strength and audible preview through a history gesture (raw notes untouched until Apply), pattern end shading, playhead. Move/resize/velocity/quantize previews are history gestures (one undo entry each); inserts/deletes are commands. Audition on insert/move/ruler, released on mouse-up or focus loss.
+- Toolbar second row: Pattern/Song mode, Loop toggle, pattern selector, Rack/Piano roll/Synth (F6/F7/F8). `--ui-preset rack|piano-roll`.
+- Engine: `editing_notes_while_playing_keeps_note_offs_and_picks_up_new_notes` (schedule swap mid-note: the removed note's note-off still fires, the added note plays, no hanging note).
+- Unit tests for snapping/quantize/scale/chord helpers. Screenshots `m3-rack.png`, `m3-piano-roll.png`.
+- Not yet: playlist/arrangement UI (song mode is engine-ready), recording, MIDI learn, count-in, tempo/meter editing, expression lanes (next slices).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -112,6 +125,6 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M3 (sequencing and recording), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
-1. M3: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
+M3 continues (slice 1 done: rack steps + piano roll), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+1. M3 remainder: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
 Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).
