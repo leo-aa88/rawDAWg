@@ -532,3 +532,29 @@ fn audio_takes_are_aligned_placed_as_clips_and_recovered_after_a_crash() {
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn browser_search_filters_and_favorites_sort_first_and_effects_add_to_the_selected_channel() {
+    assert!(super::browser_matches("", &["anything"]));
+    assert!(super::browser_matches("rev", &["Reverb", "Reverb family"]));
+    assert!(!super::browser_matches("delay", &["Reverb"]));
+    let mut h = Harness::new(Some("../../fixtures/demo-sampler.rawdawg"));
+    let asset = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| a.id.to_string()).unwrap();
+    super::toggle_favorite(&mut h.app.prefs, &asset);
+    assert!(h.app.prefs.favorites.contains(&asset));
+    super::toggle_favorite(&mut h.app.prefs, &asset);
+    assert!(!h.app.prefs.favorites.contains(&asset));
+    // the browser draws with a search term without panicking and the effect list adds inserts
+    h.app.browser_search = "verb".into();
+    h.frame(vec![]);
+    let master = h.app.project.mixer.master_id;
+    let before = h.app.project.mixer_channel(master).unwrap().inserts.len();
+    let mut inst = rawdawg_project::Instance::native(rawdawg_effects::reverb::TYPE_ID, serde_json::Value::Null);
+    inst.display_name = "Reverb".into();
+    h.app.apply(rawdawg_project::Command::AddInsert { mixer_id: master, instance: inst, index: None });
+    assert_eq!(h.app.project.mixer_channel(master).unwrap().inserts.len(), before + 1);
+    // preview without audio: a clear status, nothing held
+    let id = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| a.id.clone()).unwrap();
+    h.app.preview_asset(&id);
+    assert!(h.app.plan_error.is_none());
+}

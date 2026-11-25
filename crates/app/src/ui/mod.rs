@@ -152,6 +152,11 @@ pub(crate) struct App {
     pub selected_channel: Option<ChannelId>,
     pub show_settings: bool,
     pub(crate) export: export::ExportState,
+    /// Browser search text (filters samples and effects).
+    pub browser_search: String,
+    /// Assets handed to the engine for preview: held here until the preview ended so the
+    /// audio thread never drops the last reference.
+    preview_held: Vec<std::sync::Arc<rawdawg_sampler::SampleAsset>>,
     pub editor_view: EditorView,
     /// Main-thread mirrors of native synth state per instance (param edits, commits).
     pub synth_mirrors: HashMap<rawdawg_types::InstanceId, Synth>,
@@ -250,6 +255,8 @@ impl App {
             selected_channel,
             show_settings: false,
             export: export::ExportState::default(),
+            browser_search: String::new(),
+            preview_held: Vec::new(),
             editor_view: EditorView::Synth,
             synth_mirrors: HashMap::new(),
             live_fingerprints: HashMap::new(),
@@ -985,8 +992,23 @@ impl App {
         });
     }
 
+    /// Audition a project sample through the master at −12 dB (browser preview).
+    pub(crate) fn preview_asset(&mut self, id: &rawdawg_types::AssetId) {
+        use rawdawg_audio_engine::AssetResolver;
+        let Some(asset) = self.assets.sample(id) else {
+            self.status_line = "That sample cannot be read".into();
+            return;
+        };
+        self.preview_held.push(asset.clone());
+        if self.preview_held.len() > 8 {
+            self.preview_held.remove(0);
+        }
+        self.send(EngineCommand::PreviewSample { asset, gain: rawdawg_dsp::math::db_to_lin(-12.0) });
+    }
+
     fn browser(&mut self, ui: &mut egui::Ui) {
         ui.heading("Browser");
+        ui.add(egui::TextEdit::singleline(&mut self.browser_search).hint_text("search samples and effects…").desired_width(f32::INFINITY));
         ui.separator();
         egui::CollapsingHeader::new("Instruments").default_open(true).show(ui, |ui| {
             ui.label("rawDAWg Synth").on_hover_text("native.synth — the flagship instrument");
@@ -1003,8 +1025,31 @@ impl App {
                 }
             }
         });
+        let needle = self.browser_search.trim().to_lowercase();
         egui::CollapsingHeader::new("Effects").show(ui, |ui| {
-            ui.label(egui::RichText::new("Native effects arrive in M4").color(theme::TEXT_SECONDARY));
+            ui.label(egui::RichText::new("Click to add to the selected mixer channel (or the master)").color(theme::TEXT_SECONDARY).small());
+            let target = self.mixer.selected.unwrap_or(self.project.mixer.master_id);
+            let mut rows: Vec<(bool, &rawdawg_effects::EffectInfo)> =
+                rawdawg_effects::CATALOG.iter().filter(|f| f.listed).map(|f| (self.prefs.favorites.iter().any(|x| x == f.type_id), f)).collect();
+            rows.sort_by_key(|(fav, _)| !*fav);
+            for (fav, fx) in rows {
+                if !browser_matches(&needle, &[fx.name, fx.family]) {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button(if fav { "fav" } else { "+fav" }).on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites (listed first)" }).clicked() {
+                        toggle_favorite(&mut self.prefs, fx.type_id);
+                    }
+                    if ui.button(fx.name).on_hover_text(fx.description).clicked() {
+                        let mut inst = rawdawg_project::Instance::native(fx.type_id, serde_json::Value::Null);
+                        inst.display_name = fx.name.to_owned();
+                        let iid = inst.id;
+                        self.apply(Command::AddInsert { mixer_id: target, instance: inst, index: None });
+                        self.effect_editor = Some(iid);
+                        self.editor_view = EditorView::Effect;
+                    }
+                });
+            }
         });
         egui::CollapsingHeader::new("Samples & SoundFonts").default_open(true).show(ui, |ui| {
             // project audio assets: click to arm for the playlist, "+ channel" for a sampler
@@ -1017,8 +1062,36 @@ impl App {
                         .small(),
                 );
             }
-            for (id, name) in audio {
+            let previewing = match &self.audio {
+                AudioState::Running(s) => s.handle.status.preview_active.load(std::sync::atomic::Ordering::Relaxed),
+                _ => false,
+            };
+            if !previewing {
+                self.preview_held.clear();
+            }
+            let mut rows: Vec<(bool, rawdawg_types::AssetId, String)> =
+                audio.into_iter().map(|(id, name)| (self.prefs.favorites.iter().any(|x| x == &id.to_string()), id, name)).collect();
+            rows.sort_by_key(|(fav, _, _)| !*fav);
+            for (fav, id, name) in rows {
+                if !browser_matches(&needle, &[&name]) {
+                    continue;
+                }
                 ui.horizontal(|ui| {
+                    if ui.small_button(if fav { "fav" } else { "+fav" }).on_hover_text(if fav { "Remove from favorites" } else { "Add to favorites (listed first)" }).clicked() {
+                        toggle_favorite(&mut self.prefs, &id.to_string());
+                    }
+                    let can_play = matches!(self.audio, AudioState::Running(_));
+                    if previewing {
+                        if ui.small_button("stop").on_hover_text("Stop the preview").clicked() {
+                            self.send(EngineCommand::StopPreview);
+                        }
+                    } else if ui
+                        .add_enabled(can_play, egui::Button::new("play").small())
+                        .on_hover_text("Preview at a safe level (−12 dB) through the master; needs audio on")
+                        .clicked()
+                    {
+                        self.preview_asset(&id);
+                    }
                     let armed = self.playlist.place_asset.as_ref() == Some(&id);
                     if ui.selectable_label(armed, &name).on_hover_text("Arm for placement in the playlist").clicked() {
                         self.playlist.place_asset = if armed { None } else { Some(id.clone()) };
@@ -1506,4 +1579,18 @@ impl Drop for App {
             let _ = self.prefs.save();
         }
     }
+}
+
+/// Case-insensitive search over the given fields (empty needle matches everything).
+pub(crate) fn browser_matches(needle: &str, fields: &[&str]) -> bool {
+    needle.is_empty() || fields.iter().any(|f| f.to_lowercase().contains(needle))
+}
+
+pub(crate) fn toggle_favorite(prefs: &mut crate::prefs::Preferences, key: &str) {
+    if let Some(i) = prefs.favorites.iter().position(|x| x == key) {
+        prefs.favorites.remove(i);
+    } else {
+        prefs.favorites.push(key.to_owned());
+    }
+    let _ = prefs.save();
 }

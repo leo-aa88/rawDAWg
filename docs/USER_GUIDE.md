@@ -54,6 +54,8 @@ Tick **Advanced** in the synth panel and open **Modular graph**. The **voice gra
 
 **Automation**: right-click any parameter → "Create automation clip". Curves live on an Automation track and play in Song mode; the Automation view edits points (click adds, drag moves, right-click deletes; per point Linear or Step) in the parameter's own units. Modes: Read plays, Touch writes while you hold a control during playback, Write latches the last value until you stop. The morph pad's "Write gesture as automation" bakes a recorded XY movement into curves. **MIDI learn** is in the same context menu: pick it, move a controller, done.
 
+**Browser**: the search box filters samples and effects; mark anything *+fav* to keep it at the top. *play* auditions a sample at a safe level through the master (audio must be on); clicking an effect adds it to the mixer channel selected in the Mixer view.
+
 **Audio clips**: drop a `.wav`, `.flac` or `.mp3` onto a playlist lane and it becomes an audio clip right there (dropped anywhere else it becomes a sampler channel instead). Samples already in the project are listed in the browser: click one, then click a lane to place it (Esc cancels). Audio clips play in Song mode into the mixer channel chosen in the track header (Master by default), so inserts and sends apply to them like to anything else. Drag the right edge to shorten a clip, the left edge to trim its start; right-click it for gain and fade in/out. Tempo changes move clips but never stretch them.
 
 ## Mixer and effects

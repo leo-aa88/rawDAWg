@@ -14,7 +14,7 @@ use rawdawg_types::{AssetId, ClipId, PatternId, TrackId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-const HEADER_W: f32 = 150.0;
+const HEADER_W: f32 = 184.0;
 const RULER_H: f32 = 22.0;
 const MARKER_H: f32 = 18.0;
 const TRACK_H: f32 = 56.0;

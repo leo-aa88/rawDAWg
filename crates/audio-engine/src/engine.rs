@@ -51,6 +51,8 @@ pub struct EngineStatus {
     pub mixer_peak_r: Vec<AtomicF32>,
     /// Count-in frames still to go (0 = none).
     pub count_in_frames: AtomicI64,
+    /// A browser preview is sounding.
+    pub preview_active: AtomicBool,
     /// Master output (mono sum) for the live scope.
     pub scope: rawdawg_rt::ScopeBuffer,
 }
@@ -83,6 +85,7 @@ impl Default for EngineStatus {
             mixer_peak_l: (0..128).map(|_| AtomicF32::new(0.0)).collect(),
             mixer_peak_r: (0..128).map(|_| AtomicF32::new(0.0)).collect(),
             count_in_frames: AtomicI64::new(0),
+            preview_active: AtomicBool::new(false),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
         }
@@ -199,6 +202,8 @@ pub struct Engine {
     /// smooths the block cadence difference between the input and output callbacks.
     monitor: Option<rawdawg_rt::QueueConsumer<rawdawg_audio_io::capture::CaptureBlock>>,
     monitor_target: Option<usize>,
+    /// Browser preview: the asset, its read position (source frames) and gain.
+    preview: Option<(std::sync::Arc<rawdawg_sampler::SampleAsset>, f64, f32)>,
     monitor_ring: AudioBuffer,
     monitor_read: usize,
     monitor_write: usize,
@@ -248,6 +253,7 @@ impl Engine {
             stems: None,
             monitor: None,
             monitor_target: None,
+            preview: None,
             monitor_ring: AudioBuffer::new(2, MONITOR_RING),
             monitor_read: 0,
             monitor_write: 0,
@@ -397,6 +403,15 @@ impl Engine {
                     self.monitor_read = 0;
                     self.monitor_write = 0;
                 }
+            }
+            EngineCommand::PreviewSample { asset, gain } => {
+                // replacing drops our clone only (the sender still holds one): no deallocation
+                self.preview = Some((asset, 0.0, gain));
+                self.status.preview_active.store(true, Ordering::Relaxed);
+            }
+            EngineCommand::StopPreview => {
+                self.preview = None;
+                self.status.preview_active.store(false, Ordering::Relaxed);
             }
             EngineCommand::SetMetronome(b) => {
                 self.metronome_enabled = b;
@@ -692,6 +707,31 @@ impl Engine {
                 dl[i] += l;
                 dr[i] += r;
             }
+        }
+    }
+
+    /// Browser preview: the asset plays once through the master output at its own rate
+    /// (converted), before protection. Ends itself; no allocation.
+    fn preview_block(&mut self, l: &mut [f32], r: &mut [f32]) {
+        let Some((asset, pos, gain)) = self.preview.as_mut() else { return };
+        let step = f64::from(asset.sample_rate) / self.sample_rate.as_f64();
+        let total = asset.frames() as f64;
+        let stereo = asset.is_stereo();
+        let mut done = false;
+        for i in 0..l.len() {
+            if *pos >= total {
+                done = true;
+                break;
+            }
+            let a = asset.read(0, *pos) * *gain;
+            let b = if stereo { asset.read(1, *pos) * *gain } else { a };
+            l[i] += a;
+            r[i] += b;
+            *pos += step;
+        }
+        if done {
+            self.preview = None;
+            self.status.preview_active.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1020,6 +1060,7 @@ impl Engine {
         }
         self.count_in_block(&mut out_l[..frames], &mut out_r[..frames]);
         self.metronome_block(&mut out_l[..frames], &mut out_r[..frames]);
+        self.preview_block(&mut out_l[..frames], &mut out_r[..frames]);
         let plan = &mut self.plan;
         if plan.master_protection {
             plan.master_limiter.process(&mut out_l[..frames], &mut out_r[..frames]);

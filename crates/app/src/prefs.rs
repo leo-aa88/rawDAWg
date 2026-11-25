@@ -31,6 +31,9 @@ pub struct Preferences {
     /// Route the live input into the mixer (off by default; beware of feedback).
     #[serde(default)]
     pub monitor_input: bool,
+    /// Browser favorites: asset ids and effect type ids.
+    #[serde(default)]
+    pub favorites: Vec<String>,
 }
 
 fn default_count_in() -> u32 {
@@ -57,6 +60,7 @@ impl Default for Preferences {
             input_device_id: None,
             input_channels: rawdawg_audio_io::capture::InputChannels::default(),
             monitor_input: false,
+            favorites: Vec::new(),
         }
     }
 }

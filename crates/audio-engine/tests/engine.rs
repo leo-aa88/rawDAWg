@@ -1037,3 +1037,49 @@ fn flac_export_decodes_back_exactly_and_stems_share_the_render_length() {
     assert_eq!(peak(&empty.channels[0]), 0.0, "an unused bus exports a silent stem of full length");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn browser_preview_plays_an_asset_once_at_its_gain_and_can_be_stopped() {
+    use std::sync::atomic::Ordering;
+    let limits = EngineLimits::DEFAULT;
+    let p = project_with_notes(&[]);
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    engine.install_plan(compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan);
+    // a 0.25 s 1 kHz tone at 96 kHz: played at 48 kHz it must still be 1 kHz (rate converted)
+    let tone: Vec<f32> = (0..24_000).map(|i| (std::f64::consts::TAU * 1000.0 * i as f64 / 96_000.0).sin() as f32 * 0.5).collect();
+    let asset = rawdawg_sampler::SampleAsset::mono("tone", 96_000, tone);
+    let held = asset.clone();
+    assert!(handle.send(EngineCommand::PreviewSample { asset, gain: 0.25 }).is_ok());
+    let mut out = Vec::new();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    for _ in 0..80 {
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    assert!(!handle.status.preview_active.load(Ordering::Relaxed), "preview ended by itself (0.25 s < 80 blocks)");
+    assert!((dominant_frequency(&out[..8192], 48_000.0) - 1000.0).abs() < 2.0, "rate converted");
+    let pk = peak(&out[..12_000]);
+    assert!((pk - 0.125).abs() < 0.01, "0.5 × gain 0.25: {pk}");
+    assert_eq!(peak(&out[13_000..]), 0.0, "silence after the asset ends (12 000 output frames)");
+    // stop early
+    assert!(handle.send(EngineCommand::PreviewSample { asset: held.clone(), gain: 0.25 }).is_ok());
+    engine.render_block(&mut l, &mut r);
+    assert!(handle.status.preview_active.load(Ordering::Relaxed));
+    assert!(peak(&l) > 0.1);
+    assert!(handle.send(EngineCommand::StopPreview).is_ok());
+    engine.render_block(&mut l, &mut r);
+    assert!(!handle.status.preview_active.load(Ordering::Relaxed));
+    // the master limiter's 1 ms lookahead still carries the previous block's tail: the next block is silent
+    engine.render_block(&mut l, &mut r);
+    assert_eq!(peak(&l), 0.0);
+    // steady state with a preview running is allocation-free
+    assert!(handle.send(EngineCommand::PreviewSample { asset: held.clone(), gain: 0.25 }).is_ok());
+    let (_, allocs) = measure_rt(|| {
+        for _ in 0..8 {
+            engine.render_block(&mut l, &mut r);
+        }
+    });
+    assert_eq!(allocs, 0);
+    drop(held);
+}

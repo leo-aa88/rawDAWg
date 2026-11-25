@@ -25,6 +25,14 @@ pub enum EngineCommand {
     /// Route the live audio input (monitor queue) into a mixer channel by plan index;
     /// `None` switches monitoring off (the default).
     SetMonitor(Option<usize>),
+    /// Audition a decoded asset through the master (browser preview) at a linear gain;
+    /// replaces any running preview. The sender keeps its own `Arc` until the preview
+    /// ended so the RT thread never drops the last reference.
+    PreviewSample {
+        asset: std::sync::Arc<rawdawg_sampler::SampleAsset>,
+        gain: f32,
+    },
+    StopPreview,
     /// Live event (typing keyboard, MIDI, mouse) routed to a channel's instrument.
     /// `frame` is ignored and replaced by the block offset derived from the timestamp.
     Live {
