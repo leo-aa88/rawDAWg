@@ -137,6 +137,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
         }
     });
     for (id, n, started, stopped) in edits {
+        super::automation::capture_edit(app, instance_id, id.0, n, started, stopped);
         if started && app.instrument_panel.gesture.is_none() {
             let before = app.other_mirrors[&instance_id].save_state();
             app.instrument_panel.gesture = Some((instance_id, before));

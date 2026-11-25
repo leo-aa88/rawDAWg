@@ -157,6 +157,9 @@ pub struct Engine {
     /// Scheduled notes currently sounding: (note, channel) for note-off generation.
     active: Vec<ScheduledNote>,
     cursor: usize,
+    param_cursor: usize,
+    /// Emit the automation values in force at the playhead on the next block (after seek/start/swap).
+    chase_params: bool,
     playing: bool,
     mode: TransportMode,
     position: i64,
@@ -191,6 +194,8 @@ impl Engine {
             stage: EventStage::new(limits.max_mixer_channels as usize, limits.max_scheduled_events_per_block as usize),
             active: Vec::with_capacity(MAX_ACTIVE_SCHEDULED),
             cursor: 0,
+            param_cursor: 0,
+            chase_params: false,
             playing: false,
             mode: TransportMode::Pattern,
             position: 0,
@@ -249,6 +254,8 @@ impl Engine {
     }
 
     fn reseek_cursor(&mut self) {
+        self.param_cursor = self.schedule().params.partition_point(|p| p.frame < self.position);
+        self.chase_params = true;
         let pos = self.position;
         let sched = self.schedule();
         self.cursor = sched.notes.partition_point(|n| n.on_frame < pos);
@@ -376,6 +383,42 @@ impl Engine {
                     self.active.swap_remove(i);
                 } else {
                     i += 1;
+                }
+            }
+            // automation chase: the latest value per target before the playhead (bounded scan)
+            if self.chase_params {
+                self.chase_params = false;
+                let mut seen: [(u16, u32); 64] = [(u16::MAX, u32::MAX); 64];
+                let mut n_seen = 0usize;
+                let mut i = self.param_cursor;
+                while i > 0 && n_seen < seen.len() {
+                    i -= 1;
+                    let p = self.schedule().params[i];
+                    let key = (p.channel_index, p.id.0);
+                    if seen[..n_seen].contains(&key) {
+                        continue;
+                    }
+                    seen[n_seen] = key;
+                    n_seen += 1;
+                    let ev = TimedEvent::new(block_offset as u32, EventSource::Transport, 0, EventKind::Param { id: p.id, value: p.value });
+                    if !self.stage.push(p.channel_index as usize, ev) {
+                        self.status.dropped_events.incr();
+                    }
+                }
+            }
+            // automation events in [start, end)
+            while let Some(p) = self.schedule().params.get(self.param_cursor).copied() {
+                if p.frame >= end {
+                    break;
+                }
+                self.param_cursor += 1;
+                if p.frame < start {
+                    continue;
+                }
+                let at = (p.frame - start) as u32 + block_offset as u32;
+                let ev = TimedEvent::new(at, EventSource::Transport, 0, EventKind::Param { id: p.id, value: p.value });
+                if !self.stage.push(p.channel_index as usize, ev) {
+                    self.status.dropped_events.incr();
                 }
             }
             // note-ons in [start, end)

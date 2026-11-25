@@ -17,10 +17,27 @@ pub struct ScheduledNote {
     pub id: u32,
 }
 
+/// A scheduled parameter value (automation), absolute project frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScheduledParam {
+    pub frame: i64,
+    pub channel_index: u16,
+    pub id: rawdawg_types::ParamId,
+    pub value: f32,
+}
+
+/// Linear automation segments are sampled every this many frames (the instrument
+/// smooths in between); step points are exact.
+pub const AUTOMATION_STEP_FRAMES: i64 = 64;
+/// Upper bound of generated automation events per schedule.
+pub const MAX_AUTOMATION_EVENTS: usize = 1 << 20;
+
 /// Immutable compiled schedule, sorted by `on_frame` then deterministic order.
 #[derive(Clone, Debug, Default)]
 pub struct Schedule {
     pub notes: Vec<ScheduledNote>,
+    /// Automation events sorted by frame (song mode only).
+    pub params: Vec<ScheduledParam>,
     /// Loop region in frames (pattern length in pattern mode; loop range or song end in song mode).
     pub loop_start_frame: i64,
     pub loop_end_frame: i64,
@@ -43,7 +60,30 @@ impl Schedule {
             }
         }
         finish(&mut notes);
-        Self { notes, loop_start_frame: 0, loop_end_frame: constant.tick_to_frame(pat.length_ticks, rate).max(1), loop_enabled: true }
+        Self { notes, params: Vec::new(), loop_start_frame: 0, loop_end_frame: constant.tick_to_frame(pat.length_ticks, rate).max(1), loop_enabled: true }
+    }
+
+    /// Value of a curve at `tick` (step/linear between points; held outside).
+    pub fn curve_value(curve: &rawdawg_project::AutomationCurve, tick: i64) -> Option<f32> {
+        let pts = &curve.points;
+        if pts.is_empty() {
+            return None;
+        }
+        if tick <= pts[0].tick.0 {
+            return Some(pts[0].value);
+        }
+        let i = pts.partition_point(|p| p.tick.0 <= tick);
+        if i >= pts.len() {
+            return Some(pts[pts.len() - 1].value);
+        }
+        let (a, b) = (&pts[i - 1], &pts[i]);
+        Some(match b.interpolation {
+            rawdawg_project::Interpolation::Step => a.value,
+            rawdawg_project::Interpolation::Linear => {
+                let span = (b.tick.0 - a.tick.0).max(1) as f32;
+                a.value + (b.value - a.value) * ((tick - a.tick.0) as f32 / span)
+            }
+        })
     }
 
     /// Song mode: pattern clips placed on tracks, using the full tempo map.
@@ -86,11 +126,73 @@ impl Schedule {
             }
         }
         finish(&mut notes);
+        // automation clips → parameter events (curves in Off mode are skipped)
+        let mut params: Vec<ScheduledParam> = Vec::new();
+        for clip in &project.clips {
+            if clip.muted || project.tracks.iter().find(|t| t.id == clip.track_id).is_some_and(|t| t.mute) {
+                continue;
+            }
+            let ClipContent::Automation { curve_id, source_offset_ticks, looped } = &clip.content else { continue };
+            let Some(curve) = project.automation.iter().find(|c| c.id == *curve_id) else { continue };
+            if curve.disabled || curve.mode == rawdawg_project::AutomationMode::Off || curve.points.is_empty() {
+                continue;
+            }
+            let Some(ci) = project.channels.iter().position(|c| c.instrument.id == curve.target.instance_id) else { continue };
+            let id = rawdawg_types::ParamId(curve.target.param_id);
+            let clip_end = clip.start_tick.0 + clip.length_ticks.0;
+            let plen = curve.points.last().map(|p| p.tick.0).unwrap_or(0).max(1);
+            let reps = if *looped { ((clip.length_ticks.0 + source_offset_ticks.0 + plen - 1) / plen).max(1) } else { 1 };
+            let push = |frame: i64, value: f32, params: &mut Vec<ScheduledParam>| {
+                if params.len() < MAX_AUTOMATION_EVENTS {
+                    params.push(ScheduledParam { frame, channel_index: ci as u16, id, value: value.clamp(0.0, 1.0) });
+                }
+            };
+            let frame_of = |tick: i64| tempo.tick_to_frame(Tick(tick), rate);
+            // value at the clip start (chase into the curve)
+            if let Some(v) = Self::curve_value(curve, source_offset_ticks.0) {
+                push(frame_of(clip.start_tick.0), v, &mut params);
+            }
+            for rep in 0..reps {
+                for w in curve.points.windows(2) {
+                    let (a, b) = (&w[0], &w[1]);
+                    let ta = clip.start_tick.0 + a.tick.0 + rep * plen - source_offset_ticks.0;
+                    let tb = clip.start_tick.0 + b.tick.0 + rep * plen - source_offset_ticks.0;
+                    if tb <= clip.start_tick.0 || ta >= clip_end {
+                        continue;
+                    }
+                    match b.interpolation {
+                        rawdawg_project::Interpolation::Step => {
+                            if tb < clip_end && tb > clip.start_tick.0 {
+                                push(frame_of(tb), b.value, &mut params);
+                            }
+                        }
+                        rawdawg_project::Interpolation::Linear => {
+                            let (fa, fb) = (frame_of(ta), frame_of(tb));
+                            let (f_lo, f_hi) = (frame_of(clip.start_tick.0), frame_of(clip_end));
+                            let span_frames = (fb - fa).max(1);
+                            let step = AUTOMATION_STEP_FRAMES.max(span_frames / 4096);
+                            let mut f = fa + step;
+                            while f < fb {
+                                if f > f_lo && f < f_hi {
+                                    let v = a.value + (b.value - a.value) * ((f - fa) as f32 / span_frames as f32);
+                                    push(f, v, &mut params);
+                                }
+                                f += step;
+                            }
+                            if fb > f_lo && fb < f_hi {
+                                push(fb, b.value, &mut params);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        params.sort_by_key(|p| (p.frame, p.channel_index, p.id.0));
         let (ls, le, en) = match project.r#loop {
             Some(l) if l.enabled => (tempo.tick_to_frame(l.start_tick, rate), tempo.tick_to_frame(l.end_tick, rate), true),
             _ => (0, tempo.tick_to_frame(end_tick, rate).max(1), false),
         };
-        Self { notes, loop_start_frame: ls, loop_end_frame: le.max(ls + 1), loop_enabled: en }
+        Self { notes, params, loop_start_frame: ls, loop_end_frame: le.max(ls + 1), loop_enabled: en }
     }
 }
 

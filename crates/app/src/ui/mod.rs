@@ -1,6 +1,7 @@
 //! GUI shell (M1): dark workspace skeleton, transport, typing/MIDI/on-screen
 //! keyboards, synth parameter panel, settings, status.
 
+mod automation;
 mod evolve;
 mod graph_editor;
 mod instrument_panel;
@@ -61,6 +62,7 @@ pub(crate) enum EditorView {
     Rack,
     PianoRoll,
     Synth,
+    Automation,
 }
 
 pub(crate) struct App {
@@ -73,6 +75,7 @@ pub(crate) struct App {
     pub transport_mode: TransportMode,
     pub loop_enabled: bool,
     pub record: recording::RecordState,
+    pub automation: automation::AutomationState,
     pub midi_learn: Option<rawdawg_project::AutomationTarget>,
     pub midi_dirty: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
     pub devices: DeviceSnapshot,
@@ -200,6 +203,7 @@ impl App {
             transport_mode: TransportMode::Pattern,
             loop_enabled: true,
             record: Default::default(),
+            automation: Default::default(),
             midi_learn: None,
             midi_dirty: HashMap::new(),
         };
@@ -213,6 +217,11 @@ impl App {
                 app.transport_mode = TransportMode::Song;
             }
             Some("piano-roll") => app.editor_view = EditorView::PianoRoll,
+            Some("automation") => {
+                app.editor_view = EditorView::Automation;
+                app.automation.curve = app.project.automation.first().map(|c| c.id);
+                app.transport_mode = TransportMode::Song;
+            }
             Some("graph") => {
                 app.synth_panel.advanced = true;
                 app.synth_panel.graph.scope = rawdawg_synthesizer::graph::Scope::Voice;
@@ -490,7 +499,11 @@ impl App {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F8),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F9),
                 // Escape cancels a piano-roll gesture first; otherwise it is the panic key
-                if self.piano_roll.gesture_active() || self.playlist.gesture_active() { false } else { i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) },
+                if self.piano_roll.gesture_active() || self.playlist.gesture_active() || self.automation.gesture_active() {
+                    false
+                } else {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                },
             )
         });
         if redo {
@@ -718,6 +731,7 @@ impl App {
             ui.selectable_value(&mut self.editor_view, EditorView::Rack, "Rack").on_hover_text("F6");
             ui.selectable_value(&mut self.editor_view, EditorView::PianoRoll, "Piano roll").on_hover_text("F7");
             ui.selectable_value(&mut self.editor_view, EditorView::Synth, "Synth").on_hover_text("F8");
+            ui.selectable_value(&mut self.editor_view, EditorView::Automation, "Automation").on_hover_text("Parameter curves (right-click a parameter → Create automation clip)");
         });
     }
 
@@ -1056,6 +1070,7 @@ impl eframe::App for App {
         self.poll_midi();
         self.poll_record();
         self.commit_quiet_midi_changes();
+        automation::poll_capture(self);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             self.import_file_as_channel(&p);
@@ -1102,6 +1117,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| match self.editor_view {
                 EditorView::Rack => self.rack(ui),
                 EditorView::PianoRoll => piano_roll::show(self, ui),
+                EditorView::Automation => automation::show(self, ui),
                 EditorView::Synth => {
                     let is_synth =
                         self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);

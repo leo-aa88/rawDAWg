@@ -252,6 +252,10 @@ fn param_grid(
                         app.remove_midi_mapping(instance_id, d.id.0);
                         ui.close();
                     }
+                    if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
+                        super::automation::create_clip_for(app, instance_id, d.id.0);
+                        ui.close();
+                    }
                 })
                 .map(|r| r.response)
                 .unwrap_or(resp);
@@ -280,6 +284,7 @@ fn param_grid(
 
 pub(crate) fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(ParamId, f32, bool, bool)>) {
     for (id, n, started, stopped) in edits {
+        super::automation::capture_edit(app, instance_id, id.0, n, started, stopped);
         if started && app.synth_panel.gesture.is_none() {
             let before = app.synth_mirrors[&instance_id].save_state();
             app.synth_panel.gesture = Some((instance_id, before));

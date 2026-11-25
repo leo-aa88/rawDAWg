@@ -421,7 +421,12 @@ fn morph_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
                 app.synth_panel.evolve.morph_recording.clear();
             }
             let n = app.synth_panel.evolve.morph_recording.len();
-            ui.label(egui::RichText::new(format!("x {:.2} · y {:.2} · {n} gesture points recorded (automation lanes arrive in M3)", x, y)).color(theme::TEXT_SECONDARY));
+            ui.label(egui::RichText::new(format!("x {:.2} · y {:.2} · {n} gesture points recorded", x, y)).color(theme::TEXT_SECONDARY));
+            if n > 1 && ui.button("Write gesture as automation").on_hover_text("Bakes the recorded pad movement into automation curves for every parameter it changed (Automation track, Song mode)").clicked() {
+                let gesture = app.synth_panel.evolve.morph_recording.clone();
+                let written = super::automation::bake_morph_gesture(app, instance, refs, &gesture);
+                app.status_line = if written == 0 { "The gesture changed no continuous parameter".into() } else { format!("Wrote {written} automation curve(s) from the morph gesture") };
+            }
         });
     });
 }

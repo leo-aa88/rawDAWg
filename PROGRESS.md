@@ -90,6 +90,15 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Screenshot `m3-piano-roll.png` now shows the expression lane (fixture `demo.rawdawg` carries a bend/mod-wheel/sustain gesture).
 - NOT RUN: live recording / MIDI learn with a device and typing in a real session (needs audio + MIDI hardware; WSLg audio is wedged on this machine). The pipeline pieces are covered by the engine echo/count-in test and the take unit tests.
 
+### Slice 3b — parameter automation (CORE-08)
+
+229 automated tests pass, clippy clean, HL-01…HL-11 PASS.
+
+- Engine/schedule: automation clips (song mode) compile to `ScheduledParam` events — step points exact, linear segments sampled every 64 frames (≤ 4096 samples per segment, 2²⁰ events cap), value at the clip start, looped clips repeat, curves in Off mode or disabled are skipped; the engine emits them as sample-placed `Param` events to the instrument and **chases** the value in force after start/seek/plan swap (bounded 64-target scan, no allocation). Tests: sampled events/spacing/exact step, offline ramp audible (RMS rises then drops at the step), seek-into-curve chase vs. start-from-zero.
+- `crates/app/src/ui/automation.rs`: curve editor (target label, value grid in the parameter's own units, click adds, drag moves, right-click deletes, per-point Linear/Step, mode Off/Read/Touch/Write, delete curve with its clips, clip-relative playhead), "Create automation clip" in every parameter's context menu (curve with the current value, 4-bar clip at the playhead bar on an "Automation" track created on demand), automation clips drawn with their curve in the playlist (double-click opens the editor; move/trim/resize/split work as for pattern clips), **touch/write** capture of parameter gestures while the song plays under the clip (Touch: while held; Write: latches the last value until playback stops; written points replace the gesture's range, thinned to 1/64 notes, one undo entry), **morph gesture → automation** ("Write gesture as automation" bakes the XY pad recording into curves for up to 16 continuous parameters that changed, mapped through the tempo at tick 0).
+- Fixture `demo-song.rawdawg` carries a filter-cutoff sweep clip over bars 3–4; HL-11 measures the spectral centroid rising 225 → 891 Hz. Screenshot `m3-automation.png`. `--ui-preset automation`.
+- Limits (documented): automation plays in Song mode only (pattern mode has no timeline); mixer/effect parameters are not automation targets until M4; MIDI-learned controls are not recorded as automation (use touch/write with the mouse or map first then move while in Write mode: mapped CCs go through the live parameter path and are captured when a Touch/Write curve exists — this path is implemented through `capture_edit` only for mouse edits; CC capture is open).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -144,6 +153,6 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M3 continues (slices 1–3a done: rack steps + piano roll, playlist, recording/MIDI learn; next: automation curves/clips/recording), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M3 continues (slices 1–3b done: rack steps + piano roll, playlist, recording/MIDI learn, automation; next: M3 gate pass with UI input tests and E2E-02), keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M3 remainder: pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.
 Known limitations carried forward: MIDI timestamps are recorded but events are applied at the next block (sample-accurate placement arrives with recording in M3); morph gesture points are recorded in memory but automation lanes do not exist yet (M3).

@@ -416,9 +416,29 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 (format!("{}{}", p.map(|p| p.name.clone()).unwrap_or_else(|| "?".into()), if *looped { " (loop)" } else { "" }), p)
             }
             ClipContent::Audio { .. } => ("audio (plays in M5)".into(), None),
-            ClipContent::Automation { .. } => ("automation".into(), None),
+            ClipContent::Automation { curve_id, .. } => {
+                (app.project.automation.iter().find(|a| a.id == *curve_id).map(|a| format!("~ {}", a.name)).unwrap_or_else(|| "automation".into()), None)
+            }
         };
         painter.text(cr_vis.left_top() + vec2(4.0, 2.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(10.0), theme::TEXT);
+        // automation curve preview
+        if let ClipContent::Automation { curve_id, source_offset_ticks, .. } = &c.content
+            && let Some(curve) = app.project.automation.iter().find(|a| a.id == *curve_id)
+        {
+            let area = Rect::from_min_max(pos2(cr_vis.min.x, cr.min.y + 14.0), pos2(cr_vis.max.x, cr.max.y - 2.0));
+            let mut poly = Vec::new();
+            let mut x = area.min.x;
+            while x <= area.max.x {
+                let t = tick_at(x) - c.start_tick.0 + source_offset_ticks.0;
+                if let Some(v) = rawdawg_audio_engine::schedule::Schedule::curve_value(curve, t) {
+                    poly.push(pos2(x, area.max.y - v * area.height()));
+                }
+                x += 3.0;
+            }
+            if poly.len() > 1 {
+                painter.add(egui::Shape::line(poly, Stroke::new(1.5, theme::TEXT.linear_multiply(0.9))));
+            }
+        }
         // note miniatures
         if let (Some(p), ClipContent::Pattern { source_offset_ticks, looped, .. }) = (mini, &c.content) {
             let area = Rect::from_min_max(pos2(cr.min.x, cr.min.y + 14.0), pos2(cr.max.x, cr.max.y - 2.0));
@@ -486,6 +506,15 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     {
         let t = snap_tick(tick_at(p.x), egrid).max(0);
         app.playlist.gesture = Some(Gesture::LoopRange { start_tick: t });
+    }
+    // double-click an automation clip: open its curve
+    if resp.double_clicked()
+        && let Some(p) = pointer
+        && let Some(c) = hit(p)
+        && let ClipContent::Automation { curve_id, .. } = &c.content
+    {
+        app.automation.curve = Some(*curve_id);
+        app.editor_view = super::EditorView::Automation;
     }
     // lanes: primary press
     if resp.drag_started()

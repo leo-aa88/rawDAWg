@@ -121,6 +121,35 @@ pub fn demo_song_project() -> Project {
         content: ClipContent::Pattern { pattern_id: bass, source_offset_ticks: Tick::ZERO, looped: true },
     });
     p.tempo.push(rawdawg_project::TempoPoint { tick: Tick(7680), us_per_quarter: rawdawg_types::units::UsPerQuarter(461_538) });
+    // automation: the synth's filter cutoff sweeps up over bars 3–4 (Read mode, Song playback)
+    use rawdawg_project::{AutomationCurve, AutomationMode, AutomationPoint, AutomationTarget, Interpolation};
+    let curve_id = rawdawg_types::CurveId::from_u128(0xA070_0001);
+    p.automation.push(AutomationCurve {
+        id: curve_id,
+        name: "Graph synth · Cutoff".into(),
+        target: AutomationTarget { instance_id: p.channels[0].instrument.id, param_id: rawdawg_synthesizer::params::FILTER_CUTOFF },
+        points: vec![
+            AutomationPoint { id: rawdawg_types::PointId::from_u128(0xA0A0_0001), tick: Tick(0), value: 0.25, interpolation: Interpolation::Linear },
+            AutomationPoint { id: rawdawg_types::PointId::from_u128(0xA0A0_0002), tick: Tick(7680), value: 0.95, interpolation: Interpolation::Linear },
+        ],
+        mode: AutomationMode::Read,
+        disabled: false,
+    });
+    let t3 = rawdawg_types::TrackId::from_u128(0x7A00_0003);
+    p.tracks.push(Track { id: t3, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None });
+    p.clips.push(Clip {
+        id: rawdawg_types::ClipId::from_u128(0xC11_0004),
+        track_id: t3,
+        start_tick: Tick(7680),
+        length_ticks: Tick(7680),
+        muted: false,
+        content: ClipContent::Automation { curve_id, source_offset_ticks: Tick::ZERO, looped: false },
+    });
+    // the synth filter must be on for the sweep to be audible
+    let mut patch: rawdawg_synthesizer::Patch = serde_json::from_value(p.channels[0].instrument.state.clone()).expect("patch");
+    patch.filter.enabled = true;
+    patch.filter.cutoff_hz = 800.0;
+    p.channels[0].instrument.state = serde_json::to_value(&patch).expect("patch serializes");
     p
 }
 

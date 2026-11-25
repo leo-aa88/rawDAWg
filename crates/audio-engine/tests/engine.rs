@@ -501,3 +501,112 @@ fn count_in_clicks_then_starts_and_recording_echoes_live_events_with_frames() {
     assert!(handle.poll_recorded().is_none());
     assert_eq!(engine.status().record_overflows.get(), 0);
 }
+
+fn automation_song(points: Vec<(i64, f32, rawdawg_project::Interpolation)>, mode: rawdawg_project::AutomationMode) -> (Project, rawdawg_types::CurveId) {
+    use rawdawg_project::{AutomationCurve, AutomationPoint, AutomationTarget, Clip, ClipContent, Track};
+    use rawdawg_types::{ClipId, CurveId, PointId, TrackId};
+    // one held note for two bars in song mode, master gain automated
+    let mut p = project_with_notes(&[(0, 3840, 60)]);
+    let tid = TrackId::new();
+    p.tracks.push(Track { id: tid, name: "T".into(), color: None, mute: false, solo: false, height: None });
+    p.clips.push(Clip {
+        id: ClipId::new(),
+        track_id: tid,
+        start_tick: Tick(0),
+        length_ticks: Tick(7680),
+        muted: false,
+        content: ClipContent::Pattern { pattern_id: p.patterns[0].id, source_offset_ticks: Tick::ZERO, looped: true },
+    });
+    let curve_id = CurveId::new();
+    let curve = AutomationCurve {
+        id: curve_id,
+        name: "gain".into(),
+        target: AutomationTarget { instance_id: p.channels[0].instrument.id, param_id: rawdawg_synthesizer::params::MASTER_GAIN },
+        points: points.into_iter().map(|(t, v, i)| AutomationPoint { id: PointId::new(), tick: Tick(t), value: v, interpolation: i }).collect(),
+        mode,
+        disabled: false,
+    };
+    p.automation.push(curve);
+    p.clips.push(Clip {
+        id: ClipId::new(),
+        track_id: tid,
+        start_tick: Tick(0),
+        length_ticks: Tick(7680),
+        muted: false,
+        content: ClipContent::Automation { curve_id, source_offset_ticks: Tick::ZERO, looped: false },
+    });
+    (p, curve_id)
+}
+
+#[test]
+fn automation_curve_schedules_sampled_param_events_and_renders_a_ramp() {
+    use rawdawg_audio_engine::schedule::Schedule;
+    use rawdawg_project::Interpolation;
+    // master gain: 0 at bar 1, linear to 1 at bar 2 (tick 3840), step down to 0.25 at bar 3 start
+    let (p, _) =
+        automation_song(vec![(0, 0.0, Interpolation::Linear), (3840, 1.0, Interpolation::Linear), (3841, 0.25, Interpolation::Step)], rawdawg_project::AutomationMode::Read);
+    let s = Schedule::for_song(&p, &p.tempo_map().unwrap(), SampleRate(48_000));
+    assert!(!s.params.is_empty());
+    assert_eq!(s.params[0].frame, 0);
+    assert_eq!(s.params[0].value, 0.0);
+    assert!(s.params.windows(2).all(|w| w[0].frame <= w[1].frame), "sorted by frame");
+    let at_bar2 = s.params.iter().filter(|q| q.frame == 96_000).map(|q| q.value).next_back().unwrap();
+    assert!((at_bar2 - 1.0).abs() < 1e-6);
+    let spacing: Vec<i64> = s.params.windows(2).take(10).map(|w| w[1].frame - w[0].frame).collect();
+    assert!(spacing.iter().all(|d| *d == 64), "linear segments sampled every 64 frames: {spacing:?}");
+    let step_pt = s.params.iter().find(|q| q.value == 0.25 && q.frame >= 96_000).expect("step point");
+    assert_eq!(step_pt.frame, 96_025, "step point exact at its tick (tick 3841 = frame 96025)");
+    // offline song render: level rises through bar 1 and drops after the step
+    let (l, _, _) = render_project(&p, &OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, ..Default::default() }).unwrap();
+    let early = rms(&l[4_000..12_000]);
+    let mid = rms(&l[44_000..52_000]);
+    let late = rms(&l[88_000..95_000]);
+    let after = rms(&l[110_000..130_000]);
+    assert!(early < mid && mid < late, "ramp: {early} {mid} {late}");
+    assert!(late > 0.1 && after < late * 0.5, "step down to 0.25 after bar 2: late {late} after {after}");
+    // Off mode produces no events
+    let (p_off, _) = automation_song(vec![(0, 0.0, Interpolation::Linear), (3840, 1.0, Interpolation::Linear)], rawdawg_project::AutomationMode::Off);
+    assert!(Schedule::for_song(&p_off, &p_off.tempo_map().unwrap(), SampleRate(48_000)).params.is_empty());
+}
+
+#[test]
+fn seeking_into_automation_chases_the_current_value() {
+    use rawdawg_project::Interpolation;
+    use std::collections::HashMap;
+    let (p, _) = automation_song(vec![(0, 0.0, Interpolation::Linear), (3840, 1.0, Interpolation::Linear)], rawdawg_project::AutomationMode::Read);
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let plan = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+    engine.install_plan(plan);
+    handle.send(EngineCommand::SetMode(TransportMode::Song)).unwrap();
+    // seek to bar 2 (gain = 1.0 by the curve) and play: no note-on happened at bar 2 start in the pattern
+    // (the looped clip retriggers at tick 3840), so the note is heard at full gain right away
+    handle.send(EngineCommand::SeekTick(3840)).unwrap();
+    handle.send(EngineCommand::Play).unwrap();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    let chased = rms(&out[2_000..10_000]);
+    // compare with starting from 0 where the gain curve starts at 0
+    let (mut engine2, mut handle2) = Engine::new(SampleRate(48_000), 256, &limits);
+    let plan2 = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+    engine2.install_plan(plan2);
+    handle2.send(EngineCommand::SetMode(TransportMode::Song)).unwrap();
+    handle2.send(EngineCommand::Play).unwrap();
+    let mut out2 = Vec::new();
+    for _ in 0..40 {
+        l.fill(0.0);
+        r.fill(0.0);
+        engine2.render_block(&mut l, &mut r);
+        out2.extend_from_slice(&l);
+    }
+    let from_start = rms(&out2[2_000..10_000]);
+    assert!(chased > 0.1, "chased gain is audible: {chased}");
+    assert!(from_start < chased * 0.3, "at the start the curve is near 0: {from_start} vs {chased}");
+}

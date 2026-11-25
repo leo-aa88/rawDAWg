@@ -226,6 +226,22 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok((format!("{} frames (tempo change honoured), bar 2 fundamental {f:.2} Hz, peak {:.3}", stats.frames, stats.peak), Some(dir.display().to_string())))
     }));
+    checks.push(check("HL-11 automation clip sweeps the filter in the song render", &["CORE-08"], || {
+        let dir = root.join("fixtures/demo-song.rawdawg");
+        let p = rawdawg_project::load_project_dir(&dir)?;
+        let opts = OfflineOptions { mode: rawdawg_audio_engine::TransportMode::Song, tail_seconds: 0.0, ..Default::default() };
+        let (l, _, stats) = render_project(&p, &opts)?;
+        if stats.nonfinite_blocks > 0 {
+            bail!("nonfinite blocks");
+        }
+        // bars 3–4 (frames 192 000..369 231): cutoff rises from 25 % to 95 % → spectral centroid rises
+        let (_, c_early, _) = rawdawg_dsp::analysis::features(&l[196_000..240_000], 48_000.0);
+        let (_, c_late, _) = rawdawg_dsp::analysis::features(&l[320_000..364_000], 48_000.0);
+        if c_late < c_early * 1.3 {
+            bail!("expected the spectral centroid to rise with the cutoff sweep: early {c_early:.0} Hz, late {c_late:.0} Hz");
+        }
+        Ok((format!("centroid {c_early:.0} Hz → {c_late:.0} Hz across the sweep"), Some(dir.display().to_string())))
+    }));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");
