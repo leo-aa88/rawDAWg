@@ -5536,6 +5536,7 @@ dependencies = [
  "clap",
  "hound",
  "image",
+ "libc",
  "rawdawg-audio-engine",
  "rawdawg-audio-io",
  "rawdawg-dsp",

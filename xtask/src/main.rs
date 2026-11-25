@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+mod bench;
 mod fixtures;
 mod package;
 mod verify;
@@ -113,7 +114,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::BenchAudio { seconds } => verify::bench_audio(&root, seconds),
+        Cmd::BenchAudio { seconds } => bench::run(&root, seconds),
         Cmd::Package { format } => package(&root, format),
         Cmd::Ci => {
             run(Command::new("cargo").args(["fmt", "--all", "--", "--check"]))?;

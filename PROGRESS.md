@@ -22,7 +22,7 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 | `cargo run -p rawdawg -- --audio-smoke` | opened ALSA default 48 kHz F32 stereo, 134 callbacks / 68608 frames, 1 xrun (heuristic), engine peak 0.154, exit 0 |
 | `cargo run -p rawdawg -- --list-audio-devices` | ALSA host, 3 devices (null, default, …), JSON |
 | `cargo deny check licenses advisories bans sources` | licenses ok, bans ok, sources ok; advisories ok with 3 documented ignores (unmaintained transitive zbus 5.x crates from eframe/accesskit) |
-| `cargo run --release -p xtask -- bench-audio --seconds 30` | 4 synths × 8 voices (32 voices), 48 kHz/256: p50 0.197 ms, p95 0.248 ms, p99 0.339 ms, max 0.659 ms vs 5.333 ms deadline (p99 = 6 %); 25.8× realtime offline. M1 workload subset, this WSL2 machine, not the M8 reference workload → `target/verification/bench-audio.json` |
+| `cargo run --release -p xtask -- bench-audio --seconds 300` | M8 reference workload (TESTING.md default fixture), 48 kHz/256: p99 1.20–1.37 ms (23–26% of deadline), max 3.5–9.1 ms (66–171%) over four runs; 7.1–7.3× realtime offline; this WSL2 laptop, not the reference target → `docs/verification/benchmarks.md`, `target/verification/bench-audio.json` |
 | `./target/release/rawdawg --audio-smoke` | ALSA default 48 kHz F32, 132 callbacks, 0 xruns, max callback 0.207 ms, peak 0.154 |
 | `./target/release/rawdawg --headless-render fixtures/demo.rawdawg --output … --format pcm24` | 144000 frames, peak 0.340, 0 clipped, ~230× realtime |
 | `cargo xtask package --format deb` | refuses: scheduled for M8 |
@@ -364,6 +364,13 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Commands: `cargo test --workspace` (362 passed, twice), clippy clean, `cargo xtask package --format deb` (OK; lintian not installed → not linted), `cargo xtask verify --suite all` (20 PASS incl. E2E-08 subset; PL-03/04/05, HW-01, GUI-01 BLOCKED).
 - Not run: lintian, `dpkg -i`/removal on a clean Ubuntu (needs root), anything on Windows (MSI/portable build, install, association), signing.
 
+### Slice 2 — reference benchmarks (QUAL-04)
+
+- `xtask/src/bench.rs` replaces the M1 bench: builds the TESTING.md default fixture in code (four synths × 8 held notes, four sampler tracks on the generated fixtures, EQ + compressor per track, hall and plate send reverbs, master limiter, two automation curves; song mode), times every block at 256 and 128 frames after a 1 s warm-up, records plan compile time, peak voices, RMS, non-finite samples, per-block on-CPU time (`CLOCK_THREAD_CPUTIME_ID`) and the slow blocks; then times each listed effect alone and one synth at 1/8/32/64 notes. Report: `docs/verification/benchmarks.md`; raw JSON `target/verification/bench-audio.json`.
+- Findings (four 300 s release runs on the i7-12650H / WSL2 laptop): p99 23–26% of the 256-frame deadline (target ≤50% met); max 66–171% (target ≤90% missed in two runs; one block over the deadline in 56 250 in run 4). Slow blocks are on-CPU work as far as the guest can see and do not repeat at a fixed phase of the 8 s loop, so they are not a fixed code-path cost in this workload; cause open (frequency scaling or hypervisor suspected, unverified). A first on-CPU attempt via `/proc/thread-self/schedstat` was discarded: on this kernel it advances in 10 ms ticks. Per-voice synth cost has grown since the M1 measurement (8 voices: about 50 µs per synth then, 86 µs now) as M2/M3 features landed.
+- `libc` (already locked at 0.2.191) added as a workspace dependency for xtask on Unix only.
+- Not measured: real-device callbacks/xruns/latency (HW-01), UI frame times (GUI-01), 30-minute soak, morph and long-IR convolution, Windows.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -420,8 +427,8 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M8 in progress (slice 1 done: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset). Next, in order:
-1. M8 slice 2 — reference benchmarks (`cargo xtask bench-audio` extended to the TESTING.md default fixture: 8 tracks, four synths × 8 voices, four sample/audio tracks, EQ/comp per track, two send reverbs, master limiter; callback-time distribution p50/p99/max vs the 5.333 ms deadline at 48 kHz/256, offline real-time factor; spectral/granular/morph separately), report in `docs/verification/benchmarks.md` with exact CPU/OS. Real-device callback timing stays HW-01.
+M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset; slice 2: reference benchmarks in `docs/verification/benchmarks.md`). Next, in order:
+1. Investigate the max-block spikes on bare metal (Ubuntu 24.04, real-time-priority thread) before optimising anything; add morph and long-IR convolution to the bench.
 2. M8 slice 3 — stress/fuzz: bounded fuzzing of project/preset/SMF parsers and plugin state envelopes (cargo-fuzz targets or seeded property tests), 30-minute mixed-edit soak in headless mode with RSS tracking.
 3. M8 slice 4 — CI hygiene: run the workflow on GitHub when the owner pushes (not done by the agent); dependency audit report; quickstart/troubleshooting in USER_GUIDE.
 4. M7 follow-ups: plugin editors (export `gui`/`IPlugView`, host embedding on X11/XWayland), plugin-formatted parameter readouts, large opaque state spill; validators/independent hosts when available. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.

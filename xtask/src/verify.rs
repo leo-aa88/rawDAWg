@@ -8,7 +8,6 @@ use rawdawg_dsp::analysis::dominant_frequency;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
@@ -1225,72 +1224,6 @@ pub fn run(root: &Path, suite: Suite) -> anyhow::Result<()> {
     if failed > 0 {
         bail!("{failed} check(s) FAILED");
     }
-    Ok(())
-}
-
-/// Offline throughput + block timing on the reference-style workload (M1 subset:
-/// four synths playing 8-note chords). Prints realtime factor and block-time
-/// percentiles; the full M8 workload adds samplers, effects and sends.
-pub fn bench_audio(root: &Path, seconds: f64) -> anyhow::Result<()> {
-    use rawdawg_audio_engine::commands::EngineCommand;
-    use rawdawg_audio_engine::engine::Engine;
-    use rawdawg_types::units::Tick;
-    let mut p = rawdawg_project::Project::new_default("bench", serde_json::to_value(rawdawg_synthesizer::Patch::default())?);
-    let base_channel = p.channels[0].clone();
-    for i in 1..4 {
-        let mut c = base_channel.clone();
-        c.id = rawdawg_types::ChannelId::new();
-        c.instrument.id = rawdawg_types::InstanceId::new();
-        c.name = format!("Synth {}", i + 1);
-        p.channels.push(c);
-    }
-    let ids: Vec<_> = p.channels.iter().map(|c| c.id).collect();
-    p.patterns[0].lanes = ids
-        .iter()
-        .map(|id| rawdawg_project::Lane {
-            channel_id: *id,
-            notes: (0..8)
-                .map(|k| rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(3840), pitch: 48 + k * 3, velocity: 0.8, channel: 0 })
-                .collect(),
-            controllers: vec![],
-        })
-        .collect();
-    let limits = rawdawg_types::limits::EngineLimits::DEFAULT;
-    let block = 256usize;
-    let plan = rawdawg_audio_engine::plan::compile(&p, 1, block, &limits, &std::collections::HashMap::new(), &rawdawg_audio_engine::NoAssets)?.plan;
-    let (mut engine, mut handle) = Engine::new(rawdawg_types::SampleRate::DEFAULT, block, &limits);
-    engine.install_plan(plan);
-    handle.send(EngineCommand::Play).ok();
-    let mut l = vec![0.0f32; block];
-    let mut r = vec![0.0f32; block];
-    let blocks = ((seconds * 48_000.0) / block as f64) as usize;
-    let mut times = Vec::with_capacity(blocks);
-    let start = Instant::now();
-    for _ in 0..blocks {
-        let t = Instant::now();
-        engine.render_block(&mut l, &mut r);
-        times.push(t.elapsed().as_secs_f64() * 1e3);
-    }
-    let elapsed = start.elapsed().as_secs_f64();
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
-    let deadline_ms = block as f64 / 48.0;
-    let voices = engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed);
-    println!("workload: 4 synths × 8 voices = {voices} voices, 48 kHz, {block}-frame blocks, {blocks} blocks ({seconds:.0} s of audio)");
-    println!("offline: {:.2} s wall, {:.1}x realtime", elapsed, seconds / elapsed);
-    println!(
-        "block time ms: p50 {:.3} p95 {:.3} p99 {:.3} max {:.3} (deadline {:.3} ms; p99 at {:.0}% of deadline)",
-        pct(0.5),
-        pct(0.95),
-        pct(0.99),
-        times[times.len() - 1],
-        deadline_ms,
-        pct(0.99) / deadline_ms * 100.0
-    );
-    let out = root.join("target/verification");
-    std::fs::create_dir_all(&out)?;
-    let report = serde_json::json!({"voices": voices, "block": block, "blocks": blocks, "seconds": seconds, "wall_seconds": elapsed, "p50_ms": pct(0.5), "p95_ms": pct(0.95), "p99_ms": pct(0.99), "max_ms": times[times.len()-1], "deadline_ms": deadline_ms, "build": if cfg!(debug_assertions) {"debug"} else {"release"}, "os": std::env::consts::OS});
-    std::fs::write(out.join("bench-audio.json"), serde_json::to_vec_pretty(&report)?)?;
     Ok(())
 }
 
