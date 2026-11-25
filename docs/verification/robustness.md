@@ -23,6 +23,7 @@ Each target must not panic, and checks properties beyond that:
 | sf2 | SoundFont bytes | parsed presets play finite audio |
 | audio | WAV/FLAC bytes | decoded audio has a rate, one or two equal-length channels, finite samples |
 | expr | synth expression text | output finite and within ±8 for inputs including NaN and ±∞ |
+| expr-grammar | random expression trees from the grammar (every operator and function with its arity, extreme constants, occasional damage) | as expr; 78% of inputs compile, against 3% for byte mutations of text |
 | patch | synth patch JSON | a patch that validates also loads in the synth; plays finite audio |
 | effect-state | effect state JSON for every effect | loads, processes finite audio, and its saved state loads again |
 | plugin-envelope | CLAP/VST3 state envelope JSON | non-finite mix refused; processor state loads and plays finite |
@@ -42,6 +43,8 @@ Two campaigns, both on debug builds: seed 1 with 2,000 inputs per target, then s
 | 3 | project | Overflow panic in `Note::end_tick` during validation | Validation added tick + duration before checking either was in range | Every tick-valued field (tempo, meter, patterns, notes, controllers, automation, clips, loop) is checked against `MAX_TICK` = 2⁴⁰; audio clip frame fields against `MAX_CLIP_FRAMES` = 2³⁷; end positions saturate |
 | 4 | smf | Overflow panic inside `midly` 0.5.3 | A header claiming SMPTE timing with frame-rate byte `0x80` makes the library negate `i8::MIN` | SMPTE timing is unsupported anyway, so the header bit is checked before the library runs; any other parser panic becomes an import error |
 | 5 | audio | Overflow panic inside `symphonia-format-riff` 0.6.1 | An implausible channel count in a WAV header makes the library shift by 32 or more | All decoder entry points (whole-file, in-memory, streaming open/seek/decode) contain panics and return "the audio decoder failed on malformed data" |
+
+| 6 | expr-grammar | Panic in the expression evaluator for `clamp` with a NaN bound (for example `clamp(0.5, x, x)` when an input is NaN) | `f32::clamp` panics on NaN bounds; the evaluator only reordered reversed bounds. **The evaluator runs on the audio thread** inside the synth's modular graph | A NaN bound leaves that side open; unit test in `expr.rs`. An audit of every other `clamp` with computed bounds in the real-time crates found no other hazard (bounds constant, ordered, or guarded) |
 
 Findings 4 and 5 are bugs in third-party crates. In release builds they wrap silently rather than
 panic, but other panics in those libraries would still reach us, so containment stays either way.
@@ -67,10 +70,13 @@ deeper checks:
 | effect-state | 20,048 | 10,765 | 53.7% | 2.8 | 1.9 ms |
 | plugin-envelope | 20,016 | 19,964 | 99.7% | 2.0 | 1.0 ms |
 | midi-messages | 20,001 | 20,001 | 100% | 0.0 | 0.0 ms |
+| expr-grammar (after finding 6, seed 9) | 300,008 | 234,821 | 78.3% | 1.0 | 0.4 ms |
 
 Two targets are shallow. Raw preset archives rarely survive the zip checksum, so the
 `preset-manifest` target exists to reach the same code at 57%. Expression text breaks under byte
-mutations (2.9%); a grammar-based generator would exercise the compiler more and is not built yet.
+mutations (2.9%), so the `expr-grammar` target generates valid trees instead; it found finding 6
+within its first inputs. Deep nesting (2,040 parentheses, 815 nested calls) is checked on a 2 MB
+stack: it compiles or is rejected by the size and instruction limits, without stack overflow.
 The slowest project input in the 60,000 run took 553 ms to parse, compile and render, which is slow
 but bounded.
 

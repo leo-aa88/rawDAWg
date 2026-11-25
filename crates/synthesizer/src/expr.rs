@@ -421,6 +421,10 @@ impl Evaluator {
                     let lo = st[sp - 2];
                     let x = st[sp - 3];
                     sp -= 2;
+                    // a NaN bound leaves that side open: f32::clamp panics on NaN bounds, and this
+                    // runs on the audio thread (found by the grammar fuzz target)
+                    let lo = if lo.is_nan() { f32::NEG_INFINITY } else { lo };
+                    let hi = if hi.is_nan() { f32::INFINITY } else { hi };
                     st[sp - 1] = if lo <= hi { x.clamp(lo, hi) } else { x.clamp(hi, lo) };
                 }
                 Op::Select => {
@@ -474,6 +478,14 @@ mod tests {
         assert!((run("tanh(x * ctrl1 * 4)", 0.25, 1.0) - (1.0f32).tanh()).abs() < 1e-3);
         assert!((run("min(x, 0.2) + max(x, 0.7)", 0.5, 0.0) - 0.9).abs() < 1e-6);
         assert!((run("clamp(x * 8, -1, 1)", 0.5, 0.0) - 1.0).abs() < 1e-6);
+        // fuzz regression: NaN bounds must not panic (they leave that side open)
+        let p = compile("clamp(0.5, x, x)").unwrap();
+        let mut ev = Evaluator::new();
+        let mut vars = [0.0f32; VARIABLES.len()];
+        vars[0] = f32::NAN;
+        assert_eq!(ev.eval(&p, &vars), 0.5);
+        let p = compile("clamp(3, x, 1)").unwrap();
+        assert_eq!(ev.eval(&p, &vars), 1.0, "only the upper bound applies");
         assert!((run("select(x > 0.3, 1, -1)", 0.5, 0.0) - 1.0).abs() < 1e-6);
         assert!((run("select(x > 0.3, 1, -1)", 0.1, 0.0) + 1.0).abs() < 1e-6);
         assert!((run("exp(log(x))", 2.5, 0.0) - 2.5).abs() < 1e-5);

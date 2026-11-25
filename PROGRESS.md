@@ -395,6 +395,13 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Benchmarks: convolution at 1/5/10/30 s and the four-corner morph (blend 38.7 µs per pointer move; moving morph adds about 15 µs per synth block) added to `cargo xtask bench-audio` (`--units-only` skips the long workload runs) and `docs/verification/benchmarks.md`.
 - Commands: `cargo test --workspace` (367 passed), clippy clean, `cargo xtask verify --suite headless` (16 PASS, E2E-05 mix figures unchanged), `cargo run --release -p xtask -- bench-audio --units-only`.
 
+### Slice 5 — grammar-based expression fuzzing: audio-thread panic fixed (QUAL-01/02)
+
+- New fuzz target `expr-grammar`: the input bytes seed a generator of random expression trees (every operator and function with its real arity, extreme constants such as 1e400 and 1e-45, occasional damage). 78% of inputs compile, against 2.9% for byte mutations of text.
+- **Finding:** `clamp(...)` with a NaN bound panicked inside `Evaluator::eval`, which runs on the audio thread in the synth's modular graph. Fixed (a NaN bound leaves that side open), unit test, reproducer saved under `fixtures/fuzz-regressions/expr-grammar/`. Audit of every `clamp` with computed bounds in dsp, effects, synthesizer, sampler, audio-engine and plugin crates: no other hazard (bounds constant, ordered or guarded; SoundFont voices stop before reading at the sample end).
+- New test: deepest expressions (2,040 parentheses, 4,000 unary minus, 815 nested calls, 580 nested `min`) compile or are rejected on a 2 MB stack, no overflow.
+- Commands: `cargo xtask fuzz --target expr-grammar --iterations 300000 --seed 9` (0 findings after the fix), `cargo test -p rawdawg-fuzz` (4 passed).
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).

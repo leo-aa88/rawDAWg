@@ -273,6 +273,73 @@ fn run_expr(bytes: &[u8]) {
     }
 }
 
+/// Grammar-based expressions: the input bytes seed a generator that builds random trees from the
+/// synth expression grammar (variables, extreme constants, every operator and function with its
+/// real arity, nesting), with occasional token damage to reach error paths. Byte mutations of
+/// expression text mostly break the syntax; this reaches the compiler and evaluator instead.
+fn gen_expr(rng: &mut crate::mutate::Rng, depth: u32, out: &mut String) {
+    const VARS: [&str; 12] = ["x", "in1", "in2", "in3", "in4", "ctrl1", "ctrl2", "ctrl3", "ctrl4", "t", "phase", "sr"];
+    const NUMS: [&str; 12] = ["0", "1", "-1", "0.5", "2.5e3", "1e30", "-1e30", "3.4e38", "1e-45", "1e-30", "6.2831853", "1e400"];
+    const BINOPS: [&str; 10] = ["+", "-", "*", "/", "<", "<=", ">", ">=", "==", "!="];
+    const FUNCS: [(&str, usize); 10] = [("min", 2), ("max", 2), ("abs", 1), ("sin", 1), ("cos", 1), ("tanh", 1), ("exp", 1), ("log", 1), ("clamp", 3), ("select", 3)];
+    let leaf = depth == 0 || rng.chance(1, 4);
+    if leaf {
+        if rng.chance(2, 3) {
+            out.push_str(VARS[rng.below(VARS.len())]);
+        } else {
+            out.push_str(NUMS[rng.below(NUMS.len())]);
+        }
+        return;
+    }
+    match rng.below(4) {
+        0 | 1 => {
+            out.push('(');
+            gen_expr(rng, depth - 1, out);
+            out.push_str(&format!(" {} ", BINOPS[rng.below(BINOPS.len())]));
+            gen_expr(rng, depth - 1, out);
+            out.push(')');
+        }
+        2 => {
+            let (name, arity) = FUNCS[rng.below(FUNCS.len())];
+            out.push_str(name);
+            out.push('(');
+            for a in 0..arity {
+                if a > 0 {
+                    out.push_str(", ");
+                }
+                gen_expr(rng, depth - 1, out);
+            }
+            out.push(')');
+        }
+        _ => {
+            out.push(if rng.chance(1, 2) { '-' } else { '+' });
+            gen_expr(rng, depth - 1, out);
+        }
+    }
+}
+
+fn run_expr_grammar(bytes: &[u8]) {
+    let seed = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
+    let mut rng = crate::mutate::Rng::new(seed);
+    let mut src = String::new();
+    let depth = 1 + rng.below(9) as u32;
+    gen_expr(&mut rng, depth, &mut src);
+    if rng.chance(1, 8) && !src.is_empty() {
+        // damage one character: unbalanced parentheses, missing operands, bad names
+        let mut chars: Vec<char> = src.chars().collect();
+        let i = rng.below(chars.len());
+        match rng.below(3) {
+            0 => {
+                chars.remove(i);
+            }
+            1 => chars.insert(i, [')', '(', ',', '*', 'q'][rng.below(5)]),
+            _ => chars[i] = ' ',
+        }
+        src = chars.into_iter().collect();
+    }
+    run_expr(src.as_bytes());
+}
+
 fn patch_seeds() -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = rawdawg_synthesizer::presets::factory_presets().iter().take(6).filter_map(|p| serde_json::to_vec(&p.patch).ok()).collect();
     // instrument states from the fixtures (incl. the modular graph demo)
@@ -391,6 +458,7 @@ pub fn all() -> Vec<Target> {
         Target { name: "sf2", mode: Mode::Bytes, max_len: 512 * 1024, seeds: read(&fixtures().join("fixture.sf2")).into_iter().collect(), run: run_sf2 },
         Target { name: "audio", mode: Mode::Bytes, max_len: 128 * 1024, seeds: audio_seeds(), run: run_audio },
         Target { name: "expr", mode: Mode::Bytes, max_len: 4096, seeds: expr_seeds(), run: run_expr },
+        Target { name: "expr-grammar", mode: Mode::Bytes, max_len: 16, seeds: (0u64..8).map(|i| i.to_le_bytes().to_vec()).collect(), run: run_expr_grammar },
         Target { name: "patch", mode: Mode::Json, max_len: 1024 * 1024, seeds: patch_seeds(), run: run_patch },
         Target { name: "effect-state", mode: Mode::Json, max_len: 256 * 1024, seeds: effect_seeds(), run: run_effect_state },
         Target { name: "plugin-envelope", mode: Mode::Json, max_len: 256 * 1024, seeds: envelope_seeds(), run: run_envelope },

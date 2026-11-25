@@ -53,3 +53,18 @@ fn mutators_are_deterministic() {
     };
     assert_eq!(run(), run(), "same seed, same inputs: findings reproduce from (target, seed, iteration)");
 }
+
+#[test]
+fn deep_expression_nesting_compiles_or_is_rejected_on_a_small_stack() {
+    // recursion depth is bounded by the 4 KiB source limit and the instruction limit; a stack
+    // overflow would abort the process, so check the deepest inputs on a 2 MB thread
+    let cases = [
+        format!("{}x{}", "(".repeat(2040), ")".repeat(2040)),
+        format!("{}x", "-".repeat(4000)),
+        format!("{}x{}", "abs(".repeat(815), ")".repeat(815)),
+        format!("{}x{}", "min(x,".repeat(580), ")".repeat(580)),
+    ];
+    let h = std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(move || cases.iter().map(|c| rawdawg_synthesizer::expr::compile(c).is_ok()).collect::<Vec<_>>()).unwrap();
+    let results = h.join().expect("no stack overflow or panic");
+    assert_eq!(results.len(), 4);
+}
