@@ -10,6 +10,10 @@ rawDAWg is a native experimental digital audio workstation for Windows and Ubunt
 
 Pinned toolchain (`rust-toolchain.toml`, Rust 1.99.0). Ubuntu prerequisites: `libasound2-dev libxkbcommon-dev libwayland-dev pkg-config build-essential` (plus `libjack-jackd2-dev` for `--features jack`). Windows: MSVC Build Tools.
 
+With GNU Make and a POSIX shell plus `awk` (for example, Git Bash on Windows), run `make` for the target list. Use `make release` to build, `make test` to test, and `make run` to launch. Use `make fixtures` before headless verification on a fresh checkout. `make ci` runs the local build and verification workflow and writes evidence to `target/verification/`.
+
+The equivalent Cargo commands for the basic workflow are:
+
 ```sh
 cargo build --workspace --release --locked
 cargo test --workspace --locked

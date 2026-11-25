@@ -2,6 +2,7 @@
 
 use crate::assets::AssetResolver;
 use crate::schedule::Schedule;
+use rawdawg_dsp::delayline::DelayLine;
 use rawdawg_dsp::limiter::PeakLimiter;
 use rawdawg_dsp::processor::{PrepareSpec, Processor};
 use rawdawg_dsp::smooth::Smoother;
@@ -46,6 +47,16 @@ pub struct ChannelNode {
     pub mixer_index: usize,
     /// Peak meter of the last block (copied to status).
     pub peak: f32,
+    pub latency: u32,
+    pub comp_frames: usize,
+    pub comp: [DelayLine; 2],
+}
+
+/// What a processor slot refers to (slots: channels first, then inserts in mixer order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Channel(usize),
+    Insert { mixer: usize, insert: usize },
 }
 
 pub struct MixerNode {
@@ -59,6 +70,43 @@ pub struct MixerNode {
     pub buffer: AudioBuffer,
     pub peak_l: f32,
     pub peak_r: f32,
+    pub inserts: Vec<InsertNode>,
+    pub sends: Vec<SendNode>,
+    /// External sidechain input summed from `sidechain` sends.
+    pub sidechain: AudioBuffer,
+    pub sidechain_fed: bool,
+    /// Compensation delay on the main-output contribution (frames).
+    pub comp_frames: usize,
+    pub comp: [DelayLine; 2],
+    /// Latency at this node's input (max over its sources) and output (+ inserts).
+    pub latency_in: u32,
+    pub latency_out: u32,
+}
+
+/// One effect in a mixer channel's insert chain.
+pub struct InsertNode {
+    pub instance_id: InstanceId,
+    pub processor: Box<dyn Processor>,
+    pub fingerprint: u64,
+    pub carry_over: bool,
+    pub bypass: bool,
+    pub has_mix: bool,
+    pub mix: Smoother,
+    pub latency: u32,
+    /// Dry copy delayed by `latency` for wet/dry mixing and true bypass alignment.
+    pub dry: [DelayLine; 2],
+    /// Processor slot (event stage / meter index).
+    pub slot: usize,
+}
+
+/// A send edge into another mixer channel (main input or sidechain).
+pub struct SendNode {
+    pub target_index: usize,
+    pub gain: Smoother,
+    pub pre_fader: bool,
+    pub sidechain: bool,
+    pub comp_frames: usize,
+    pub comp: [DelayLine; 2],
 }
 
 /// Everything the RT thread needs; immutable topology, mutable DSP state.
@@ -80,6 +128,23 @@ pub struct Plan {
     pub meter: MeterMap,
     pub any_solo: bool,
     pub solo_mixer: Vec<bool>,
+    /// Processor slots (events and meters are addressed by slot index).
+    pub slots: Vec<Slot>,
+    pub slot_instances: Vec<InstanceId>,
+    /// Input copy for inserts (frames × 2).
+    pub fx_in: AudioBuffer,
+    /// Latency from the master's sources to its output, frames (published for UI/export).
+    pub output_latency: u32,
+}
+
+/// Processor slot layout shared by the compiler and the scheduler: channels in project
+/// order, then every insert of every mixer channel in project order.
+pub fn slot_layout(project: &Project) -> Vec<InstanceId> {
+    let mut v: Vec<InstanceId> = project.channels.iter().map(|c| c.instrument.id).collect();
+    for m in &project.mixer.channels {
+        v.extend(m.inserts.iter().map(|i| i.id));
+    }
+    v
 }
 
 fn pan_gains(pan: rawdawg_types::units::Pan) -> (f32, f32) {
@@ -139,8 +204,20 @@ pub struct CompileOutput {
     pub plan: Plan,
     /// Live table senders for instances that were (re)created; absent for carried-over ones.
     pub table_senders: Vec<(InstanceId, TableSender)>,
-    /// Fingerprints of every instrument instance in the plan.
+    /// Fingerprints of every instrument and insert instance in the plan.
     pub fingerprints: HashMap<InstanceId, u64>,
+    /// Processor slot of every instance (meters, parameter events).
+    pub slots: HashMap<InstanceId, usize>,
+    pub output_latency: u32,
+}
+
+/// Build an (unprepared) native effect processor for an insert instance.
+pub fn make_effect(inst: &rawdawg_project::Instance, owner: &str) -> Result<Box<dyn Processor>, CompileError> {
+    if !inst.type_id.as_str().starts_with(rawdawg_types::ids::native_types::FX_PREFIX) {
+        return Err(CompileError::UnsupportedInstrument(inst.type_id.as_str().to_owned()));
+    }
+    let bytes = state_bytes(inst, owner)?;
+    rawdawg_effects::make_effect(inst.type_id.as_str(), bytes.as_deref()).map_err(|e| CompileError::InstrumentState(owner.to_owned(), e))
 }
 
 /// Compile and prepare. Allocates; never called on the RT thread.
@@ -167,9 +244,54 @@ pub fn compile(
     let sr = rate.as_f64();
     let spec = PrepareSpec::new(sr, max_frames, BusLayout::Stereo);
 
+    let n_channels = project.channels.len();
+    let mut fingerprints = HashMap::new();
+    let mut slots: Vec<Slot> = (0..n_channels).map(Slot::Channel).collect();
+    let mut slot_instances: Vec<InstanceId> = project.channels.iter().map(|c| c.instrument.id).collect();
     let mut mixer = Vec::with_capacity(project.mixer.channels.len());
-    for m in &project.mixer.channels {
+    for (mi, m) in project.mixer.channels.iter().enumerate() {
         let (pl, pr) = pan_gains(m.pan);
+        let mut inserts = Vec::with_capacity(m.inserts.len());
+        for (ii, inst) in m.inserts.iter().enumerate() {
+            let owner = format!("{} / {}", m.name, inst.display_name);
+            let mut processor = make_effect(inst, &owner)?;
+            processor.prepare(&spec).map_err(|e| CompileError::Prepare(owner.clone(), e.to_string()))?;
+            let fingerprint = fingerprint_state(inst.type_id.as_str(), &inst.state);
+            let carry_over = live.get(&inst.id) == Some(&fingerprint);
+            fingerprints.insert(inst.id, fingerprint);
+            let latency = processor.latency_frames();
+            let has_mix = rawdawg_effects::info(inst.type_id.as_str()).is_some_and(|i| i.has_mix);
+            let slot = slots.len();
+            slots.push(Slot::Insert { mixer: mi, insert: ii });
+            slot_instances.push(inst.id);
+            inserts.push(InsertNode {
+                instance_id: inst.id,
+                processor,
+                fingerprint,
+                carry_over,
+                bypass: inst.bypass,
+                has_mix,
+                mix: Smoother::new(if has_mix { inst.mix } else { 1.0 }, 0.01, sr as f32),
+                latency,
+                dry: [DelayLine::new(latency as usize), DelayLine::new(latency as usize)],
+                slot,
+            });
+        }
+        let sends = m
+            .sends
+            .iter()
+            .filter_map(|snd| {
+                let target_index = project.mixer.channels.iter().position(|c| c.id == snd.target_id)?;
+                Some(SendNode {
+                    target_index,
+                    gain: Smoother::new(snd.level_db.to_linear() as f32, 0.01, sr as f32),
+                    pre_fader: snd.tap == rawdawg_project::SendTap::PreFader,
+                    sidechain: snd.sidechain,
+                    comp_frames: 0,
+                    comp: [DelayLine::new(0), DelayLine::new(0)],
+                })
+            })
+            .collect();
         mixer.push(MixerNode {
             id: m.id,
             name: m.name.clone(),
@@ -181,20 +303,36 @@ pub fn compile(
             buffer: AudioBuffer::new(2, max_frames),
             peak_l: 0.0,
             peak_r: 0.0,
+            inserts,
+            sends,
+            sidechain: AudioBuffer::new(2, max_frames),
+            sidechain_fed: false,
+            comp_frames: 0,
+            comp: [DelayLine::new(0), DelayLine::new(0)],
+            latency_in: 0,
+            latency_out: 0,
         });
     }
+    for mi in 0..mixer.len() {
+        let targets: Vec<usize> = mixer[mi].sends.iter().filter(|s| s.sidechain).map(|s| s.target_index).collect();
+        for t in targets {
+            mixer[t].sidechain_fed = true;
+        }
+    }
     let master_index = project.mixer.channels.iter().position(|c| c.id == project.mixer.master_id).ok_or_else(|| CompileError::Invalid("missing master".into()))?;
-    // topological order: depth-first post-order following output edges (validated acyclic)
+    // topological order: depth-first post-order following output and send edges (validated acyclic)
     let mut order = Vec::with_capacity(mixer.len());
     let mut visited = vec![false; mixer.len()];
+    fn feeds(m: &MixerNode, i: usize) -> bool {
+        m.output_index == Some(i) || m.sends.iter().any(|s| s.target_index == i)
+    }
     fn visit(i: usize, mixer: &[MixerNode], visited: &mut [bool], order: &mut Vec<usize>) {
         if visited[i] {
             return;
         }
         visited[i] = true;
-        // all sources feeding i first
         for (j, m) in mixer.iter().enumerate() {
-            if m.output_index == Some(i) {
+            if j != i && feeds(m, i) {
                 visit(j, mixer, visited, order);
             }
         }
@@ -206,7 +344,6 @@ pub fn compile(
 
     let mut channels = Vec::with_capacity(project.channels.len());
     let mut table_senders = Vec::new();
-    let mut fingerprints = HashMap::new();
     for c in &project.channels {
         let (mut processor, sender) = make_instrument(&c.instrument, &c.name, assets)?;
         processor.prepare(&spec).map_err(|e| CompileError::Prepare(c.name.clone(), e.to_string()))?;
@@ -231,8 +368,61 @@ pub fn compile(
             mute: c.mute,
             mixer_index,
             peak: 0.0,
+            latency: 0,
+            comp_frames: 0,
+            comp: [DelayLine::new(0), DelayLine::new(0)],
         });
     }
+    for ch in channels.iter_mut() {
+        ch.latency = ch.processor.latency_frames();
+    }
+    // Latency compensation: longest path. Every source feeding a node is delayed up to the
+    // slowest source at that summing point; intentional delays inside inserts are not compensated away.
+    let max_comp = (f64::from(limits.max_compensated_latency_seconds) * sr) as u32;
+    for &mi in &order {
+        let mut lat_in = 0u32;
+        for ch in channels.iter().filter(|c| c.mixer_index == mi) {
+            lat_in = lat_in.max(ch.latency);
+        }
+        for (j, m) in mixer.iter().enumerate() {
+            if j != mi && feeds(m, mi) {
+                lat_in = lat_in.max(m.latency_out);
+            }
+        }
+        let inserts_latency: u32 = mixer[mi].inserts.iter().map(|i| i.latency).sum();
+        mixer[mi].latency_in = lat_in;
+        mixer[mi].latency_out = lat_in.saturating_add(inserts_latency);
+        if mixer[mi].latency_out > max_comp {
+            return Err(CompileError::Limit(format!("compensated latency {} frames on {} exceeds {} frames", mixer[mi].latency_out, mixer[mi].name, max_comp)));
+        }
+    }
+    for ch in channels.iter_mut() {
+        let need = mixer[ch.mixer_index].latency_in.saturating_sub(ch.latency) as usize;
+        ch.comp_frames = need;
+        if need > 0 {
+            ch.comp = [DelayLine::new(need), DelayLine::new(need)];
+        }
+    }
+    for mi in 0..mixer.len() {
+        let lat_out = mixer[mi].latency_out;
+        if let Some(oi) = mixer[mi].output_index {
+            let need = mixer[oi].latency_in.saturating_sub(lat_out) as usize;
+            mixer[mi].comp_frames = need;
+            if need > 0 {
+                mixer[mi].comp = [DelayLine::new(need), DelayLine::new(need)];
+            }
+        }
+        let targets: Vec<usize> = mixer[mi].sends.iter().map(|s| s.target_index).collect();
+        for (si, t) in targets.into_iter().enumerate() {
+            let need = mixer[t].latency_in.saturating_sub(lat_out) as usize;
+            let snd = &mut mixer[mi].sends[si];
+            snd.comp_frames = need;
+            if need > 0 {
+                snd.comp = [DelayLine::new(need), DelayLine::new(need)];
+            }
+        }
+    }
+    let output_latency = mixer[master_index].latency_out;
     let any_solo = project.channels.iter().any(|c| c.solo) || project.mixer.channels.iter().any(|m| m.solo);
     // A mixer channel is audible under solo if it is soloed, feeds a soloed channel's path,
     // or is downstream of a soloed source. Compute the set of mixer nodes on soloed paths.
@@ -279,8 +469,13 @@ pub fn compile(
         meter,
         any_solo,
         solo_mixer,
+        slots,
+        slot_instances: slot_instances.clone(),
+        fx_in: AudioBuffer::new(2, max_frames),
+        output_latency,
     };
-    Ok(CompileOutput { plan, table_senders, fingerprints })
+    let slot_map: HashMap<InstanceId, usize> = slot_instances.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    Ok(CompileOutput { plan, table_senders, fingerprints, slots: slot_map, output_latency })
 }
 
 impl Plan {
@@ -303,6 +498,14 @@ impl Plan {
                 buffer: AudioBuffer::new(2, max_frames),
                 peak_l: 0.0,
                 peak_r: 0.0,
+                inserts: vec![],
+                sends: vec![],
+                sidechain: AudioBuffer::new(2, max_frames),
+                sidechain_fed: false,
+                comp_frames: 0,
+                comp: [DelayLine::new(0), DelayLine::new(0)],
+                latency_in: 0,
+                latency_out: 0,
             }],
             mixer_order: vec![0],
             master_index: 0,
@@ -315,11 +518,20 @@ impl Plan {
             meter: MeterMap::default(),
             any_solo: false,
             solo_mixer: vec![false],
+            slots: vec![],
+            slot_instances: vec![],
+            fx_in: AudioBuffer::new(2, max_frames),
+            output_latency: 0,
         }
     }
 
     pub fn channel_index(&self, id: ChannelId) -> Option<usize> {
         self.channels.iter().position(|c| c.id == id)
+    }
+
+    /// RT-safe, bounded linear scan: processor slot of an instance.
+    pub fn slot_of(&self, id: InstanceId) -> Option<usize> {
+        self.slot_instances.iter().position(|x| *x == id)
     }
 
     /// RT-safe, bounded: move live state from `old` into this plan's carried-over channels.
@@ -334,8 +546,14 @@ impl Plan {
             }
         }
         for node in self.mixer.iter_mut() {
-            if let Some(prev) = old.mixer.iter().find(|o| o.id == node.id) {
+            if let Some(prev) = old.mixer.iter_mut().find(|o| o.id == node.id) {
                 node.gain.snap(prev.gain.current());
+                for ins in node.inserts.iter_mut().filter(|i| i.carry_over) {
+                    if let Some(pi) = prev.inserts.iter_mut().find(|o| o.instance_id == ins.instance_id) {
+                        ins.processor.migrate_from(pi.processor.as_mut());
+                        ins.mix.snap(pi.mix.current());
+                    }
+                }
             }
         }
     }

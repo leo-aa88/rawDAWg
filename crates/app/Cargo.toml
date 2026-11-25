@@ -19,6 +19,7 @@ rawdawg-rt = { path = "../rt" }
 rawdawg-dsp = { path = "../dsp" }
 rawdawg-synthesizer = { path = "../synthesizer" }
 rawdawg-sampler = { path = "../sampler" }
+rawdawg-effects = { path = "../effects" }
 rawdawg-project = { path = "../project" }
 rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-audio-io = { path = "../audio-io" }

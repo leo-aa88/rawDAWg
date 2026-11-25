@@ -107,6 +107,11 @@ pub trait Processor: Send + std::any::Any {
     fn active_voices(&self) -> u32 {
         0
     }
+    /// Optional meter values (gain reduction in dB, correlation, …) read by the UI
+    /// off-thread; `None` when the index is not provided.
+    fn meter(&self, _index: usize) -> Option<f32> {
+        None
+    }
     /// Current normalized value of a parameter (non-RT query).
     fn param(&self, id: rawdawg_types::ParamId) -> Option<f32>;
     /// Set the base normalized value of a parameter (non-RT path; the RT path

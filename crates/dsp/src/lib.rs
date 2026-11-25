@@ -8,7 +8,9 @@
 #![allow(clippy::should_implement_trait)]
 
 pub mod analysis;
+pub mod biquad;
 pub mod buffer;
+pub mod delayline;
 pub mod envelope;
 pub mod filter;
 pub mod limiter;

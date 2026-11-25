@@ -47,7 +47,7 @@
             "sustain": 0.75
           },
           "filter": {
-            "cutoff_hz": 20000.0,
+            "cutoff_hz": 800.0,
             "enabled": true,
             "env_octaves": 0.0,
             "key_track": 0.0,
@@ -2465,6 +2465,18 @@
       "mute": false,
       "solo": false,
       "height": null
+    },
+    {
+      "id": "00000000-0000-0000-0000-00007a000003",
+      "name": "Automation",
+      "color": [
+        230,
+        201,
+        110
+      ],
+      "mute": false,
+      "solo": false,
+      "height": null
     }
   ],
   "clips": [
@@ -2500,6 +2512,17 @@
       "pattern_id": "00000000-0000-0000-0000-00009a770002",
       "source_offset_ticks": 0,
       "looped": true
+    },
+    {
+      "id": "00000000-0000-0000-0000-00000c110004",
+      "track_id": "00000000-0000-0000-0000-00007a000003",
+      "start_tick": 7680,
+      "length_ticks": 7680,
+      "muted": false,
+      "type": "automation",
+      "curve_id": "00000000-0000-0000-0000-0000a0700001",
+      "source_offset_ticks": 0,
+      "looped": false
     }
   ],
   "mixer": {
@@ -2532,7 +2555,32 @@
     ],
     "master_protection": true
   },
-  "automation": [],
+  "automation": [
+    {
+      "id": "00000000-0000-0000-0000-0000a0700001",
+      "name": "Graph synth · Cutoff",
+      "target": {
+        "instance_id": "00000000-0000-0000-0000-000014570001",
+        "param_id": 20
+      },
+      "points": [
+        {
+          "id": "00000000-0000-0000-0000-0000a0a00001",
+          "tick": 0,
+          "value": 0.25,
+          "interpolation": "linear"
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000a0a00002",
+          "tick": 7680,
+          "value": 0.95,
+          "interpolation": "linear"
+        }
+      ],
+      "mode": "read",
+      "disabled": false
+    }
+  ],
   "midi_mappings": [],
   "loop": null,
   "selected_pattern": "00000000-0000-0000-0000-00009a770001"

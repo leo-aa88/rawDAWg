@@ -223,9 +223,7 @@ impl App {
             } else if let Some(o) = self.other_mirrors.get_mut(&m.target.instance_id) {
                 o.set_param(id, v);
             }
-            if let Some(ch) = self.project.channels.iter().find(|c| c.instrument.id == m.target.instance_id).map(|c| c.id) {
-                self.send(EngineCommand::Live { channel: ch, event: TimedEvent::new(0, ev.source, ev.channel, EventKind::Param { id, value: v }) });
-            }
+            self.send(EngineCommand::Param { instance: m.target.instance_id, id, value: v });
             self.midi_dirty.insert(m.target.instance_id, Instant::now());
         }
         true

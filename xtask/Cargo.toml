@@ -12,6 +12,7 @@ rawdawg-types = { path = "../crates/types" }
 rawdawg-dsp = { path = "../crates/dsp" }
 rawdawg-synthesizer = { path = "../crates/synthesizer" }
 rawdawg-transport = { path = "../crates/transport" }
+rawdawg-effects = { path = "../crates/effects" }
 rawdawg-sampler = { path = "../crates/sampler" }
 rawdawg-project = { path = "../crates/project" }
 rawdawg-audio-engine = { path = "../crates/audio-engine" }

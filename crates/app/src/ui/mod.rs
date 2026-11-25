@@ -2,10 +2,12 @@
 //! keyboards, synth parameter panel, settings, status.
 
 mod automation;
+mod effect_panel;
 mod evolve;
 mod graph_editor;
 mod instrument_panel;
 mod keyboard;
+mod mixer;
 mod piano_roll;
 mod playlist;
 mod presets;
@@ -106,6 +108,8 @@ pub(crate) enum EditorView {
     PianoRoll,
     Synth,
     Automation,
+    Mixer,
+    Effect,
 }
 
 pub(crate) struct App {
@@ -120,6 +124,13 @@ pub(crate) struct App {
     pub record: recording::RecordState,
     pub automation: automation::AutomationState,
     pub key_target: KeyTarget,
+    pub mixer: mixer::MixerState,
+    pub effect_panel: effect_panel::EffectPanelState,
+    pub effect_editor: Option<rawdawg_types::InstanceId>,
+    /// Initial editor panel height requested by a `--ui-preset`.
+    pub editor_height_hint: Option<f32>,
+    /// Processor slot of every instance in the live plan (meters, automation).
+    pub slots: HashMap<rawdawg_types::InstanceId, usize>,
     pub midi_learn: Option<rawdawg_project::AutomationTarget>,
     pub midi_dirty: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
     persist_prefs: bool,
@@ -255,6 +266,11 @@ impl App {
             record: Default::default(),
             automation: Default::default(),
             key_target: KeyTarget::None,
+            mixer: Default::default(),
+            effect_panel: Default::default(),
+            effect_editor: None,
+            editor_height_hint: None,
+            slots: HashMap::new(),
             midi_learn: None,
             midi_dirty: HashMap::new(),
             persist_prefs,
@@ -269,6 +285,16 @@ impl App {
                 app.transport_mode = TransportMode::Song;
             }
             Some("piano-roll") => app.editor_view = EditorView::PianoRoll,
+            Some("mixer") => {
+                app.editor_view = EditorView::Mixer;
+                app.editor_height_hint = Some(620.0);
+                app.mixer.selected = app.project.mixer.channels.iter().find(|m| !m.inserts.is_empty()).map(|m| m.id);
+            }
+            Some("effect") => {
+                app.editor_height_hint = Some(520.0);
+                app.effect_editor = app.project.mixer.channels.iter().flat_map(|m| m.inserts.iter()).map(|i| i.id).next();
+                app.editor_view = EditorView::Effect;
+            }
             Some("automation") => {
                 app.editor_view = EditorView::Automation;
                 app.automation.curve = app.project.automation.first().map(|c| c.id);
@@ -320,6 +346,7 @@ impl App {
                     Ok(_) => {
                         self.plan_error = None;
                         self.live_fingerprints = out.fingerprints;
+                        self.slots = out.slots;
                         for (id, sender) in out.table_senders {
                             self.table_senders.insert(id, sender);
                         }
@@ -356,6 +383,7 @@ impl App {
     }
 
     fn rebuild_mirrors_if_needed(&mut self) {
+        self.other_mirrors.retain(|id, _| self.project.instance(*id).is_some());
         let synth_ids: Vec<_> =
             self.project.channels.iter().filter(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH).map(|c| c.instrument.id).collect();
         if synth_ids.len() != self.synth_mirrors.len() || synth_ids.iter().any(|i| !self.synth_mirrors.contains_key(i)) {
@@ -576,8 +604,11 @@ impl App {
         if f7 {
             self.editor_view = EditorView::PianoRoll;
         }
-        if f8 || f9 {
+        if f8 {
             self.editor_view = EditorView::Synth;
+        }
+        if f9 {
+            self.editor_view = EditorView::Mixer;
         }
         if esc {
             self.send(EngineCommand::Panic { source: None });
@@ -784,6 +815,10 @@ impl App {
             ui.selectable_value(&mut self.editor_view, EditorView::PianoRoll, "Piano roll").on_hover_text("F7");
             ui.selectable_value(&mut self.editor_view, EditorView::Synth, "Synth").on_hover_text("F8");
             ui.selectable_value(&mut self.editor_view, EditorView::Automation, "Automation").on_hover_text("Parameter curves (right-click a parameter → Create automation clip)");
+            ui.selectable_value(&mut self.editor_view, EditorView::Mixer, "Mixer").on_hover_text("F9");
+            if self.effect_editor.is_some() {
+                ui.selectable_value(&mut self.editor_view, EditorView::Effect, "Effect");
+            }
         });
     }
 
@@ -928,6 +963,14 @@ impl App {
                     other => other,
                 };
                 ui.label(egui::RichText::new(kind).color(theme::TEXT_SECONDARY));
+                let mixer_name = self.project.mixer_channel(ch.mixer_id).map(|m| m.name.clone()).unwrap_or_else(|| "?".into());
+                egui::ComboBox::from_id_salt(("ch-mixer", ch.id)).selected_text(format!("→ {mixer_name}")).width(90.0).show_ui(ui, |ui| {
+                    for m in &self.project.mixer.channels {
+                        if ui.selectable_label(m.id == ch.mixer_id, &m.name).clicked() && m.id != ch.mixer_id {
+                            cmds.push(Command::SetChannelMixer { id: ch.id, mixer_id: m.id });
+                        }
+                    }
+                });
                 ui.separator();
                 sequencer::step_row(self, ui, ch.id, &mut cmds);
             });
@@ -1197,9 +1240,12 @@ impl App {
             egui::Panel::left("browser").resizable(true).default_size(220.0).show(ui, |ui| self.browser(ui));
         }
         if parts & 16 != 0 {
-            egui::Panel::bottom("editor").resizable(true).default_size(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }).show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.editor_contents(ui));
-            });
+            egui::Panel::bottom("editor")
+                .resizable(true)
+                .default_size(self.editor_height_hint.unwrap_or(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.editor_contents(ui));
+                });
         }
         if parts & 32 != 0 {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -1216,6 +1262,13 @@ impl App {
             EditorView::Rack => self.rack(ui),
             EditorView::PianoRoll => piano_roll::show(self, ui),
             EditorView::Automation => automation::show(self, ui),
+            EditorView::Mixer => mixer::show(self, ui),
+            EditorView::Effect => match self.effect_editor {
+                Some(id) => effect_panel::show(self, ui, id),
+                None => {
+                    ui.label("Pick an effect in the mixer (F9).");
+                }
+            },
             EditorView::Synth => {
                 let is_synth =
                     self.selected_channel.and_then(|id| self.project.channel(id)).is_some_and(|c| c.instrument.type_id.as_str() == rawdawg_types::ids::native_types::SYNTH);

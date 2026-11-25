@@ -21,7 +21,8 @@ pub struct ScheduledNote {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScheduledParam {
     pub frame: i64,
-    pub channel_index: u16,
+    /// Processor slot (see `plan::slot_layout`).
+    pub slot: u16,
     pub id: rawdawg_types::ParamId,
     pub value: f32,
 }
@@ -137,14 +138,14 @@ impl Schedule {
             if curve.disabled || curve.mode == rawdawg_project::AutomationMode::Off || curve.points.is_empty() {
                 continue;
             }
-            let Some(ci) = project.channels.iter().position(|c| c.instrument.id == curve.target.instance_id) else { continue };
+            let Some(ci) = crate::plan::slot_layout(project).iter().position(|i| *i == curve.target.instance_id) else { continue };
             let id = rawdawg_types::ParamId(curve.target.param_id);
             let clip_end = clip.start_tick.0 + clip.length_ticks.0;
             let plen = curve.points.last().map(|p| p.tick.0).unwrap_or(0).max(1);
             let reps = if *looped { ((clip.length_ticks.0 + source_offset_ticks.0 + plen - 1) / plen).max(1) } else { 1 };
             let push = |frame: i64, value: f32, params: &mut Vec<ScheduledParam>| {
                 if params.len() < MAX_AUTOMATION_EVENTS {
-                    params.push(ScheduledParam { frame, channel_index: ci as u16, id, value: value.clamp(0.0, 1.0) });
+                    params.push(ScheduledParam { frame, slot: ci as u16, id, value: value.clamp(0.0, 1.0) });
                 }
             };
             let frame_of = |tick: i64| tempo.tick_to_frame(Tick(tick), rate);
@@ -187,7 +188,7 @@ impl Schedule {
                 }
             }
         }
-        params.sort_by_key(|p| (p.frame, p.channel_index, p.id.0));
+        params.sort_by_key(|p| (p.frame, p.slot, p.id.0));
         let (ls, le, en) = match project.r#loop {
             Some(l) if l.enabled => (tempo.tick_to_frame(l.start_tick, rate), tempo.tick_to_frame(l.end_tick, rate), true),
             _ => (0, tempo.tick_to_frame(end_tick, rate).max(1), false),

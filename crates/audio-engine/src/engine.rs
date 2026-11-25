@@ -41,6 +41,13 @@ pub struct EngineStatus {
     pub metronome: AtomicBool,
     pub recording: AtomicBool,
     pub record_overflows: Counter,
+    /// Latency from sources to the master output, frames.
+    pub output_latency: std::sync::atomic::AtomicU32,
+    /// Per processor slot meter (effects: gain reduction / correlation), −1000 = none.
+    pub slot_meters: Vec<AtomicF32>,
+    /// Per mixer channel peak (fetch_max; the UI resets).
+    pub mixer_peak_l: Vec<AtomicF32>,
+    pub mixer_peak_r: Vec<AtomicF32>,
     /// Count-in frames still to go (0 = none).
     pub count_in_frames: AtomicI64,
     /// Master output (mono sum) for the live scope.
@@ -70,6 +77,10 @@ impl Default for EngineStatus {
             tempo_bpm: AtomicF64::new(120.0),
             recording: AtomicBool::new(false),
             record_overflows: Counter::new(),
+            output_latency: std::sync::atomic::AtomicU32::new(0),
+            slot_meters: (0..512).map(|_| AtomicF32::new(-1000.0)).collect(),
+            mixer_peak_l: (0..128).map(|_| AtomicF32::new(0.0)).collect(),
+            mixer_peak_r: (0..128).map(|_| AtomicF32::new(0.0)).collect(),
             count_in_frames: AtomicI64::new(0),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
@@ -227,7 +238,7 @@ impl Engine {
     }
     /// Install a plan directly (offline renderer / tests; not used by the RT path).
     pub fn install_plan(&mut self, plan: Plan) -> Plan {
-        self.stage.ensure_channels(plan.channels.len().max(1));
+        self.stage.ensure_channels(plan.slots.len().max(1));
         let old = std::mem::replace(&mut self.plan, plan);
         self.on_plan_changed();
         old
@@ -235,6 +246,7 @@ impl Engine {
 
     fn on_plan_changed(&mut self) {
         self.status.plan_revision.store(self.plan.revision, Ordering::Relaxed);
+        self.status.output_latency.store(self.plan.output_latency, Ordering::Relaxed);
         self.status.tempo_bpm.store(self.plan.tempo.tempo_at(rawdawg_types::units::Tick(self.current_tick())).bpm().0);
         // Keep playing and keep the list of sounding scheduled notes: carried-over
         // processors still hold those voices and need their note-offs. Channels that
@@ -295,6 +307,16 @@ impl Engine {
                 }
             }
             EngineCommand::SetLoopEnabled(b) => self.loop_enabled_override = Some(b),
+            EngineCommand::Param { instance, id, value } => {
+                if let Some(slot) = self.plan.slot_of(instance) {
+                    let ev = TimedEvent::new(0, EventSource::Mouse, 0, EventKind::Param { id, value });
+                    if !self.stage.push(slot, ev) {
+                        self.status.dropped_events.incr();
+                    }
+                } else {
+                    self.status.dropped_events.incr();
+                }
+            }
             EngineCommand::SetRecording(b) => {
                 self.recording = b;
                 self.status.recording.store(b, Ordering::Relaxed);
@@ -394,14 +416,14 @@ impl Engine {
                 while i > 0 && n_seen < seen.len() {
                     i -= 1;
                     let p = self.schedule().params[i];
-                    let key = (p.channel_index, p.id.0);
+                    let key = (p.slot, p.id.0);
                     if seen[..n_seen].contains(&key) {
                         continue;
                     }
                     seen[n_seen] = key;
                     n_seen += 1;
                     let ev = TimedEvent::new(block_offset as u32, EventSource::Transport, 0, EventKind::Param { id: p.id, value: p.value });
-                    if !self.stage.push(p.channel_index as usize, ev) {
+                    if !self.stage.push(p.slot as usize, ev) {
                         self.status.dropped_events.incr();
                     }
                 }
@@ -417,7 +439,7 @@ impl Engine {
                 }
                 let at = (p.frame - start) as u32 + block_offset as u32;
                 let ev = TimedEvent::new(at, EventSource::Transport, 0, EventKind::Param { id: p.id, value: p.value });
-                if !self.stage.push(p.channel_index as usize, ev) {
+                if !self.stage.push(p.slot as usize, ev) {
                     self.status.dropped_events.incr();
                 }
             }
@@ -466,6 +488,44 @@ impl Engine {
                 if span_end == 0 {
                     break;
                 }
+            }
+        }
+    }
+
+    /// Copy a mixer channel's buffer into its send targets (main input or sidechain), with
+    /// per-send gain and latency compensation. `pre` selects the pre- or post-fader taps.
+    fn run_sends(plan: &mut Plan, mi: usize, frames: usize, pre: bool, audible: bool) {
+        let n_sends = plan.mixer[mi].sends.len();
+        for si in 0..n_sends {
+            let (target, is_pre, sidechain, comp) = {
+                let snd = &plan.mixer[mi].sends[si];
+                (snd.target_index, snd.pre_fader, snd.sidechain, snd.comp_frames)
+            };
+            if is_pre != pre || target == mi {
+                continue;
+            }
+            let (src, dst) = if mi < target {
+                let (a, b) = plan.mixer.split_at_mut(target);
+                (&mut a[mi], &mut b[0])
+            } else {
+                let (a, b) = plan.mixer.split_at_mut(mi);
+                (&mut b[0], &mut a[target])
+            };
+            let snd = &mut src.sends[si];
+            let (sl, sr) = src.buffer.stereo_mut(frames);
+            let (dl, dr) = if sidechain { dst.sidechain.stereo_mut(frames) } else { dst.buffer.stereo_mut(frames) };
+            let mute = src.mute && !pre; // a muted channel still feeds pre-fader sends
+            for i in 0..frames {
+                let g = snd.gain.next() * if mute || !audible { 0.0 } else { 1.0 };
+                let (mut l, mut r) = (sl[i] * g, sr[i] * g);
+                if comp > 0 {
+                    snd.comp[0].push(l);
+                    snd.comp[1].push(r);
+                    l = snd.comp[0].read(comp);
+                    r = snd.comp[1].read(comp);
+                }
+                dl[i] += l;
+                dr[i] += r;
             }
         }
     }
@@ -562,7 +622,6 @@ impl Engine {
         let frames = out_l.len().min(out_r.len()).min(self.max_frames);
         // 1. plan swap at block boundary (refused when retirement is full)
         if self.plans.try_swap_with(&mut self.plan, |new, old| new.migrate_from(old)) {
-            self.stage.ensure_channels(self.plan.channels.len());
             self.on_plan_changed();
         }
         let refused = self.plans.refused_swaps();
@@ -588,6 +647,9 @@ impl Engine {
         // 4. channels → mixer buffers
         for m in &mut self.plan.mixer {
             m.buffer.clear(frames);
+            if m.sidechain_fed {
+                m.sidechain.clear(frames);
+            }
         }
         let plan = &mut self.plan;
         let transport = TransportView {
@@ -615,6 +677,10 @@ impl Engine {
                 self.status.nonfinite_blocks.incr();
                 ch.processor.reset();
             }
+            if ch.comp_frames > 0 {
+                ch.comp[0].delay_block(sl, ch.comp_frames);
+                ch.comp[1].delay_block(sr, ch.comp_frames);
+            }
             let audible = !ch.mute && (!plan.any_solo || plan.solo_mixer[ch.mixer_index]);
             let mut peak = 0.0f32;
             let dest = &mut plan.mixer[ch.mixer_index].buffer;
@@ -633,17 +699,90 @@ impl Engine {
             ch.peak = peak;
             voices += u64::from(ch.processor.active_voices());
         }
-        // 5. mixer in topological order (sources before outputs)
-        for &mi in &plan.mixer_order {
-            let (out_idx, mute, audible) = {
-                let m = &plan.mixer[mi];
-                (m.output_index, m.mute, !plan.any_solo || plan.solo_mixer[mi])
-            };
+        // 5. mixer in topological order (sources before outputs): inserts → pre sends → fader → post sends → output
+        for oi in 0..plan.mixer_order.len() {
+            let mi = plan.mixer_order[oi];
+            let audible = !plan.any_solo || plan.solo_mixer[mi];
+            // inserts
+            for ii in 0..plan.mixer[mi].inserts.len() {
+                let slot = plan.mixer[mi].inserts[ii].slot;
+                let events = self.stage.events.get_mut(slot).map(|v| v.as_mut_slice()).unwrap_or(&mut []);
+                sort_events(events);
+                let (node, fx_in) = (&mut plan.mixer[mi], &mut plan.fx_in);
+                let ins = &mut node.inserts[ii];
+                let (bl, br) = node.buffer.stereo_mut(frames);
+                if ins.bypass {
+                    // true bypass keeps the chain's latency so parallel paths stay aligned
+                    if ins.latency > 0 {
+                        ins.dry[0].delay_block(bl, ins.latency as usize);
+                        ins.dry[1].delay_block(br, ins.latency as usize);
+                    }
+                    // parameters still arrive (bypassed effects keep their state current)
+                    for ev in events.iter() {
+                        if let EventKind::Param { id, value } = ev.kind {
+                            ins.processor.set_param(id, value);
+                        }
+                    }
+                    continue;
+                }
+                let (il, ir) = fx_in.stereo_mut(frames);
+                il.copy_from_slice(bl);
+                ir.copy_from_slice(br);
+                {
+                    let inputs: [&[f32]; 2] = [il, ir];
+                    let (scl, scr) = node.sidechain.stereo_mut(frames);
+                    let sidechain: [&[f32]; 2] = [scl, scr];
+                    let mut outputs: [&mut [f32]; 2] = [bl, br];
+                    let mut ctx = ProcessContext {
+                        audio: AudioBlock { frames, inputs: &inputs, outputs: &mut outputs, sidechain: if node.sidechain_fed { &sidechain } else { &[] } },
+                        events,
+                        transport: &transport,
+                    };
+                    ins.processor.process(&mut ctx);
+                }
+                let (bl, br) = node.buffer.stereo_mut(frames);
+                let bad = sanitize(bl) + sanitize(br);
+                if bad > 0 {
+                    self.status.nonfinite_blocks.incr();
+                    ins.processor.reset();
+                }
+                if ins.has_mix {
+                    let (il, ir) = fx_in.stereo_mut(frames);
+                    let lat = ins.latency as usize;
+                    for i in 0..frames {
+                        let mix = ins.mix.next();
+                        let (dl, dr) = if lat > 0 {
+                            ins.dry[0].push(il[i]);
+                            ins.dry[1].push(ir[i]);
+                            (ins.dry[0].read(lat), ins.dry[1].read(lat))
+                        } else {
+                            (il[i], ir[i])
+                        };
+                        bl[i] = dl + (bl[i] - dl) * mix;
+                        br[i] = dr + (br[i] - dr) * mix;
+                    }
+                } else if ins.latency > 0 {
+                    // keep the dry line in step for a later mix change
+                    let (il, ir) = fx_in.stereo_mut(frames);
+                    for i in 0..frames {
+                        ins.dry[0].push(il[i]);
+                        ins.dry[1].push(ir[i]);
+                    }
+                }
+                if let Some(m) = ins.processor.meter(0)
+                    && let Some(a) = self.status.slot_meters.get(slot)
+                {
+                    a.store(m);
+                }
+            }
+            // pre-fader sends (tap after the inserts)
+            Self::run_sends(plan, mi, frames, true, audible);
+            // fader / pan / meters
+            let mute = plan.mixer[mi].mute;
             let gain_pl = plan.mixer[mi].pan_l * std::f32::consts::SQRT_2;
             let gain_pr = plan.mixer[mi].pan_r * std::f32::consts::SQRT_2;
             let mut pk_l = 0.0f32;
             let mut pk_r = 0.0f32;
-            // apply gain/pan in place
             {
                 let m = &mut plan.mixer[mi];
                 let (bl, br) = m.buffer.stereo_mut(frames);
@@ -657,6 +796,14 @@ impl Engine {
                 m.peak_l = pk_l;
                 m.peak_r = pk_r;
             }
+            if let (Some(a), Some(b)) = (self.status.mixer_peak_l.get(mi), self.status.mixer_peak_r.get(mi)) {
+                a.fetch_max(pk_l);
+                b.fetch_max(pk_r);
+            }
+            // post-fader sends
+            Self::run_sends(plan, mi, frames, false, audible);
+            // main output
+            let out_idx = plan.mixer[mi].output_index;
             if let Some(oi) = out_idx
                 && oi != mi
             {
@@ -667,7 +814,12 @@ impl Engine {
                     let (a, b) = plan.mixer.split_at_mut(mi);
                     (&mut b[0], &mut a[oi])
                 };
+                let comp = src.comp_frames;
                 let (sl, sr) = src.buffer.stereo_mut(frames);
+                if comp > 0 {
+                    src.comp[0].delay_block(sl, comp);
+                    src.comp[1].delay_block(sr, comp);
+                }
                 let (dl, dr) = dst.buffer.stereo_mut(frames);
                 for i in 0..frames {
                     dl[i] += sl[i];

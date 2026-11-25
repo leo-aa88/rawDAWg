@@ -145,6 +145,44 @@ pub fn demo_song_project() -> Project {
         muted: false,
         content: ClipContent::Automation { curve_id, source_offset_ticks: Tick::ZERO, looped: false },
     });
+    // mixer: the synth goes through a "Lead" bus with an EQ, and sends to a "Wide" bus with a stereo widener
+    use rawdawg_project::{Instance, MixerChannel, Send, SendTap};
+    let master = p.mixer.master_id;
+    let lead = rawdawg_types::MixerChannelId::from_u128(0x3100_0010);
+    let wide = rawdawg_types::MixerChannelId::from_u128(0x3100_0011);
+    let eq_state: serde_json::Value =
+        serde_json::from_slice(&rawdawg_effects::preset_state(rawdawg_effects::eq::TYPE_ID, &rawdawg_effects::eq::PRESETS[1]).expect("eq preset")).expect("json");
+    let mut eq = Instance { id: rawdawg_types::InstanceId::from_u128(0xF000_0001), ..Instance::native(rawdawg_effects::eq::TYPE_ID, eq_state) };
+    eq.display_name = "Parametric EQ".into();
+    let wide_state: serde_json::Value =
+        serde_json::from_slice(&rawdawg_effects::preset_state(rawdawg_effects::stereo::TYPE_ID, &rawdawg_effects::stereo::PRESETS[2]).expect("stereo preset")).expect("json");
+    let mut widener = Instance { id: rawdawg_types::InstanceId::from_u128(0xF000_0002), ..Instance::native(rawdawg_effects::stereo::TYPE_ID, wide_state) };
+    widener.display_name = "Stereo".into();
+    p.mixer.channels.push(MixerChannel {
+        id: lead,
+        name: "Lead".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![eq],
+        sends: vec![Send { target_id: wide, level_db: rawdawg_types::units::Db(-9.0), tap: SendTap::PostFader, sidechain: false }],
+        output_id: Some(master),
+    });
+    p.mixer.channels.push(MixerChannel {
+        id: wide,
+        name: "Wide".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![widener],
+        sends: vec![],
+        output_id: Some(master),
+    });
+    p.channels[0].mixer_id = lead;
     // the synth filter must be on for the sweep to be audible
     let mut patch: rawdawg_synthesizer::Patch = serde_json::from_value(p.channels[0].instrument.state.clone()).expect("patch");
     patch.filter.enabled = true;

@@ -3404,6 +3404,7 @@ dependencies = [
  "rawdawg-audio-engine",
  "rawdawg-audio-io",
  "rawdawg-dsp",
+ "rawdawg-effects",
  "rawdawg-midi",
  "rawdawg-project",
  "rawdawg-rt",
@@ -3422,6 +3423,7 @@ dependencies = [
  "hound",
  "log",
  "rawdawg-dsp",
+ "rawdawg-effects",
  "rawdawg-project",
  "rawdawg-rt",
  "rawdawg-sampler",
@@ -3456,6 +3458,19 @@ dependencies = [
  "rawdawg-types",
  "realfft",
  "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rawdawg-effects"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rawdawg-dsp",
+ "rawdawg-rt",
+ "rawdawg-types",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -5306,6 +5321,7 @@ dependencies = [
  "rawdawg-audio-engine",
  "rawdawg-audio-io",
  "rawdawg-dsp",
+ "rawdawg-effects",
  "rawdawg-project",
  "rawdawg-sampler",
  "rawdawg-synthesizer",

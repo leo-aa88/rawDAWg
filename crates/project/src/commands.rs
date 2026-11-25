@@ -180,6 +180,10 @@ pub enum Command {
         id: MixerChannelId,
         gain_db: Db,
     },
+    RenameMixerChannel {
+        id: MixerChannelId,
+        name: String,
+    },
     SetMixerPan {
         id: MixerChannelId,
         pan: Pan,
@@ -611,6 +615,14 @@ impl Command {
                 let old = std::mem::replace(slot, clip);
                 Ok(Command::UpdateClip { clip: old })
             }
+            Command::RenameMixerChannel { id, name } => {
+                if name.trim().is_empty() {
+                    return Err(CommandError::Invalid("empty name".into()));
+                }
+                let m = p.mixer_channel_mut(id).ok_or_else(|| unknown("mixer channel", id))?;
+                let old = std::mem::replace(&mut m.name, name);
+                Ok(Command::RenameMixerChannel { id, name: old })
+            }
             Command::AddMixerChannel { channel, index } => {
                 if p.mixer_channel(channel.id).is_some() {
                     return Err(CommandError::Invalid("mixer channel id already exists".into()));
@@ -809,6 +821,7 @@ impl Command {
             Command::SetChannelMixer { .. } => "Route channel",
             Command::SetInstanceState { .. } => "Edit sound",
             Command::SetInstanceBypass { .. } => "Bypass",
+            Command::RenameMixerChannel { .. } => "Rename mixer channel",
             Command::SetInstanceMix { .. } => "Mix",
             Command::AddPattern { .. } => "Add pattern",
             Command::RemovePattern { .. } => "Delete pattern",

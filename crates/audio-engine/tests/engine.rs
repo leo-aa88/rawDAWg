@@ -610,3 +610,185 @@ fn seeking_into_automation_chases_the_current_value() {
     assert!(chased > 0.1, "chased gain is audible: {chased}");
     assert!(from_start < chased * 0.3, "at the start the curve is near 0: {from_start} vs {chased}");
 }
+
+/// Project with one synth channel feeding a bus with the given insert chain, plus an
+/// optional parallel path (second bus) so summing alignment can be measured.
+fn mixer_project(inserts: Vec<rawdawg_project::Instance>) -> (Project, rawdawg_types::MixerChannelId) {
+    use rawdawg_project::MixerChannel;
+    let mut p = project_with_notes(&[(0, 240, 69)]);
+    let master = p.mixer.master_id;
+    let bus = rawdawg_types::MixerChannelId::new();
+    p.mixer.channels.push(MixerChannel {
+        id: bus,
+        name: "Bus".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts,
+        sends: vec![],
+        output_id: Some(master),
+    });
+    (p, bus)
+}
+
+fn latency_insert(frames: u32) -> rawdawg_project::Instance {
+    let state = serde_json::json!({ "version": 1, "params": { "latency": frames as f64 / 4096.0 } });
+    rawdawg_project::Instance::native(rawdawg_effects::testfx::TYPE_ID, state)
+}
+
+fn render_song_or_pattern(p: &Project) -> Vec<f32> {
+    let (l, _, _) = render_project(p, &OfflineOptions { tail_seconds: 0.5, ..Default::default() }).unwrap();
+    l
+}
+
+fn first_onset(buf: &[f32]) -> usize {
+    buf.iter().position(|v| v.abs() > 1e-4).unwrap_or(usize::MAX)
+}
+
+#[test]
+fn insert_latency_is_compensated_at_summing_points_within_one_frame() {
+    use rawdawg_project::{Send, SendTap};
+    // A: channel → bus(latency 1000) → master ; B: same channel also sent pre-fader to a dry bus → master.
+    // Both paths must arrive at the master aligned: the dry bus gets a 1000-frame compensation.
+    let (mut p, bus) = mixer_project(vec![latency_insert(1000)]);
+    let master = p.mixer.master_id;
+    let dry = rawdawg_types::MixerChannelId::new();
+    p.mixer.channels.push(rawdawg_project::MixerChannel {
+        id: dry,
+        name: "Dry".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![],
+        sends: vec![],
+        output_id: Some(master),
+    });
+    p.channels[0].mixer_id = bus;
+    p.mixer_channel_mut(bus).unwrap().sends.push(Send { target_id: dry, level_db: rawdawg_types::units::Db::UNITY, tap: SendTap::PreFader, sidechain: false });
+    // reference: the channel straight to master (no latency anywhere)
+    let mut reference = p.clone();
+    reference.channels[0].mixer_id = master;
+    reference.mixer_channel_mut(bus).unwrap().sends.clear();
+    reference.mixer_channel_mut(bus).unwrap().inserts.clear();
+    let r = render_song_or_pattern(&reference);
+    let out = render_song_or_pattern(&p);
+    let (on_ref, on_out) = (first_onset(&r), first_onset(&out));
+    assert_eq!(on_out, on_ref + 1000, "master output is delayed by the longest path (1000 frames) once, not twice");
+    // the summed signal is exactly twice the reference (both paths aligned): compare shapes
+    let n = 20_000;
+    let err = (0..n).map(|i| (out[i + 1000] - 2.0 * r[i]).abs()).fold(0.0f32, f32::max);
+    assert!(err < 1e-4, "misaligned parallel paths: max error {err}");
+    // bypassing the latency insert keeps the alignment (true bypass retains latency)
+    let mut bypassed = p.clone();
+    bypassed.mixer_channel_mut(bus).unwrap().inserts[0].bypass = true;
+    let outb = render_song_or_pattern(&bypassed);
+    assert_eq!(first_onset(&outb), on_ref + 1000);
+    let errb = (0..n).map(|i| (outb[i + 1000] - 2.0 * r[i]).abs()).fold(0.0f32, f32::max);
+    assert!(errb < 1e-4, "bypass broke the alignment: {errb}");
+    // compile reports the output latency
+    let limits = EngineLimits::DEFAULT;
+    let out = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap();
+    assert_eq!(out.output_latency, 1000);
+    assert!(out.slots.contains_key(&p.mixer_channel(bus).unwrap().inserts[0].id));
+}
+
+#[test]
+fn sends_pre_post_and_sidechain_route_where_declared() {
+    use rawdawg_project::{Send, SendTap};
+    let (mut p, bus) = mixer_project(vec![]);
+    let master = p.mixer.master_id;
+    p.channels[0].mixer_id = bus;
+    // the bus is muted at the fader: a post-fader send carries nothing, a pre-fader send still does
+    let aux = rawdawg_types::MixerChannelId::new();
+    p.mixer.channels.push(rawdawg_project::MixerChannel {
+        id: aux,
+        name: "Aux".into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db::UNITY,
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts: vec![],
+        sends: vec![],
+        output_id: Some(master),
+    });
+    p.mixer_channel_mut(bus).unwrap().gain_db = rawdawg_types::units::Db(-60.0);
+    p.mixer_channel_mut(bus).unwrap().sends.push(Send { target_id: aux, level_db: rawdawg_types::units::Db(-6.0), tap: SendTap::PostFader, sidechain: false });
+    let post = render_song_or_pattern(&p);
+    assert!(peak(&post) < 0.01, "post-fader send follows the (−60 dB) fader: {}", peak(&post));
+    p.mixer_channel_mut(bus).unwrap().sends[0].tap = SendTap::PreFader;
+    let pre = render_song_or_pattern(&p);
+    assert!(peak(&pre) > 0.05, "pre-fader send ignores the fader");
+    // the send level (−6 dB) scales the aux contribution
+    let mut unity = p.clone();
+    unity.mixer_channel_mut(bus).unwrap().sends[0].level_db = rawdawg_types::units::Db::UNITY;
+    let u = render_song_or_pattern(&unity);
+    let ratio = rms(&pre[..10_000]) / rms(&u[..10_000]);
+    assert!((ratio - 0.501).abs() < 0.02, "{ratio}");
+    // sidechain sends do not reach the target's main input (no insert listens: silence at master)
+    p.mixer_channel_mut(bus).unwrap().sends[0].sidechain = true;
+    let sc = render_song_or_pattern(&p);
+    // only the bus's own −60 dB main output remains
+    assert!(peak(&sc) < 0.002 && peak(&sc) < peak(&pre) * 0.01, "sidechain sends never enter the audio path: {}", peak(&sc));
+}
+
+#[test]
+fn insert_effect_processes_audio_receives_params_and_carries_over() {
+    use std::collections::HashMap;
+    // EQ insert on the bus with a −24 dB bell at 440 Hz and Q 1 (note A4)
+    let eq_state =
+        serde_json::json!({ "version": 1, "params": { "band0.on": 0.0, "band1.on": 1.0, "band1.kind": 0.0, "band1.freq": 0.4475, "band1.gain": 0.0, "band1.q": 0.4675 } });
+    let (mut p, bus) = mixer_project(vec![rawdawg_project::Instance::native(rawdawg_effects::eq::TYPE_ID, eq_state)]);
+    p.channels[0].mixer_id = bus;
+    p.patterns[0].lanes[0].notes[0].duration_ticks = Tick(3840);
+    // a pure sine so the bell on the fundamental is the whole story
+    let sine =
+        rawdawg_synthesizer::Patch { layers: vec![rawdawg_synthesizer::patch::Layer::basic(rawdawg_dsp::oscillator::BasicWave::Sine)], ..rawdawg_synthesizer::Patch::default() };
+    p.channels[0].instrument.state = serde_json::to_value(&sine).unwrap();
+    let cut = render_song_or_pattern(&p);
+    let mut flat = p.clone();
+    flat.mixer_channel_mut(bus).unwrap().inserts[0].bypass = true;
+    let dry = render_song_or_pattern(&flat);
+    let ratio = rms(&cut[20_000..40_000]) / rms(&dry[20_000..40_000]);
+    assert!(ratio < 0.2, "−24 dB bell on the fundamental: ratio {ratio}");
+    // live parameter change through the engine command reaches the insert (gain back to 0 dB)
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let out = compile(&p, 1, 256, &limits, &HashMap::new(), &rawdawg_audio_engine::NoAssets).unwrap();
+    let fx_id = p.mixer_channel(bus).unwrap().inserts[0].id;
+    let live = out.fingerprints.clone();
+    engine.install_plan(out.plan);
+    handle.send(EngineCommand::Play).unwrap();
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    let mut quiet = Vec::new();
+    for _ in 0..100 {
+        l.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        quiet.extend_from_slice(&l);
+    }
+    handle.send(EngineCommand::Param { instance: fx_id, id: rawdawg_types::ParamId(rawdawg_effects::eq::band_param(1, rawdawg_effects::eq::B_GAIN)), value: 0.5 }).unwrap();
+    let mut loud = Vec::new();
+    for _ in 0..100 {
+        l.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        loud.extend_from_slice(&l);
+    }
+    assert!(rms(&loud[12_000..]) > rms(&quiet[12_000..]) * 4.0, "param event restored the level: {} vs {}", rms(&loud[12_000..]), rms(&quiet[12_000..]));
+    assert_eq!(engine.status().dropped_events.get(), 0);
+    // a plan swap with the same insert state carries the insert over (no reset glitch) and keeps playing
+    let mut p2 = p.clone();
+    p2.mixer_channel_mut(bus).unwrap().gain_db = rawdawg_types::units::Db(-1.0);
+    let second = compile(&p2, 2, 256, &limits, &live, &rawdawg_audio_engine::NoAssets).unwrap();
+    assert!(second.plan.mixer.iter().find(|m| m.id == bus).unwrap().inserts[0].carry_over);
+    assert!(handle.publish_plan(second.plan).is_ok());
+    for _ in 0..10 {
+        engine.render_block(&mut l, &mut r);
+    }
+    assert_eq!(engine.status().plan_revision.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(engine.status().active_voices.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+}

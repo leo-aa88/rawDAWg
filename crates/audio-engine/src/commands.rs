@@ -41,6 +41,12 @@ pub enum EngineCommand {
     },
     /// Echo applied live events with their project frame to the record queue.
     SetRecording(bool),
+    /// Parameter change for any processor instance (instruments or inserts).
+    Param {
+        instance: rawdawg_types::InstanceId,
+        id: rawdawg_types::ParamId,
+        value: f32,
+    },
 }
 
 /// A live event as the engine applied it, with the absolute project frame it landed on.
