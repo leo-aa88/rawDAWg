@@ -120,6 +120,15 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Fixture `demo-song.rawdawg`: the synth runs through a "Lead" bus with the EQ "Low cut 80" preset and a −9 dB post-fader send to a "Wide" bus carrying the Stereo "Wide" preset (HL-10/11 still pass through the chain).
 - Open in this slice: drag-and-drop reorder of inserts (up/down buttons instead), effect browser entry in the left browser, gain-reduction meters (dynamics arrive in slice 2). Remaining FX-01 families follow one slice each (dynamics, delays, reverbs, distortion/per-band, modulation, pitch/formant, granular, spectral), then FX-03 rack randomize/morph and the reverb decay editor.
 
+### Slice 2 — dynamics (FX-01/02 subset)
+
+250 automated tests pass, clippy clean.
+
+- `native.fx.compressor`: threshold, ratio (1–20), attack/release, knee (soft-knee quadratic), makeup, peak or RMS detector, external sidechain (uses the mixer's sidechain sends), wet/dry, gain-reduction meter; feedforward envelope follower on the detected level, static curve in dB. Presets: Gentle glue, Punchy drums, Sidechain duck, Brick. Tests: static curve (−6 dBFS, −18/4:1 → −15 dBFS ± 0.5, knee formula, makeup), attack/release reach ≈ 63 % at one time constant, RMS slower than peak on a 1 ms burst, sidechain ducking only when enabled.
+- `native.fx.limiter`: ceiling, release, lookahead 1–10 ms (fixed per plan, reported as latency), input gain, **true-peak** mode = 4× oversampled polyphase windowed-sinc detector feeding the lookahead window maximum (estimated dBTP of the input exposed as meter 1), GR meter. Presets: Transparent −1 dBTP, Loud, Safety −6. Tests: sample peaks never exceed the ceiling, limits at (not below) the ceiling, latency 48 frames at 48 kHz, inter-sample peak of a fs/4 sine (+3 dB) detected and limited to the ceiling in true-peak mode. No standards certification is claimed.
+- `native.fx.gate`: threshold, hysteresis, attack, hold, release, range (floor), external sidechain, GR meter. Presets: Drum gate, Noise cleanup, Chopper (sidechain). Tests: closed below threshold, opens on a burst, hysteresis keeps it open between the close and open points, hold then close, range floor.
+- Effect editor shows a gain-reduction bar for dynamics. All three are allocation-free on the process path and carry over across plan swaps like other inserts.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -174,7 +183,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M4 in progress (slice 1: mixer routing, inserts, EQ, stereo processor); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M4 in progress (slices 1–2: mixer routing/inserts, EQ, stereo, compressor, limiter, gate); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M4 — mixer UI and routing (buses/sends/sidechain/parallel, latency compensation), then native effects one vertical slice each (EQ, compressor, limiter, delay, reverbs, distortion, modulation, stereo, pitch/formant, granular, spectral) with presets, tests and dark editors; automation/MIDI-learn targets extended to mixer and effects.
 2. M3 leftovers when touched: rack channel reorder/duplicate, pattern-mode automation, CC capture into automation.
 3. (was) pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.

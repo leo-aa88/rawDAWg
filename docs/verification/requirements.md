@@ -6,7 +6,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 
 | ID | Status | Milestone | Evidence / notes |
 |---|---|---|---|
-| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 244 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
+| PLAT-01 | PARTIAL | M0 | Native Rust workspace builds and tests on Ubuntu x86-64 (`cargo test --workspace`: 250 tests pass). Windows build: NOT RUN locally (no MSVC here); CI job `Windows 2022` defined, not yet executed. |
 | PLAT-02 | PARTIAL | M0/M1 | CPAL enumeration, pure negotiation policy with fake-device tests (stereo/f32 preference, nearest-supported hints), explicit device/rate/buffer controls in Settings with requested vs actual, rate-limited error reporting, automatic one-time fallback to the device buffer (preferences untouched), no-device/failed states with Retry. Evidence: `rawdawg --audio-smoke` → ALSA default 48 kHz F32, 0 xruns (WSLg PulseAudio bridge, **not** real hardware; the bridge later wedged, see PROGRESS.md). Real-device matrix: BLOCKED (HW-01). |
 | PLAT-03 | PARTIAL | M0 | Dark-only visuals forced every frame (`crates/app/src/theme.rs`), no theme toggle anywhere. Manual screenshot verification: BLOCKED (GUI-01). |
 | PLAT-04 | NOT RUN | M8 | `cargo xtask package` exists and refuses with an explicit message; no packaging yet. |
@@ -65,7 +65,7 @@ Build under test: workspace at the commit recorded in `PROGRESS.md`; Rust 1.99.0
 | T-MUTATE | PASS (determinism, chaos 0, locks, 1000 seeds valid/finite, ≥90 % perceptible, descendants, breed) | `crates/synthesizer/src/mutate.rs` |
 | T-MORPH | PARTIAL (corners exact, weights sum 1, smooth midpoints, incompatible reported; crossfade/record-replay open) | `crates/synthesizer/src/morph.rs` |
 | T-SAMPLER | PASS (bounds, loop, pitch/duration, rate conversion, SF2 zones/bank/loop/warnings/malformed) | `crates/sampler/tests/sampler.rs` |
-| T-FX | PARTIAL (EQ gain/response/null/stability/state/presets, stereo width/mono/pan/correlation, allocation-free) | `crates/effects/tests/effects.rs`, `crates/dsp/src/biquad.rs` |
+| T-FX | PARTIAL (EQ, stereo, compressor curve/timing/sidechain, limiter ceiling/true-peak/latency, gate hysteresis/hold/range; presets distinct; allocation-free) | `crates/effects/tests/{effects,dynamics}.rs` |
 
 ## Manual / platform gates currently open
 

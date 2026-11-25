@@ -96,11 +96,24 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     {
         let v = a.load();
         if v > -999.0 {
-            let label = match type_id.as_str() {
-                rawdawg_effects::stereo::TYPE_ID => format!("correlation {v:+.2}"),
-                _ => format!("meter {v:.2}"),
-            };
-            ui.label(egui::RichText::new(label).monospace().color(theme::TEXT_SECONDARY));
+            match type_id.as_str() {
+                rawdawg_effects::stereo::TYPE_ID => {
+                    ui.label(egui::RichText::new(format!("correlation {v:+.2}")).monospace().color(theme::TEXT_SECONDARY));
+                }
+                rawdawg_effects::dynamics::compressor::TYPE_ID | rawdawg_effects::dynamics::limiter::TYPE_ID | rawdawg_effects::dynamics::gate::TYPE_ID => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("gain reduction {v:5.1} dB")).monospace().color(theme::TEXT_SECONDARY));
+                        let (r, _) = ui.allocate_exact_size(vec2(160.0, 10.0), Sense::hover());
+                        let painter = ui.painter();
+                        painter.rect_filled(r, 2.0, theme::BACKGROUND);
+                        let frac = (v / 24.0).clamp(0.0, 1.0);
+                        painter.rect_filled(Rect::from_min_size(pos2(r.max.x - r.width() * frac, r.min.y), vec2(r.width() * frac, r.height())), 2.0, theme::WARNING);
+                    });
+                }
+                _ => {
+                    ui.label(egui::RichText::new(format!("meter {v:.2}")).monospace().color(theme::TEXT_SECONDARY));
+                }
+            }
         }
     }
     let mut edits: Vec<(ParamId, f32, bool, bool)> = Vec::new();

@@ -4,6 +4,7 @@
 //! renderer and the plugin exports.
 
 pub mod common;
+pub mod dynamics;
 pub mod eq;
 pub mod stereo;
 pub mod testfx;
@@ -52,6 +53,9 @@ pub fn info(type_id: &str) -> Option<&'static EffectInfo> {
 pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Processor>, String> {
     let mut p: Box<dyn Processor> = match type_id {
         eq::TYPE_ID => Box::new(eq::ParametricEq::new()),
+        dynamics::compressor::TYPE_ID => Box::new(dynamics::compressor::Compressor::new()),
+        dynamics::limiter::TYPE_ID => Box::new(dynamics::limiter::Limiter::new()),
+        dynamics::gate::TYPE_ID => Box::new(dynamics::gate::Gate::new()),
         stereo::TYPE_ID => Box::new(stereo::StereoProcessor::new()),
         testfx::TYPE_ID => Box::new(testfx::LatencyTest::new()),
         other => return Err(format!("unknown native effect {other}")),
@@ -68,6 +72,9 @@ pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Proces
 pub fn presets(type_id: &str) -> &'static [Preset] {
     match type_id {
         eq::TYPE_ID => &eq::PRESETS,
+        dynamics::compressor::TYPE_ID => &dynamics::compressor::PRESETS,
+        dynamics::limiter::TYPE_ID => &dynamics::limiter::PRESETS,
+        dynamics::gate::TYPE_ID => &dynamics::gate::PRESETS,
         stereo::TYPE_ID => &stereo::PRESETS,
         _ => &[],
     }
