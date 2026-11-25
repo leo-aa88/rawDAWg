@@ -146,6 +146,14 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Tests (`crates/effects/tests/reverb.rs`): Schroeder-integrated RT60 within 35 percent of the set decay for room/hall/cathedral and the three programs measurably different; echo density (Abel–Huang) builds fastest in the plate, then room, then hall, all dense after 100 ms; spring tail present, bounded and periodic at its loop length; the high-band multiplier 0.3 lowers the tail's spectral centroid; a 30 s cathedral with every band at 2× and full diffusion stays bounded and does not grow after the input stops; shimmer raises the tail centroid versus the hall; mix 0 is a bit-exact null; a preset per type (9 presets, pairwise distinct); allocation-free in every type.
 - Open: convolution reverb with user impulse responses (next slice), listening evaluation (manual).
 
+### Slice 5 — convolution reverb (FX-01 subset)
+
+265 automated tests pass, clippy clean.
+
+- `native.fx.convolution`: uniformly partitioned FFT convolution (partition 256 frames, FFT 512, frequency-delay line; latency 256 frames reported and compensated), impulse response from a project audio asset referenced by id in the effect state (`ir_asset`), resolved off-thread at plan compile (`plan::attach_effect_assets`) — the IR is resampled to the project rate (linear, documented slight high-frequency loss), optionally trimmed of trailing silence (−80 dBFS) and normalized to unity energy, and bounded to 30 s (truncation flagged). Mono IRs feed both channels, stereo IRs map L/R; pre-delay, IR gain, low/high cut (true bypass at their extremes), mix. 3 presets. CPU cost is proportional to IR length (30 s ≈ 5 600 partitions per channel per block) and is stated in the editor.
+- Effect editor: IR chooser over the project's audio assets, "Import IR" by path into the managed assets (new `App::import_asset_only`), IR info (length, channels, resampled/truncated).
+- Tests (`crates/effects/tests/convolution.rs`): output equals direct convolution of a 1 500-tap noise IR within 1e-4 after the latency for block sizes 256/100/37/512; stereo IR channel mapping, pre-delay and gain; 44.1 kHz IR resampled to the expected length; trim to one partition; unity energy after normalization; 31 s IR truncated and flagged; no IR → silent wet path; asset reference survives state round trip; allocation-free processing with a 20 000-tap IR.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -200,7 +208,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M4 in progress (slices 1–4: mixer routing/inserts, EQ, stereo, dynamics, delay, algorithmic reverbs); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
+M4 in progress (slices 1–5: mixer routing/inserts, EQ, stereo, dynamics, delay, reverbs incl. convolution); M3 leftovers listed above, keeping these M2 leftovers on the list: incompatible-topology morph via bounded parallel corner instances with crossfade and CPU admission; morph gesture → automation once lanes exist.
 1. M4 — mixer UI and routing (buses/sends/sidechain/parallel, latency compensation), then native effects one vertical slice each (EQ, compressor, limiter, delay, reverbs, distortion, modulation, stereo, pitch/formant, granular, spectral) with presets, tests and dark editors; automation/MIDI-learn targets extended to mixer and effects.
 2. M3 leftovers when touched: rack channel reorder/duplicate, pattern-mode automation, CC capture into automation.
 3. (was) pattern/song transport UI, step rack and piano roll (same note model), snap/selection/clipboard/velocity/scale/chords, metronome count-in, tempo/meter editing, live recording with timestamp mapping and quantization, playlist with clips, MIDI learn.

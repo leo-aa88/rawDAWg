@@ -211,13 +211,26 @@ pub struct CompileOutput {
     pub output_latency: u32,
 }
 
-/// Build an (unprepared) native effect processor for an insert instance.
-pub fn make_effect(inst: &rawdawg_project::Instance, owner: &str) -> Result<Box<dyn Processor>, CompileError> {
+/// Build an (unprepared) native effect processor for an insert instance. Effects that
+/// reference project assets (convolution impulse responses) get them resolved here, off-thread.
+pub fn make_effect(inst: &rawdawg_project::Instance, owner: &str, _assets: &dyn AssetResolver) -> Result<Box<dyn Processor>, CompileError> {
     if !inst.type_id.as_str().starts_with(rawdawg_types::ids::native_types::FX_PREFIX) {
         return Err(CompileError::UnsupportedInstrument(inst.type_id.as_str().to_owned()));
     }
     let bytes = state_bytes(inst, owner)?;
     rawdawg_effects::make_effect(inst.type_id.as_str(), bytes.as_deref()).map_err(|e| CompileError::InstrumentState(owner.to_owned(), e))
+}
+
+/// Resolve asset-backed effect data after `prepare` (the IR is partitioned at the final rate).
+pub fn attach_effect_assets(p: &mut dyn Processor, assets: &dyn AssetResolver) {
+    if let Some(c) = p.as_any_mut().downcast_mut::<rawdawg_effects::convolution::Convolution>() {
+        let ir = c
+            .ir_asset_id()
+            .and_then(rawdawg_types::AssetId::from_hex)
+            .and_then(|id| assets.sample(&id))
+            .map(|s| std::sync::Arc::new(rawdawg_effects::convolution::ImpulseResponse { name: s.name.clone(), sample_rate: s.sample_rate, channels: s.channels.clone() }));
+        c.set_ir(ir);
+    }
 }
 
 /// Compile and prepare. Allocates; never called on the RT thread.
@@ -254,8 +267,9 @@ pub fn compile(
         let mut inserts = Vec::with_capacity(m.inserts.len());
         for (ii, inst) in m.inserts.iter().enumerate() {
             let owner = format!("{} / {}", m.name, inst.display_name);
-            let mut processor = make_effect(inst, &owner)?;
+            let mut processor = make_effect(inst, &owner, assets)?;
             processor.prepare(&spec).map_err(|e| CompileError::Prepare(owner.clone(), e.to_string()))?;
+            attach_effect_assets(processor.as_mut(), assets);
             let fingerprint = fingerprint_state(inst.type_id.as_str(), &inst.state);
             let carry_over = live.get(&inst.id) == Some(&fingerprint);
             fingerprints.insert(inst.id, fingerprint);

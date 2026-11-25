@@ -19,6 +19,7 @@ pub(crate) struct EffectPanelState {
     tap_drag: Option<usize>,
     /// Reverb decay-shape band being dragged.
     shape_drag: Option<usize>,
+    pub ir_path: String,
 }
 
 fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
@@ -26,12 +27,13 @@ fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
         return Ok(());
     }
     let inst = app.project.instance(instance_id).cloned().ok_or("the effect no longer exists")?;
-    let mut p = rawdawg_audio_engine::plan::make_effect(&inst, &inst.display_name).map_err(|e| e.to_string())?;
+    let mut p = rawdawg_audio_engine::plan::make_effect(&inst, &inst.display_name, &app.assets).map_err(|e| e.to_string())?;
     let sr = match &app.audio {
         AudioState::Running(s) => f64::from(s.sample_rate.0),
         _ => 48_000.0,
     };
     let _ = p.prepare(&rawdawg_dsp::processor::PrepareSpec::new(sr, 256, rawdawg_dsp::BusLayout::Stereo));
+    rawdawg_audio_engine::plan::attach_effect_assets(p.as_mut(), &app.assets);
     app.other_mirrors.insert(instance_id, p);
     Ok(())
 }
@@ -129,6 +131,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     }
     if type_id == rawdawg_effects::reverb::TYPE_ID {
         reverb_editor(app, ui, instance_id, &mut edits);
+    }
+    if type_id == rawdawg_effects::convolution::TYPE_ID {
+        convolution_editor(app, ui, instance_id, &mut cmds);
     }
     let descriptors: Vec<ParamDescriptor> = app.other_mirrors[&instance_id].descriptors().iter().filter(|d| !d.flags.hidden).copied().collect();
     let simple_only = !app.effect_panel.advanced && type_id == rawdawg_effects::eq::TYPE_ID;
@@ -607,4 +612,84 @@ fn reverb_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edit
         edits.push((d.id, d.to_normalized(f64::from(shape[b])), false, true));
     }
     ui.label(egui::RichText::new("Drag a band up to let it ring longer, down to damp it faster").color(theme::TEXT_SECONDARY).small());
+}
+
+// ---------------------------------------------------------------------------
+// Convolution: impulse response chooser (project audio assets, import by path)
+
+fn convolution_editor(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, cmds: &mut Vec<Command>) {
+    use rawdawg_effects::convolution::Convolution;
+    let (current, info) = {
+        let m = app.other_mirrors.get_mut(&instance_id).expect("mirror");
+        let c = m.as_any_mut().downcast_mut::<Convolution>().expect("convolution mirror");
+        (c.ir_asset_id().map(|s| s.to_owned()), c.info().cloned())
+    };
+    let mut choose: Option<Option<String>> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Impulse response");
+        let label = match &info {
+            Some(i) => format!("{} · {:.2} s · {} ch", i.name, i.used_frames as f32 / app.audio_sample_rate(), i.channels),
+            None if current.is_some() => "missing asset".to_owned(),
+            None => "none".to_owned(),
+        };
+        egui::ComboBox::from_id_salt(("ir-asset", instance_id)).selected_text(label).width(320.0).show_ui(ui, |ui| {
+            if ui.selectable_label(current.is_none(), "(none)").clicked() {
+                choose = Some(None);
+            }
+            for a in app.project.assets.iter().filter(|a| matches!(a.kind, rawdawg_project::AssetKind::Audio | rawdawg_project::AssetKind::ImpulseResponse)) {
+                let id = a.id.to_string();
+                if ui
+                    .selectable_label(
+                        current.as_deref() == Some(id.as_str()),
+                        format!("{} ({:.1} s)", a.source_name, a.frames.unwrap_or(0) as f32 / a.original_rate_hz.unwrap_or(48_000) as f32),
+                    )
+                    .clicked()
+                {
+                    choose = Some(Some(id));
+                }
+            }
+        });
+        ui.add(egui::TextEdit::singleline(&mut app.effect_panel.ir_path).hint_text("/path/to/impulse.wav").desired_width(220.0));
+        if ui.button("Import IR").on_hover_text("Copies the file into the project assets and uses it here").clicked() && !app.effect_panel.ir_path.trim().is_empty() {
+            let path = std::path::PathBuf::from(app.effect_panel.ir_path.trim());
+            match app.import_asset_only(&path) {
+                Ok(id) => choose = Some(Some(id)),
+                Err(e) => app.status_line = e,
+            }
+        }
+        if let Some(i) = &info {
+            let mut notes = Vec::new();
+            if i.resampled {
+                notes.push(format!("resampled from {} Hz", i.source_rate));
+            }
+            if i.truncated {
+                notes.push("truncated to 30 s".to_owned());
+            }
+            if !notes.is_empty() {
+                ui.label(egui::RichText::new(notes.join(" · ")).color(theme::WARNING));
+            }
+        }
+    });
+    ui.label(
+        egui::RichText::new("Latency 256 frames (compensated). Mono IRs feed both channels, stereo IRs map left/right. Long IRs cost CPU: 30 s ≈ 5 600 partitions per channel.")
+            .color(theme::TEXT_SECONDARY)
+            .small(),
+    );
+    if let Some(sel) = choose {
+        let Some(inst) = app.project.instance(instance_id).cloned() else { return };
+        let mut state = inst.state.clone();
+        if state.is_null() || !state.is_object() {
+            state = serde_json::json!({ "version": 1, "params": {} });
+        }
+        if let Some(obj) = state.as_object_mut() {
+            obj.insert("ir_asset".into(), sel.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        }
+        if let Some(m) = app.other_mirrors.get_mut(&instance_id)
+            && let Ok(bytes) = serde_json::to_vec(&state)
+        {
+            let _ = m.load_state(&bytes);
+            rawdawg_audio_engine::plan::attach_effect_assets(m.as_mut(), &app.assets);
+        }
+        cmds.push(Command::SetInstanceState { instance_id, state_version: 1, state });
+    }
 }

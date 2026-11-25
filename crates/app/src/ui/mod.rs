@@ -407,6 +407,25 @@ impl App {
     }
 
     /// Import a WAV/FLAC/MP3 as a sampler channel or an .sf2 as a SoundFont channel.
+    /// Sample rate used for display when audio is off.
+    pub(crate) fn audio_sample_rate(&self) -> f32 {
+        match &self.audio {
+            AudioState::Running(s) => s.sample_rate.0 as f32,
+            _ => 48_000.0,
+        }
+    }
+
+    /// Import a file into the project's managed assets (no channel). Returns the asset id.
+    pub(crate) fn import_asset_only(&mut self, path: &std::path::Path) -> Result<String, String> {
+        let dir = self.working_dir().ok_or("No writable folder for assets")?;
+        let asset = rawdawg_project::assets::import_asset(&dir, path).map_err(|e| format!("Import failed: {e}"))?;
+        let id = asset.id.to_string();
+        if self.project.assets.iter().all(|a| a.id != asset.id) {
+            self.apply(Command::AddAsset { asset });
+        }
+        Ok(id)
+    }
+
     pub(crate) fn import_file_as_channel(&mut self, path: &std::path::Path) {
         let Some(dir) = self.working_dir() else {
             self.status_line = "No writable folder for assets".into();

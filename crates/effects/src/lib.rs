@@ -4,6 +4,7 @@
 //! renderer and the plugin exports.
 
 pub mod common;
+pub mod convolution;
 pub mod delay;
 pub mod dynamics;
 pub mod eq;
@@ -57,6 +58,7 @@ pub fn make_effect(type_id: &str, state: Option<&[u8]>) -> Result<Box<dyn Proces
         eq::TYPE_ID => Box::new(eq::ParametricEq::new()),
         delay::TYPE_ID => Box::new(delay::Delay::new()),
         reverb::TYPE_ID => Box::new(reverb::Reverb::new()),
+        convolution::TYPE_ID => Box::new(convolution::Convolution::new()),
         dynamics::compressor::TYPE_ID => Box::new(dynamics::compressor::Compressor::new()),
         dynamics::limiter::TYPE_ID => Box::new(dynamics::limiter::Limiter::new()),
         dynamics::gate::TYPE_ID => Box::new(dynamics::gate::Gate::new()),
@@ -78,6 +80,7 @@ pub fn presets(type_id: &str) -> &'static [Preset] {
         eq::TYPE_ID => &eq::PRESETS,
         delay::TYPE_ID => &delay::PRESETS,
         reverb::TYPE_ID => &reverb::PRESETS,
+        convolution::TYPE_ID => &convolution::PRESETS,
         dynamics::compressor::TYPE_ID => &dynamics::compressor::PRESETS,
         dynamics::limiter::TYPE_ID => &dynamics::limiter::PRESETS,
         dynamics::gate::TYPE_ID => &dynamics::gate::PRESETS,
