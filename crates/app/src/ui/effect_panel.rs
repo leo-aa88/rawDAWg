@@ -22,6 +22,8 @@ pub(crate) struct EffectPanelState {
     pub ir_path: String,
     /// Multiband paint gesture in progress.
     paint_active: bool,
+    /// Path field of the effect preset file menu.
+    pub preset_path: String,
 }
 
 pub(crate) fn ensure_mirror(app: &mut App, instance_id: InstanceId) -> Result<(), String> {
@@ -82,6 +84,40 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                 }
             });
         }
+        ui.menu_button("Preset file…", |ui| {
+            ui.label(egui::RichText::new("Save or load this effect's settings as a .rawdawgpreset").small().color(theme::TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut app.effect_panel.preset_path).hint_text("/path/to/name.rawdawgpreset").desired_width(320.0));
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() && !app.effect_panel.preset_path.trim().is_empty() {
+                    let path = std::path::PathBuf::from(app.effect_panel.preset_path.trim()).with_extension("rawdawgpreset");
+                    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "preset".into());
+                    let state: serde_json::Value =
+                        app.other_mirrors.get(&instance_id).map(|m| serde_json::from_slice(&m.save_state()).unwrap_or(serde_json::Value::Null)).unwrap_or(serde_json::Value::Null);
+                    let manifest = rawdawg_project::preset::PresetManifest::new_effect(&name, &type_id, state);
+                    app.status_line = match rawdawg_project::preset::write_preset(&path, &manifest, &[]) {
+                        Ok(()) => format!("Saved effect preset {}", path.display()),
+                        Err(e) => format!("Could not save the preset: {e}"),
+                    };
+                    ui.close();
+                }
+                if ui.button("Load").clicked() && !app.effect_panel.preset_path.trim().is_empty() {
+                    let path = std::path::PathBuf::from(app.effect_panel.preset_path.trim());
+                    match rawdawg_project::preset::read_preset(&path) {
+                        Ok(f) if f.manifest.kind == "effect" && f.manifest.type_id == type_id => {
+                            let state = f.manifest.state.clone();
+                            if let (Some(m), Ok(bytes)) = (app.other_mirrors.get_mut(&instance_id), serde_json::to_vec(&state)) {
+                                let _ = m.load_state(&bytes);
+                            }
+                            cmds.push(Command::SetInstanceState { instance_id, state_version: 1, state });
+                            app.status_line = format!("Loaded effect preset “{}”", f.manifest.name);
+                        }
+                        Ok(f) => app.status_line = format!("That preset is for {} ({}), not this effect", f.manifest.type_id, f.manifest.kind),
+                        Err(e) => app.status_line = format!("Could not load the preset: {e}"),
+                    }
+                    ui.close();
+                }
+            });
+        });
         if ui.button("Reset").on_hover_text("All parameters to their defaults (undoable)").clicked()
             && let Some(m) = app.other_mirrors.get_mut(&instance_id)
         {

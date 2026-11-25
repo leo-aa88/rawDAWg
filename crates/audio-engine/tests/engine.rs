@@ -1206,3 +1206,60 @@ fn streamed_clips_play_live_recover_after_a_loop_wrap_and_render_allocation_free
     drop(engine);
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
+
+#[test]
+fn third_party_instances_compile_as_stand_ins_and_their_state_is_preserved() {
+    use rawdawg_project::{Instance, PluginFormat};
+    let root = std::env::temp_dir().join(format!("rawdawg-missing-plugin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("P.rawdawg");
+    let mut p = project_with_notes(&[(0, 960, 69)]);
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    // a CLAP insert on the master with an opaque state file, and a VST3 instrument channel
+    let blob = vec![7u8, 1, 9, 3, 0, 255, 42];
+    let blob_name = format!("plugin-state/{}.bin", rawdawg_project::preset::sha256_hex(&blob));
+    std::fs::write(dir.join(&blob_name), &blob).unwrap();
+    let mut clap = Instance::native("com.example.fx", serde_json::json!({ "note": "opaque" }));
+    clap.format = PluginFormat::Clap;
+    clap.display_name = "Example FX".into();
+    clap.opaque_state_path = Some(blob_name.clone());
+    let clap_id = clap.id;
+    let master = p.mixer.master_id;
+    p.mixer.channels.iter_mut().find(|m| m.id == master).unwrap().inserts.push(clap);
+    let mut vst = Instance::native("com.example.synth", serde_json::json!({ "preset": 3 }));
+    vst.format = PluginFormat::Vst3;
+    let mix_id = p.channels[0].mixer_id;
+    p.channels.push(rawdawg_project::Channel {
+        id: rawdawg_types::ChannelId::new(),
+        name: "Ext".into(),
+        color: None,
+        instrument: vst,
+        gain_db: rawdawg_types::units::Db(0.0),
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        mixer_id: mix_id,
+    });
+    rawdawg_project::validate(&p).unwrap();
+    let limits = EngineLimits::DEFAULT;
+    let out = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap();
+    assert_eq!(out.missing_plugins.len(), 2, "{:?}", out.missing_plugins);
+    assert!(out.missing_plugins.iter().any(|m| m.contains("Example FX") && m.contains("Clap")));
+    // the native synth still sounds through the pass-through insert; the external instrument is silent
+    let (l, _, stats) = render_project(&p, &OfflineOptions { tail_seconds: 0.0, ..Default::default() }).unwrap();
+    assert_eq!(stats.nonfinite_blocks, 0);
+    assert!(rms(&l[2000..20_000]) > 0.05, "stand-in insert passes audio through");
+    assert!((dominant_frequency(&l[2000..20_000], 48_000.0) - 440.0).abs() < 1.0);
+    // state round trips through save/load and Save As, bytes untouched
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    let back = rawdawg_project::load_project_dir(&dir).unwrap();
+    let ins = back.mixer_channel(master).unwrap().inserts.iter().find(|i| i.id == clap_id).unwrap();
+    assert_eq!(ins.opaque_state_path.as_deref(), Some(blob_name.as_str()));
+    assert_eq!(ins.state, serde_json::json!({ "note": "opaque" }));
+    assert_eq!(ins.format, PluginFormat::Clap);
+    let copy = root.join("Copy.rawdawg");
+    rawdawg_project::save_as(Some(&dir), &copy, &back).unwrap();
+    assert_eq!(std::fs::read(copy.join(&blob_name)).unwrap(), blob, "opaque state copied by Save As");
+    let _ = std::fs::remove_dir_all(&root);
+}

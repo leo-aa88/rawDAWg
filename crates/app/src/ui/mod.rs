@@ -152,6 +152,7 @@ pub(crate) struct App {
     pub midi_activity: u64,
     pub selected_channel: Option<ChannelId>,
     pub show_settings: bool,
+    pub show_help: bool,
     pub(crate) export: export::ExportState,
     pub(crate) files: project_files::ProjectFilesState,
     /// Browser search text (filters samples and effects).
@@ -259,6 +260,7 @@ impl App {
             midi_activity: 0,
             selected_channel,
             show_settings: false,
+            show_help: false,
             export: export::ExportState::default(),
             files: project_files::ProjectFilesState::default(),
             browser_search: String::new(),
@@ -407,6 +409,9 @@ impl App {
                         self.plan_error = None;
                         // the old worker stops when replaced; the retired plan's streams go with it
                         self.stream_worker = out.stream_worker;
+                        if !out.missing_plugins.is_empty() {
+                            self.status_line = format!("{} plugin(s) not available (state preserved): {}", out.missing_plugins.len(), out.missing_plugins.join("; "));
+                        }
                         self.live_fingerprints = out.fingerprints;
                         self.slots = out.slots;
                         for (id, sender) in out.table_senders {
@@ -448,6 +453,13 @@ impl App {
             Ok(()) => {
                 self.rebuild_mirrors_if_needed();
                 self.recompile();
+                if !matches!(self.audio, AudioState::Running(_)) {
+                    // no plan is compiled without a device: report stand-ins from the model instead
+                    let missing = missing_plugin_notes(&self.project);
+                    if !missing.is_empty() {
+                        self.status_line = format!("{} plugin(s) not available (state preserved): {}", missing.len(), missing.join("; "));
+                    }
+                }
             }
             Err(e) => self.status_line = format!("Edit rejected: {e}"),
         }
@@ -1384,6 +1396,10 @@ impl App {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("User guide (offline)").clicked() {
+                    self.show_help = true;
+                    ui.close();
+                }
                 ui.label(format!("{PRODUCT_NAME} {VERSION}"));
                 ui.label(TAGLINE);
                 ui.separator();
@@ -1394,6 +1410,9 @@ impl App {
         });
     }
 }
+
+/// The offline user guide (docs/USER_GUIDE.md), shown from Help.
+const USER_GUIDE: &str = include_str!("../../../../docs/USER_GUIDE.md");
 
 impl App {
     /// `--screenshot`: ask the viewport for a capture once, save it as PNG, then close.
@@ -1580,6 +1599,28 @@ impl App {
             export::show(self, ui.ctx());
         }
         project_files::show(self, ui.ctx());
+        if self.show_help {
+            let mut open = self.show_help;
+            egui::Window::new("User guide").open(&mut open).default_size([640.0, 520.0]).resizable(true).show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for line in USER_GUIDE.lines() {
+                        if let Some(h) = line.strip_prefix("# ") {
+                            ui.heading(h);
+                        } else if let Some(h) = line.strip_prefix("## ") {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(h).strong().size(16.0));
+                        } else if let Some(h) = line.strip_prefix("### ") {
+                            ui.label(egui::RichText::new(h).strong());
+                        } else if line.trim().is_empty() {
+                            ui.add_space(4.0);
+                        } else {
+                            ui.label(line.replace("**", "").replace('`', ""));
+                        }
+                    }
+                });
+            });
+            self.show_help = open;
+        }
     }
 
     fn editor_contents(&mut self, ui: &mut egui::Ui) {
@@ -1632,4 +1673,23 @@ impl App {
         }
         self.save_prefs();
     }
+}
+
+/// Third-party instances the project references (no host yet): shown as preserved stand-ins.
+pub(crate) fn missing_plugin_notes(project: &Project) -> Vec<String> {
+    let label = |i: &rawdawg_project::Instance, owner: &str| {
+        format!("{owner}: {} ({:?}) is not available — its state is preserved", if i.display_name.is_empty() { i.type_id.as_str() } else { i.display_name.as_str() }, i.format)
+    };
+    let mut out = Vec::new();
+    for c in &project.channels {
+        if c.instrument.format != rawdawg_project::PluginFormat::Native {
+            out.push(label(&c.instrument, &c.name));
+        }
+    }
+    for m in &project.mixer.channels {
+        for i in m.inserts.iter().filter(|i| i.format != rawdawg_project::PluginFormat::Native) {
+            out.push(label(i, &m.name));
+        }
+    }
+    out
 }

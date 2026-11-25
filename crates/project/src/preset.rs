@@ -57,6 +57,63 @@ pub struct PresetManifest {
 }
 
 impl PresetManifest {
+    /// Manifest for one native effect's state.
+    pub fn new_effect(name: &str, type_id: &str, state: Value) -> Self {
+        Self {
+            schema_version: PRESET_SCHEMA_VERSION,
+            preset_id: rawdawg_types::PresetId::new(),
+            kind: "effect".into(),
+            type_id: type_id.to_owned(),
+            state_version: 1,
+            name: name.to_owned(),
+            author: String::new(),
+            tags: vec![],
+            description: String::new(),
+            state,
+            assets: vec![],
+            mutation: None,
+            generator: format!("{} {}", rawdawg_types::PRODUCT_NAME, rawdawg_types::VERSION),
+        }
+    }
+
+    /// Manifest for an insert chain: `state` is `{"inserts": [{type_id, display_name, state, bypass, mix}, …]}`.
+    pub fn new_rack(name: &str, inserts: &[crate::model::Instance]) -> Self {
+        let list: Vec<Value> = inserts
+            .iter()
+            .map(|i| serde_json::json!({ "type_id": i.type_id.as_str(), "display_name": i.display_name, "state": i.state, "bypass": i.bypass, "mix": i.mix }))
+            .collect();
+        Self {
+            schema_version: PRESET_SCHEMA_VERSION,
+            preset_id: rawdawg_types::PresetId::new(),
+            kind: "rack".into(),
+            type_id: "native.rack".into(),
+            state_version: 1,
+            name: name.to_owned(),
+            author: String::new(),
+            tags: vec![],
+            description: String::new(),
+            state: serde_json::json!({ "inserts": list }),
+            assets: vec![],
+            mutation: None,
+            generator: format!("{} {}", rawdawg_types::PRODUCT_NAME, rawdawg_types::VERSION),
+        }
+    }
+
+    /// Inserts described by a `rack` manifest (fresh instance ids).
+    pub fn rack_inserts(&self) -> Vec<crate::model::Instance> {
+        let Some(list) = self.state.get("inserts").and_then(|v| v.as_array()) else { return Vec::new() };
+        list.iter()
+            .filter_map(|v| {
+                let type_id = v.get("type_id")?.as_str()?;
+                let mut inst = crate::model::Instance::native(type_id, v.get("state").cloned().unwrap_or(Value::Null));
+                inst.display_name = v.get("display_name").and_then(|d| d.as_str()).unwrap_or("").to_owned();
+                inst.bypass = v.get("bypass").and_then(|b| b.as_bool()).unwrap_or(false);
+                inst.mix = v.get("mix").and_then(|m| m.as_f64()).unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+                Some(inst)
+            })
+            .collect()
+    }
+
     /// Manifest for a flagship synth patch (`state` must be the serialized patch).
     pub fn new_synth<T: Serialize>(name: &str, patch: &T, tags: &[String]) -> Self {
         let state = serde_json::to_value(patch).unwrap_or(Value::Null);

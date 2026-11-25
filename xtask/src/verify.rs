@@ -857,6 +857,106 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             ))
         },
     ));
+    checks.push(check(
+        "E2E-06 (headless subset) save/reopen full project, autosave + forced-termination recovery, move to another folder, missing plugin and asset preservation, relink; native renders compared",
+        &["DATA-01", "DATA-02", "CORE-07"],
+        || {
+            use rawdawg_audio_engine::commands::TransportMode;
+            use rawdawg_project::{Command, History, Instance, PluginFormat};
+            let base = out.join("e2e-06");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base)?;
+            // 1. the full song demo saved into a fresh folder, reopened, renders identically
+            let src = root.join("fixtures/demo-song.rawdawg");
+            let mut p = rawdawg_project::load_project_dir(&src)?;
+            let dir = base.join("Song.rawdawg");
+            rawdawg_project::save_as(Some(&src), &dir, &p)?;
+            let opts = |d: &std::path::Path| OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, project_dir: Some(d.to_path_buf()), ..Default::default() };
+            let (ref_l, _, _) = render_project(&p, &opts(&src))?;
+            let reopened = rawdawg_project::load_project_dir(&dir)?;
+            let (l1, _, _) = render_project(&reopened, &opts(&dir))?;
+            if l1 != ref_l {
+                bail!("render differs after Save As + reopen");
+            }
+            // 2. forced termination: an autosave with newer edits, then "crash" (no save); recovery offered and recoverable
+            let mut history = History::new();
+            let lock = rawdawg_project::lock::ProjectLock::acquire(&dir, false)?;
+            history.apply(&mut p, Command::RenameProject { name: "edited after save".into() })?;
+            p.revision = history.revision();
+            let auto = rawdawg_project::autosave(&dir, &p)?;
+            std::mem::forget(lock); // the lock file stays behind as after a crash
+            let cands = rawdawg_project::recovery_candidates(&dir);
+            if cands.len() != 1 || cands[0].path != auto {
+                bail!("expected one recovery candidate, got {cands:?}");
+            }
+            let recovered = rawdawg_project::persist::parse_project(&std::fs::read(&cands[0].path)?)?;
+            if recovered.name != "edited after save" || rawdawg_project::load_project_dir(&dir)?.name == "edited after save" {
+                bail!("recovery candidate does not carry the unsaved edit, or the saved manifest was touched");
+            }
+            // the stale lock from the crashed process (our own pid) is reclaimed on reopen
+            let relock = rawdawg_project::lock::ProjectLock::acquire(&dir, false)?;
+            drop(relock);
+            rawdawg_project::persist::clear_autosaves(&dir);
+            // 3. move the folder: identical model and render from the new location
+            let moved = base.join("moved").join("Song.rawdawg");
+            std::fs::create_dir_all(moved.parent().unwrap())?;
+            std::fs::rename(&dir, &moved)?;
+            let m = rawdawg_project::load_project_dir(&moved)?;
+            if m != reopened {
+                bail!("model differs after moving the folder");
+            }
+            let (l2, _, _) = render_project(&m, &opts(&moved))?;
+            if l2 != ref_l {
+                bail!("render differs after moving the folder");
+            }
+            // 4. a missing third-party plugin: stand-in in the plan, state and opaque blob preserved across save/load/save-as
+            let mut q = m.clone();
+            let blob = b"opaque-plugin-state".to_vec();
+            let blob_rel = format!("plugin-state/{}.bin", rawdawg_project::preset::sha256_hex(&blob));
+            std::fs::write(moved.join(&blob_rel), &blob)?;
+            let mut ext = Instance::native("com.example.fx", serde_json::json!({ "k": 1 }));
+            ext.format = PluginFormat::Vst3;
+            ext.display_name = "External".into();
+            ext.opaque_state_path = Some(blob_rel.clone());
+            let ext_id = ext.id;
+            let master = q.mixer.master_id;
+            history.apply(&mut q, Command::AddInsert { mixer_id: master, instance: ext, index: None })?;
+            let compiled = rawdawg_audio_engine::compile(&q, 1, 256, &rawdawg_types::limits::EngineLimits::DEFAULT, &std::collections::HashMap::new(), &rawdawg_audio_engine::NoAssets)?;
+            if compiled.missing_plugins.len() != 1 {
+                bail!("expected one missing plugin, got {:?}", compiled.missing_plugins);
+            }
+            let (l3, _, _) = render_project(&q, &opts(&moved))?;
+            if l3 != ref_l {
+                bail!("a pass-through stand-in must not change the render");
+            }
+            rawdawg_project::save_project_dir(&moved, &q)?;
+            let copy = base.join("Copy.rawdawg");
+            rawdawg_project::save_as(Some(&moved), &copy, &rawdawg_project::load_project_dir(&moved)?)?;
+            let c = rawdawg_project::load_project_dir(&copy)?;
+            let ins = c.mixer_channel(master).unwrap().inserts.iter().find(|i| i.id == ext_id).unwrap();
+            if ins.opaque_state_path.as_deref() != Some(blob_rel.as_str()) || std::fs::read(copy.join(&blob_rel))? != blob || ins.state != serde_json::json!({ "k": 1 }) {
+                bail!("third-party state not preserved through save/load/save-as");
+            }
+            // 5. a missing asset renders silent (not an error) and relinks by hash
+            let asset = c.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).cloned().ok_or_else(|| anyhow::anyhow!("song has an audio asset"))?;
+            let asset_file = copy.join(&asset.path);
+            let backup = base.join("backup.wav");
+            std::fs::rename(&asset_file, &backup)?;
+            let (l_missing, _, _) = render_project(&c, &opts(&copy))?;
+            if l_missing == ref_l {
+                bail!("the missing audio asset should change the render");
+            }
+            let relinked = rawdawg_project::assets::import_asset(&copy, &backup)?;
+            if relinked.id != asset.id {
+                bail!("relink by hash gave a different id");
+            }
+            let (l_back, _, _) = render_project(&c, &opts(&copy))?;
+            if l_back != l3 {
+                bail!("render after relink differs");
+            }
+            Ok((format!("save-as/reopen/move renders identical ({} frames), recovery candidate found and parsed, stand-in plugin with opaque state preserved, missing asset silent then relinked", ref_l.len()), Some(base.display().to_string())))
+        },
+    ));
     checks.push(check("HL-07 audio device enumeration (no device required)", &["PLAT-02"], || {
         let snap = rawdawg_audio_io::enumerate();
         let path = out.join("devices.json");

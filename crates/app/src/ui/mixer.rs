@@ -36,6 +36,7 @@ pub(crate) struct MixerState {
     pub morph_xy: (f32, f32),
     /// Morph drag in progress: the chain's states before the gesture.
     morph_gesture: Option<Vec<(InstanceId, String, Vec<u8>)>>,
+    pub rack_preset_path: String,
 }
 
 pub(crate) type RackSnapshot = Vec<(InstanceId, Vec<(ParamId, f32)>)>;
@@ -569,6 +570,36 @@ fn rack_tools(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, cmds: &mut Vec
         apply_rack_values(app, &values, Some(&before), true);
     }
     ui.horizontal(|ui| {
+        ui.menu_button("Rack preset…", |ui| {
+            ui.label(egui::RichText::new("Save this channel's insert chain as a .rawdawgpreset, or load one (adds the inserts)").small().color(theme::TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut app.mixer.rack_preset_path).hint_text("/path/to/rack.rawdawgpreset").desired_width(320.0));
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() && !app.mixer.rack_preset_path.trim().is_empty() {
+                    let path = std::path::PathBuf::from(app.mixer.rack_preset_path.trim()).with_extension("rawdawgpreset");
+                    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "rack".into());
+                    let manifest = rawdawg_project::preset::PresetManifest::new_rack(&name, &m.inserts);
+                    app.status_line = match rawdawg_project::preset::write_preset(&path, &manifest, &[]) {
+                        Ok(()) => format!("Saved rack preset {}", path.display()),
+                        Err(e) => format!("Could not save the rack preset: {e}"),
+                    };
+                    ui.close();
+                }
+                if ui.button("Load").clicked() && !app.mixer.rack_preset_path.trim().is_empty() {
+                    let path = std::path::PathBuf::from(app.mixer.rack_preset_path.trim());
+                    match rawdawg_project::preset::read_preset(&path) {
+                        Ok(f) if f.manifest.kind == "rack" => {
+                            let inserts = f.manifest.rack_inserts();
+                            let n = inserts.len();
+                            cmds.push(Command::Batch { commands: inserts.into_iter().map(|instance| Command::AddInsert { mixer_id: id, instance, index: None }).collect() });
+                            app.status_line = format!("Loaded rack preset “{}” ({n} effects added)", f.manifest.name);
+                        }
+                        Ok(f) => app.status_line = format!("That preset is a {} preset, not a rack", f.manifest.kind),
+                        Err(e) => app.status_line = format!("Could not load the rack preset: {e}"),
+                    }
+                    ui.close();
+                }
+            });
+        });
         if ui
             .button("+ Parallel branch")
             .on_hover_text("A new bus fed by a post-fader send at 0 dB and summed into this channel's output: build a parallel effect path on it (latency is aligned at the sum)")

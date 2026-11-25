@@ -648,3 +648,26 @@ fn projects_save_as_autosave_recover_lock_and_relink() {
     assert!(h3.app.project.assets.iter().any(|a| a.id == asset.id), "undo restores the original asset entry");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn missing_plugins_are_reported_without_blocking_and_the_help_window_draws() {
+    use rawdawg_project::{Command, Instance, PluginFormat};
+    let mut h = Harness::new(None);
+    let mut ext = Instance::native("com.example.fx", serde_json::json!({ "opaque": true }));
+    ext.format = PluginFormat::Clap;
+    ext.display_name = "Example FX".into();
+    let master = h.app.project.mixer.master_id;
+    h.app.apply(Command::AddInsert { mixer_id: master, instance: ext, index: None });
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+    assert!(h.app.status_line.contains("not available") && h.app.status_line.contains("Example FX"), "{}", h.app.status_line);
+    h.app.editor_view = EditorView::Mixer;
+    h.app.mixer.selected = Some(master);
+    h.frame(vec![]);
+    h.app.show_help = true;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.app.show_help);
+    // undo removes the stand-in insert again
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h.app.project.mixer_channel(master).unwrap().inserts.is_empty());
+}

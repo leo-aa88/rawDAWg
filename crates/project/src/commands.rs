@@ -274,6 +274,23 @@ fn rewrite_asset_refs(v: &mut Value, old: &str, new: &str) -> usize {
     }
 }
 
+/// After an instance disappears: its automation curves become disabled orphans (kept, with
+/// their points) and its MIDI mappings are dropped. Returns the commands that restore both
+/// (appended to the removal's inverse).
+fn orphan_references(p: &mut Project, instance_id: InstanceId) -> Vec<Command> {
+    let mut restores = Vec::new();
+    for c in p.automation.iter_mut().filter(|c| c.target.instance_id == instance_id && !c.disabled) {
+        restores.push(Command::UpdateAutomationCurve { curve: c.clone() });
+        c.disabled = true;
+    }
+    if p.midi_mappings.iter().any(|m| m.target.instance_id == instance_id) {
+        let old = p.midi_mappings.clone();
+        p.midi_mappings.retain(|m| m.target.instance_id != instance_id);
+        restores.push(Command::SetMidiMappings { mappings: old });
+    }
+    restores
+}
+
 fn unknown<T: std::fmt::Display>(kind: &'static str, id: T) -> CommandError {
     CommandError::Unknown { kind, id: id.to_string() }
 }
@@ -338,6 +355,8 @@ impl Command {
             Command::RemoveChannel { id } => {
                 let idx = p.channels.iter().position(|c| c.id == id).ok_or_else(|| unknown("channel", id))?;
                 let channel = p.channels.remove(idx);
+                let instance_id = channel.instrument.id;
+                let mut orphan_restores = orphan_references(p, instance_id);
                 // Lanes with data are preserved in the inverse through a batch.
                 let mut restores = Vec::new();
                 for pat in &mut p.patterns {
@@ -350,6 +369,7 @@ impl Command {
                 }
                 let mut cmds = vec![Command::AddChannel { channel, index: Some(idx) }];
                 cmds.extend(restores);
+                cmds.append(&mut orphan_restores);
                 Ok(Command::Batch { commands: cmds })
             }
             Command::RenameChannel { id, name } => {
@@ -739,7 +759,9 @@ impl Command {
                 let m = p.mixer_channel_mut(mixer_id).ok_or_else(|| unknown("mixer channel", mixer_id))?;
                 let idx = m.inserts.iter().position(|i| i.id == instance_id).ok_or_else(|| unknown("insert", instance_id))?;
                 let instance = m.inserts.remove(idx);
-                Ok(Command::AddInsert { mixer_id, instance, index: Some(idx) })
+                let mut cmds = vec![Command::AddInsert { mixer_id, instance, index: Some(idx) }];
+                cmds.append(&mut orphan_references(p, instance_id));
+                if cmds.len() == 1 { Ok(cmds.pop().unwrap()) } else { Ok(Command::Batch { commands: cmds }) }
             }
             Command::MoveInsert { mixer_id, instance_id, to_index } => {
                 let m = p.mixer_channel_mut(mixer_id).ok_or_else(|| unknown("mixer channel", mixer_id))?;

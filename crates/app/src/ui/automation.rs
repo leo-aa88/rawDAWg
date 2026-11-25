@@ -349,7 +349,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut cmds: Vec<Command> = Vec::new();
     ui.horizontal_wrapped(|ui| {
         ui.heading("Automation");
-        let names: Vec<(CurveId, String)> = app.project.automation.iter().map(|c| (c.id, format!("{} ({} pts)", target_label(app, &c.target), c.points.len()))).collect();
+        let names: Vec<(CurveId, String)> = app
+            .project
+            .automation
+            .iter()
+            .map(|c| (c.id, format!("{}{} ({} pts)", target_label(app, &c.target), if c.disabled { " [orphan]" } else { "" }, c.points.len())))
+            .collect();
         let current = app.automation.curve.and_then(|id| names.iter().find(|(i, _)| *i == id).map(|(_, n)| n.clone())).unwrap_or_else(|| "choose a curve".into());
         egui::ComboBox::from_id_salt("auto-curve").selected_text(current).width(260.0).show_ui(ui, |ui| {
             for (id, n) in &names {
@@ -369,6 +374,22 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     let desc = descriptor(app, &curve.target);
+    if curve.disabled {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(theme::WARNING, "Orphan: its instrument or effect was removed. The points are kept; retarget it or delete it.");
+            if let Some(ch) = app.selected_channel.and_then(|c| app.project.channels.iter().find(|x| x.id == c)).cloned()
+                && ui.button(format!("Retarget to {} (same parameter id)", ch.name)).clicked()
+            {
+                let target = AutomationTarget { instance_id: ch.instrument.id, param_id: curve.target.param_id };
+                let name = target_label(app, &target);
+                cmds.push(Command::UpdateAutomationCurve { curve: AutomationCurve { target, disabled: false, name, ..curve.clone() } });
+            }
+            if ui.button("Delete curve").clicked() {
+                cmds.push(Command::RemoveAutomationCurve { id: curve.id });
+                app.automation.curve = None;
+            }
+        });
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(target_label(app, &curve.target)).strong());
         let mut mode = curve.mode;

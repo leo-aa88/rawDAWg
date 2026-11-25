@@ -200,7 +200,63 @@ fn state_bytes(inst: &rawdawg_project::Instance, channel_name: &str) -> Result<O
 
 /// Build an (unprepared) processor for a native instrument instance, plus its
 /// live table channel for synths. Also used by the app for main-thread mirrors.
+/// Stand-in for a third-party plugin that is not available (format not hosted yet, or the
+/// plugin is missing): instruments stay silent, inserts pass audio through; the project's
+/// state (inline or opaque file) is never touched. Reported in `CompileOutput::missing_plugins`.
+pub struct MissingPlugin {
+    type_id: &'static str,
+    insert: bool,
+}
+
+impl Processor for MissingPlugin {
+    fn type_id(&self) -> &'static str {
+        self.type_id
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn descriptors(&self) -> &'static [rawdawg_types::ParamDescriptor] {
+        &[]
+    }
+    fn prepare(&mut self, _spec: &rawdawg_dsp::processor::PrepareSpec) -> Result<(), rawdawg_dsp::processor::PrepareError> {
+        Ok(())
+    }
+    fn process(&mut self, ctx: &mut rawdawg_dsp::processor::ProcessContext<'_>) {
+        if self.insert {
+            ctx.audio.copy_input_to_output();
+        } else {
+            for out in ctx.audio.outputs.iter_mut() {
+                out[..ctx.audio.frames].fill(0.0);
+            }
+        }
+    }
+    fn reset(&mut self) {}
+    fn param(&self, _id: rawdawg_types::ParamId) -> Option<f32> {
+        None
+    }
+    fn set_param(&mut self, _id: rawdawg_types::ParamId, _v: f32) -> bool {
+        false
+    }
+    fn save_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn load_state(&mut self, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn missing_label(inst: &rawdawg_project::Instance, owner: &str) -> String {
+    format!(
+        "{owner}: {} ({:?}) is not available — its state is preserved",
+        if inst.display_name.is_empty() { inst.type_id.as_str() } else { inst.display_name.as_str() },
+        inst.format
+    )
+}
+
 pub fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str, assets: &dyn AssetResolver) -> Result<(Box<dyn Processor>, Option<TableSender>), CompileError> {
+    if inst.format != rawdawg_project::PluginFormat::Native {
+        return Ok((Box::new(MissingPlugin { type_id: "missing.instrument", insert: false }), None));
+    }
     match inst.type_id.as_str() {
         rawdawg_types::ids::native_types::SYNTH => {
             let mut synth = Synth::default();
@@ -243,11 +299,16 @@ pub struct CompileOutput {
     pub output_latency: u32,
     /// Decoding worker for streamed audio clips; keep it alive while the plan plays.
     pub stream_worker: Option<crate::stream::StreamWorker>,
+    /// Third-party instances replaced by silent/pass-through stand-ins (state preserved).
+    pub missing_plugins: Vec<String>,
 }
 
 /// Build an (unprepared) native effect processor for an insert instance. Effects that
 /// reference project assets (convolution impulse responses) get them resolved here, off-thread.
 pub fn make_effect(inst: &rawdawg_project::Instance, owner: &str, _assets: &dyn AssetResolver) -> Result<Box<dyn Processor>, CompileError> {
+    if inst.format != rawdawg_project::PluginFormat::Native {
+        return Ok(Box::new(MissingPlugin { type_id: "missing.effect", insert: true }));
+    }
     if !inst.type_id.as_str().starts_with(rawdawg_types::ids::native_types::FX_PREFIX) {
         return Err(CompileError::UnsupportedInstrument(inst.type_id.as_str().to_owned()));
     }
@@ -356,6 +417,7 @@ pub fn compile(
     live: &HashMap<InstanceId, u64>,
     assets: &dyn AssetResolver,
 ) -> Result<CompileOutput, CompileError> {
+    let mut missing_plugins: Vec<String> = Vec::new();
     rawdawg_project::validate(project).map_err(|e| CompileError::Invalid(e.to_string()))?;
     if project.channels.len() + project.mixer.channels.len() > limits.max_processing_nodes as usize {
         return Err(CompileError::Limit(format!("{} processing nodes (max {})", project.channels.len() + project.mixer.channels.len(), limits.max_processing_nodes)));
@@ -378,6 +440,9 @@ pub fn compile(
         for (ii, inst) in m.inserts.iter().enumerate() {
             let owner = format!("{} / {}", m.name, inst.display_name);
             let mut processor = make_effect(inst, &owner, assets)?;
+            if inst.format != rawdawg_project::PluginFormat::Native {
+                missing_plugins.push(missing_label(inst, &owner));
+            }
             processor.prepare(&spec).map_err(|e| CompileError::Prepare(owner.clone(), e.to_string()))?;
             attach_effect_assets(processor.as_mut(), assets);
             let fingerprint = fingerprint_state(inst.type_id.as_str(), &inst.state);
@@ -470,6 +535,9 @@ pub fn compile(
     let mut table_senders = Vec::new();
     for c in &project.channels {
         let (mut processor, sender) = make_instrument(&c.instrument, &c.name, assets)?;
+        if c.instrument.format != rawdawg_project::PluginFormat::Native {
+            missing_plugins.push(missing_label(&c.instrument, &c.name));
+        }
         processor.prepare(&spec).map_err(|e| CompileError::Prepare(c.name.clone(), e.to_string()))?;
         let fingerprint = fingerprint_state(c.instrument.type_id.as_str(), &c.instrument.state);
         let carry_over = live.get(&c.instrument.id) == Some(&fingerprint);
@@ -625,7 +693,7 @@ pub fn compile(
         output_latency,
     };
     let slot_map: HashMap<InstanceId, usize> = slot_instances.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    Ok(CompileOutput { stream_worker, plan, table_senders, fingerprints, slots: slot_map, output_latency })
+    Ok(CompileOutput { stream_worker, missing_plugins, plan, table_senders, fingerprints, slots: slot_map, output_latency })
 }
 
 impl Plan {
