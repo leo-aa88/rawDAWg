@@ -62,6 +62,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
         ui.heading(format!("{shown} — {owner}"));
         if inst.format != rawdawg_project::PluginFormat::Native {
             ui.label(egui::RichText::new(format!("{:?} · {} {}", inst.format, inst.vendor, inst.version)).color(theme::TEXT_SECONDARY).small());
+            crate::plugins::plugin_window_button(app, ui, instance_id, &format!("{shown} — {owner}"));
         }
         let mut on = !inst.bypass;
         let on_label = if on { "On" } else { "Bypassed" };

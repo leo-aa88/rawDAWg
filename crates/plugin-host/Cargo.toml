@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
+rawdawg-ui = { path = "../ui" }
 clack-host = { workspace = true }
 clack-extensions = { workspace = true, features = ["clack-host"] }
 vst3 = { workspace = true }
@@ -18,6 +19,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 rawdawg-plugin-clap = { path = "../plugin-clap" }
 rawdawg-audio-engine = { path = "../audio-engine" }
@@ -25,3 +29,7 @@ rawdawg-project = { path = "../project" }
 rawdawg-effects = { path = "../effects" }
 rawdawg-synthesizer = { path = "../synthesizer" }
 rawdawg-plugin-api = { path = "../plugin-api" }
+egui = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { workspace = true }

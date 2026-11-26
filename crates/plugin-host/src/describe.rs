@@ -54,7 +54,7 @@ pub unsafe fn describe_clap_library(path: &Path) -> Result<ScannedLibrary, Strin
             has_gui: false,
             notes: Vec::new(),
         };
-        match PluginInstance::<MinimalHost>::new(|_| crate::host::Shared::default(), |_| crate::host::MainThread, &entry, id, &host_info()) {
+        match PluginInstance::<MinimalHost>::new(|_| crate::host::Shared::default(), |_| crate::host::MainThread::default(), &entry, id, &host_info()) {
             Ok(mut instance) => {
                 let mut handle = instance.plugin_handle();
                 if let Some(ports) = handle.get_extension::<PluginAudioPorts>() {

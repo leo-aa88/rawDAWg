@@ -13,6 +13,8 @@
 //! (`rawdawg_plugin_api::wrap`), shared with the VST3 export, so an exported
 //! reverb behaves like its insert in rawDAWg and its state loads in both formats.
 
+mod gui;
+
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfo, AudioPortInfoWriter, AudioPortType, PluginAudioPorts, PluginAudioPortsImpl};
 use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
 use clack_extensions::note_ports::{NoteDialect, NoteDialects, NotePortInfo, NotePortInfoWriter, PluginNotePorts, PluginNotePortsImpl};
@@ -29,8 +31,8 @@ use rawdawg_types::events::{EventKind, EventSource, TimedEvent, sort_events};
 use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping};
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub use rawdawg_plugin_api::exported::{FX_CLAP_ID_PREFIX, SYNTH_CLAP_ID, URL, VENDOR, clap_id_for_native, native_type_id_for_clap};
 pub use rawdawg_plugin_api::wrap::{WRAP_BYPASS, WRAP_MIX};
@@ -85,18 +87,63 @@ pub fn exported_plugins() -> Vec<Exported> {
 /// The generic plugin type: every exported plugin is an instance of it.
 pub struct RawPlugin;
 
+/// State the main thread, the audio thread and the editor share. Behind an `Arc` so the
+/// editor (which outlives no plugin call but must be `'static`) can hold it.
+pub struct Core {
+    /// Main-thread copy of the processor used for descriptors, state and param queries.
+    main: Mutex<Box<dyn Processor>>,
+    bypass: AtomicBool,
+    /// Wet/dry as f32 bits.
+    mix_bits: AtomicU32,
+    is_synth: bool,
+    has_mix: bool,
+    /// Parameter edits made in the editor, for the audio thread (or an inactive flush) to
+    /// apply and report to the host.
+    edits: gui::PendingEdits,
+}
+
+impl Core {
+    fn mix(&self) -> f32 {
+        f32::from_bits(self.mix_bits.load(Ordering::Relaxed))
+    }
+    fn set_wrapper_param(&self, id: u32, value: f32) -> bool {
+        match id {
+            WRAP_BYPASS if !self.is_synth => {
+                self.bypass.store(value >= 0.5, Ordering::Relaxed);
+                true
+            }
+            WRAP_MIX if self.has_mix => {
+                self.mix_bits.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// Current normalized value of a visible parameter (wrapper or processor).
+    fn value(&self, id: u32) -> Option<f32> {
+        match id {
+            WRAP_BYPASS if !self.is_synth => Some(if self.bypass.load(Ordering::Relaxed) { 1.0 } else { 0.0 }),
+            WRAP_MIX if self.has_mix => Some(self.mix()),
+            id => self.main.lock().ok()?.param(ParamId(id)),
+        }
+    }
+}
+
 /// Thread-safe shared state: the authoritative processor state for the main
 /// thread (parameters, save/load). The audio processor owns a separate
 /// prepared instance; parameter changes flow through CLAP events.
 pub struct Shared<'a> {
     exported: &'a Exported,
-    /// Main-thread copy of the processor used for descriptors, state and param queries.
-    main: Mutex<Box<dyn Processor>>,
+    core: Arc<Core>,
     /// Latency of the active (or default-prepared) processor, for the latency extension.
     latency: AtomicU32,
-    bypass: AtomicBool,
-    /// Wet/dry as f32 bits.
-    mix_bits: AtomicU32,
+}
+
+impl std::ops::Deref for Shared<'_> {
+    type Target = Core;
+    fn deref(&self) -> &Core {
+        &self.core
+    }
 }
 
 impl<'a> PluginShared<'a> for Shared<'a> {}
@@ -107,23 +154,18 @@ impl<'a> Shared<'a> {
         // A default preparation gives hosts a sensible latency before activation.
         let _ = main.prepare(&PrepareSpec::new(48_000.0, 512, BusLayout::Stereo));
         let latency = main.latency_frames();
-        Ok(Self { exported, main: Mutex::new(main), latency: AtomicU32::new(latency), bypass: AtomicBool::new(false), mix_bits: AtomicU32::new(1.0f32.to_bits()) })
-    }
-    fn mix(&self) -> f32 {
-        f32::from_bits(self.mix_bits.load(Ordering::Relaxed))
-    }
-    fn set_wrapper_param(&self, id: u32, value: f32) -> bool {
-        match id {
-            WRAP_BYPASS if !self.exported.is_synth() => {
-                self.bypass.store(value >= 0.5, Ordering::Relaxed);
-                true
-            }
-            WRAP_MIX if self.exported.has_mix => {
-                self.mix_bits.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-                true
-            }
-            _ => false,
-        }
+        let wrapper = wrapper_descriptors(exported.is_synth(), exported.has_mix);
+        let ids = main.descriptors().iter().filter(|d| !d.flags.hidden).chain(wrapper.iter()).map(|d| d.id.0);
+        let edits = gui::PendingEdits::new(ids);
+        let core = Core {
+            main: Mutex::new(main),
+            bypass: AtomicBool::new(false),
+            mix_bits: AtomicU32::new(1.0f32.to_bits()),
+            is_synth: exported.is_synth(),
+            has_mix: exported.has_mix,
+            edits,
+        };
+        Ok(Self { exported, core: Arc::new(core), latency: AtomicU32::new(latency) })
     }
     fn wrapper_descriptors(&self) -> &'static [ParamDescriptor] {
         wrapper_descriptors(self.exported.is_synth(), self.exported.has_mix)
@@ -167,6 +209,9 @@ impl<'a> Shared<'a> {
 
 pub struct MainThread<'a> {
     shared: &'a Shared<'a>,
+    host: HostMainThreadHandle<'a>,
+    /// The editor, when the host opened one (main thread only).
+    gui: std::cell::RefCell<gui::GuiState>,
 }
 
 impl<'a> PluginMainThread<'a, Shared<'a>> for MainThread<'a> {}
@@ -183,7 +228,9 @@ impl Plugin for RawPlugin {
             .register::<PluginParams>()
             .register::<PluginState>()
             .register::<PluginLatency>()
-            .register::<PluginTail>();
+            .register::<PluginTail>()
+            .register::<clack_extensions::gui::PluginGui>()
+            .register::<clack_extensions::timer::PluginTimer>();
     }
 }
 
@@ -209,7 +256,12 @@ impl PluginFactoryImpl for RawFactory {
 
     fn create_plugin<'a>(&'a self, host_info: HostInfo<'a>, plugin_id: &CStr) -> Option<PluginInstance<'a>> {
         let exported = self.plugins.iter().find(|p| p.clap_id.as_bytes() == plugin_id.to_bytes())?;
-        Some(PluginInstance::new::<RawPlugin>(host_info, &exported.descriptor, move |_host| Shared::new(exported), |_host, shared| Ok(MainThread { shared })))
+        Some(PluginInstance::new::<RawPlugin>(
+            host_info,
+            &exported.descriptor,
+            move |_host| Shared::new(exported),
+            |host, shared| Ok(MainThread { shared, host, gui: Default::default() }),
+        ))
     }
 }
 
@@ -292,6 +344,29 @@ fn integer_table(descriptors: &[ParamDescriptor]) -> Vec<(u32, f64, f64)> {
     let mut t: Vec<(u32, f64, f64)> = descriptors.iter().filter_map(|d| integer_range(d).map(|(lo, hi)| (d.id.0, lo, hi))).collect();
     t.sort_unstable_by_key(|e| e.0);
     t
+}
+
+/// Normalized → plain on the audio thread (`table` from [`integer_table`]).
+fn to_plain_rt(table: &[(u32, f64, f64)], id: u32, normalized: f32) -> f64 {
+    match table.binary_search_by_key(&id, |e| e.0) {
+        Ok(i) => (table[i].1 + f64::from(normalized.clamp(0.0, 1.0)) * (table[i].2 - table[i].1)).round(),
+        Err(_) => f64::from(normalized.clamp(0.0, 1.0)),
+    }
+}
+
+/// Report editor edits to the host: gesture begin, the latest value, gesture end.
+fn report_edits(output: &mut OutputEvents, id: u32, flags: u8, plain: f64) {
+    use clack_plugin::events::event_types::{ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent};
+    let cid = ClapId::new(id);
+    if flags & gui::BEGIN != 0 {
+        let _ = output.try_push(ParamGestureBeginEvent::new(0, cid));
+    }
+    if flags & gui::VALUE != 0 {
+        let _ = output.try_push(ParamValueEvent::new(0, cid, Pckn::match_all(), plain));
+    }
+    if flags & gui::END != 0 {
+        let _ = output.try_push(ParamGestureEndEvent::new(0, cid));
+    }
 }
 
 /// Plain → normalized on the audio thread (`table` from [`integer_table`]).
@@ -461,6 +536,14 @@ impl<'a> PluginAudioProcessor<'a, Shared<'a>, MainThread<'a>> for AudioProcessor
         let frames = audio.frames_count();
         let total = frames as usize;
         translate_events(events.input, &mut self.events, frames, &self.discrete);
+        // edits made in the editor: applied at the start of this block, reported to the host
+        let (discrete, evs) = (&self.discrete, &mut self.events);
+        self.shared.edits.drain(|id, flags, n| {
+            if flags & gui::VALUE != 0 && evs.len() < evs.capacity() {
+                evs.insert(0, TimedEvent::new(0, EventSource::Host, 0, EventKind::Param { id: ParamId(id), value: n }));
+            }
+            report_edits(events.output, id, flags, to_plain_rt(discrete, id, n));
+        });
         if !self.is_synth {
             self.wrapper.take_wrapper_events(&mut self.events);
         }
@@ -684,8 +767,11 @@ impl PluginMainThreadParams for MainThread<'_> {
         d.parse(text.to_str().ok()?).map(|n| to_plain(d, n))
     }
 
-    fn flush(&self, input: &InputEvents, _output: &mut OutputEvents) {
-        // Inactive flush: apply parameter events to the main-thread state.
+    fn flush(&self, input: &InputEvents, output: &mut OutputEvents) {
+        // Inactive flush: editor edits (already in the main-thread state) go to the host ...
+        let discrete = self.shared.main.lock().map(|m| integer_table(m.descriptors())).unwrap_or_default();
+        self.shared.edits.drain(|id, flags, n| report_edits(output, id, flags, to_plain_rt(&discrete, id, n)));
+        // ... and parameter events from the host apply to the main-thread state.
         let Ok(mut s) = self.shared.main.lock() else { return };
         for ev in input.iter() {
             if let Some(p) = ev.as_event::<clack_plugin::events::event_types::ParamValueEvent>()
@@ -710,7 +796,15 @@ fn module_of(key: &str) -> &'static [u8] {
 }
 
 impl PluginAudioProcessorParams for AudioProcessor<'_> {
-    fn flush(&mut self, input: &InputEvents, _output: &mut OutputEvents) {
+    fn flush(&mut self, input: &InputEvents, output: &mut OutputEvents) {
+        // editor edits while active but not processing: apply and report them
+        let (discrete, processor, wrapper, is_synth) = (&self.discrete, &mut self.processor, &mut self.wrapper, self.is_synth);
+        self.shared.edits.drain(|id, flags, n| {
+            if flags & gui::VALUE != 0 && (is_synth || !wrapper.apply_param(id, n)) {
+                processor.set_param(ParamId(id), n);
+            }
+            report_edits(output, id, flags, to_plain_rt(discrete, id, n));
+        });
         for ev in input.iter() {
             if let Some(p) = ev.as_event::<clack_plugin::events::event_types::ParamValueEvent>()
                 && let Some(id) = p.param_id()

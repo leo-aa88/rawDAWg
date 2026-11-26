@@ -370,3 +370,74 @@ pub fn scan_cli(catalog_override: Option<PathBuf>) -> anyhow::Result<i32> {
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(0)
 }
+
+/// Pause after the last edit in a plugin's own editor before its state is committed to the
+/// project (one undo step per burst of edits).
+pub const EDITOR_COMMIT_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
+
+impl crate::ui::App {
+    /// Service open plugin editors (timers, input, resize, close) and commit the state of
+    /// plugins whose editor changed parameters, once the editing pauses.
+    pub(crate) fn poll_plugin_editors(&mut self, ctx: &egui::Context) {
+        let open: Vec<InstanceId> = self.other_mirrors.iter_mut().filter_map(|(id, m)| hosted_mut(m.as_mut()).filter(|h| h.editor_is_open()).map(|_| *id)).collect();
+        let now = std::time::Instant::now();
+        for id in &open {
+            let Some(h) = self.other_mirrors.get_mut(id).and_then(|m| hosted_mut(m.as_mut())) else { continue };
+            let idle = h.editor_idle();
+            if idle.edited {
+                self.plugin_editor_edits.insert(*id, now);
+            }
+            if !idle.open {
+                // closed: commit right away
+                self.plugin_editor_edits.entry(*id).and_modify(|t| *t = now - EDITOR_COMMIT_AFTER);
+            }
+        }
+        if !open.is_empty() {
+            // plugin timers run from this loop
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
+        }
+        let due: Vec<InstanceId> = self.plugin_editor_edits.iter().filter(|(_, t)| now.duration_since(**t) >= EDITOR_COMMIT_AFTER).map(|(id, _)| *id).collect();
+        for id in due {
+            self.plugin_editor_edits.remove(&id);
+            self.commit_plugin_state(id, "plugin window edit");
+        }
+    }
+
+    /// Store a hosted plugin's current state in the project as one undo step.
+    pub(crate) fn commit_plugin_state(&mut self, id: InstanceId, what: &str) {
+        let (Some(m), Some(inst)) = (self.other_mirrors.get(&id), self.project.instance(id)) else { return };
+        let state: serde_json::Value = serde_json::from_slice(&m.save_state()).unwrap_or(serde_json::Value::Null);
+        if state.is_null() || state == inst.state {
+            return;
+        }
+        let type_id = inst.type_id.as_str().to_owned();
+        self.mark_live_state(id, &type_id, &state);
+        match self.history.apply(&mut self.project, rawdawg_project::Command::SetInstanceState { instance_id: id, state_version: 1, state }) {
+            Ok(()) => self.status_line = format!("Recorded {what} ({})", inst_name(&self.project, id)),
+            Err(e) => self.status_line = format!("Edit rejected: {e}"),
+        }
+    }
+}
+
+fn inst_name(p: &rawdawg_project::Project, id: InstanceId) -> String {
+    p.instance(id).map(|i| if i.display_name.is_empty() { i.type_id.as_str().to_owned() } else { i.display_name.clone() }).unwrap_or_default()
+}
+
+/// "Open plugin window" for a hosted plugin with an editor (shown in its panel header).
+pub(crate) fn plugin_window_button(app: &mut crate::ui::App, ui: &mut egui::Ui, id: InstanceId, title: &str) {
+    let Some(h) = app.other_mirrors.get_mut(&id).and_then(|m| hosted_mut(m.as_mut())) else { return };
+    if !h.has_editor() {
+        ui.label(egui::RichText::new("no plugin window on this system: the controls below edit it").small().color(crate::theme::TEXT_SECONDARY));
+        return;
+    }
+    if h.editor_is_open() {
+        if ui.button("Close plugin window").clicked() {
+            h.close_editor();
+            app.commit_plugin_state(id, "plugin window edit");
+        }
+    } else if ui.button("Open plugin window").on_hover_text("The plugin's own editor, in its own window").clicked()
+        && let Err(e) = h.open_editor(title)
+    {
+        app.status_line = format!("Cannot open the plugin window: {e}");
+    }
+}

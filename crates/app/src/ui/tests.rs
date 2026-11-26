@@ -1131,3 +1131,62 @@ fn a_long_status_message_or_project_path_never_overlaps_the_rest_of_the_status_b
     }
     assert!(status.width() > 100.0, "the message keeps a useful width");
 }
+
+/// A hosted rawDAWg reverb (CLAP) as an insert on the master, its panel shown.
+fn hosted_reverb_on_master(h: &mut Harness) -> rawdawg_types::InstanceId {
+    let lib = hosted_catalog();
+    let module_path = lib.path.clone();
+    h.app.plugin_host.catalog.insert_library(lib);
+    let master = h.app.project.mixer.master_id;
+    let reverb = h.app.plugin_host.catalog.find(rawdawg_plugin_host::Format::Clap, "rawdawg.fx.reverb", None).map(|(_, p)| p.clone()).unwrap();
+    h.app.add_catalog_plugin(&reverb, &module_path, master);
+    h.frame(vec![]);
+    h.app.project.mixer_channel(master).unwrap().inserts[0].id
+}
+
+#[test]
+fn edits_in_a_plugin_window_are_committed_once_editing_pauses_as_one_undo_step() {
+    let mut h = Harness::new(None);
+    let id = hosted_reverb_on_master(&mut h);
+    let stored = h.app.project.instance(id).unwrap().state.clone();
+    let depth = h.app.history.undo_len();
+    // the plugin's own state changes (as its editor would change it)
+    let first = *h.app.other_mirrors[&id].descriptors().iter().find(|d| !d.flags.is_bypass).unwrap();
+    assert!(h.app.other_mirrors.get_mut(&id).unwrap().set_param(first.id, 0.123));
+    // a recent edit is not committed yet ...
+    h.app.plugin_editor_edits.insert(id, std::time::Instant::now());
+    h.frame(vec![]);
+    assert_eq!(h.app.project.instance(id).unwrap().state, stored, "still editing");
+    // ... once editing paused, the state is stored as one undo step
+    h.app.plugin_editor_edits.insert(id, std::time::Instant::now() - crate::plugins::EDITOR_COMMIT_AFTER);
+    h.frame(vec![]);
+    assert_ne!(h.app.project.instance(id).unwrap().state, stored);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    assert!(h.app.status_line.contains("plugin window edit"), "{}", h.app.status_line);
+    assert!(h.app.plugin_editor_edits.is_empty());
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.instance(id).unwrap().state, stored, "undo restores the stored state");
+}
+
+#[test]
+#[ignore = "needs a display server; run by `cargo xtask verify` (GUI-02)"]
+fn the_effect_panel_opens_and_closes_a_hosted_plugins_own_window() {
+    let mut h = Harness::new(None);
+    let id = hosted_reverb_on_master(&mut h);
+    let click_text = |h: &mut Harness, text: &str| {
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    let is_open = |h: &mut Harness| h.app.other_mirrors.get_mut(&id).and_then(|m| rawdawg_plugin_host::hosted_mut(m.as_mut())).is_some_and(|x| x.editor_is_open());
+    click_text(&mut h, "Open plugin window");
+    assert!(is_open(&mut h), "{}", h.app.status_line);
+    for _ in 0..20 {
+        h.frame(vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(is_open(&mut h));
+    click_text(&mut h, "Close plugin window");
+    assert!(!is_open(&mut h));
+    click_text(&mut h, "Open plugin window");
+    assert!(is_open(&mut h), "reopens");
+}

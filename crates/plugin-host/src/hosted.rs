@@ -56,6 +56,22 @@ pub trait HostedInstance: Processor {
     fn display_name(&self) -> &str;
     fn problem_count(&self) -> u32;
     fn refresh_values(&mut self);
+    /// Whether the plugin has an editor rawDAWg can show in a window on this platform.
+    fn has_editor(&self) -> bool {
+        false
+    }
+    fn editor_is_open(&self) -> bool {
+        false
+    }
+    /// Open the plugin's own editor in a rawDAWg window titled `title` (main thread).
+    fn open_editor(&mut self, _title: &str) -> Result<(), String> {
+        Err("rawDAWg cannot show this plugin's editor yet; use the controls in the panel".into())
+    }
+    /// Service an open editor; call every UI frame while it is open.
+    fn editor_idle(&mut self) -> crate::clap::EditorIdle {
+        crate::clap::EditorIdle::default()
+    }
+    fn close_editor(&mut self) {}
     /// `clap:<id>` / `vst3:<cid>`.
     fn live_id(&self) -> String {
         Processor::type_id(self).to_owned()
@@ -83,6 +99,21 @@ impl HostedInstance for ClapInstance {
     }
     fn refresh_values(&mut self) {
         ClapInstance::refresh_values(self)
+    }
+    fn has_editor(&self) -> bool {
+        ClapInstance::has_editor(self)
+    }
+    fn editor_is_open(&self) -> bool {
+        ClapInstance::editor_is_open(self)
+    }
+    fn open_editor(&mut self, title: &str) -> Result<(), String> {
+        ClapInstance::open_editor(self, title)
+    }
+    fn editor_idle(&mut self) -> crate::clap::EditorIdle {
+        ClapInstance::editor_idle(self)
+    }
+    fn close_editor(&mut self) {
+        ClapInstance::close_editor(self)
     }
 }
 

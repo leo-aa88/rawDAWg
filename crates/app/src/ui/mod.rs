@@ -174,6 +174,9 @@ pub(crate) struct App {
     pub assets: rawdawg_audio_engine::ProjectAssetCache,
     /// Main-thread mirrors for non-synth native instruments.
     pub other_mirrors: HashMap<rawdawg_types::InstanceId, Box<dyn rawdawg_dsp::processor::Processor>>,
+    /// Hosted plugins whose own editor changed parameters, with the time of the last change;
+    /// their state is committed to the project once the editing pauses.
+    pub plugin_editor_edits: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
     /// Third-party plugin catalog, loaded modules and scan state.
     pub plugin_host: crate::plugins::PluginHost,
     plugin_refresh_counter: u32,
@@ -279,6 +282,7 @@ impl App {
             table_senders: HashMap::new(),
             assets: rawdawg_audio_engine::ProjectAssetCache::new(None),
             other_mirrors: HashMap::new(),
+            plugin_editor_edits: HashMap::new(),
             plugin_host: crate::plugins::PluginHost::load(opts.safe_mode, persist_prefs, opts.catalog.clone()),
             plugin_refresh_counter: 0,
             instrument_panel: Default::default(),
@@ -1579,6 +1583,7 @@ impl App {
         }
         self.poll_project_files(ctx);
         self.poll_plugins();
+        self.poll_plugin_editors(ctx);
         self.handle_shortcuts(ctx);
         self.handle_typing(ctx);
         self.poll_midi();

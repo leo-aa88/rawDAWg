@@ -167,7 +167,7 @@ fn describes_the_built_rawdawg_module_in_process() {
     assert_eq!(synth.main_output_channels, 2);
     assert!(synth.param_count > 20);
     assert_eq!(synth.vendor, "rawDAWg");
-    assert!(!synth.has_gui, "no GUI extension yet");
+    assert!(synth.has_gui, "the exported plugins have an editor (CLAP gui extension)");
     let comp = lib.plugins.iter().find(|p| p.plugin_id == "rawdawg.fx.compressor").expect("compressor");
     assert!(comp.is_effect && !comp.is_instrument);
     assert_eq!((comp.audio_inputs, comp.audio_outputs), (2, 1), "main + sidechain");

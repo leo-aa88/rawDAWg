@@ -3689,6 +3689,7 @@ dependencies = [
  "rawdawg-plugin-api",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "rawdawg-ui",
  "serde_json",
 ]
 
@@ -3698,6 +3699,8 @@ version = "0.1.0"
 dependencies = [
  "clack-extensions",
  "clack-host",
+ "egui",
+ "libc",
  "libloading 0.9.1",
  "log",
  "rawdawg-audio-engine",
@@ -3708,9 +3711,11 @@ dependencies = [
  "rawdawg-project",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "rawdawg-ui",
  "serde",
  "serde_json",
  "vst3",
+ "x11rb",
 ]
 
 [[package]]

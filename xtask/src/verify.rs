@@ -1008,6 +1008,43 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
         }
         Ok(("CLAP and VST3 exports (17 plugins each) through the built modules: audio, events, sidechain, latency/tail, params, state envelope; CLAP host bridge: hosted vs native renders, migration, state, params".into(), None))
     }));
+    // plugin editor windows need a display server: X11 (WSLg, Xorg, Xvfb) on Linux, the
+    // desktop session on Windows
+    let display = cfg!(target_os = "windows") || std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
+    const GUI02: &str = "GUI-02 plugin editors on a real display: editor window, exported CLAP editor hosted by rawDAWg with input, panel open/close";
+    if display {
+        checks.push(check(GUI02, &["PLUG-01", "PLUG-02", "PLAT-03"], || {
+            let mut runs: Vec<Vec<&str>> = vec![
+                vec!["test", "-q", "-p", "rawdawg-ui", "--test", "editor_window", "--", "--ignored"],
+                vec!["test", "-q", "-p", "rawdawg", "--bin", "rawdawg", "the_effect_panel_opens", "--", "--ignored"],
+            ];
+            if cfg!(target_os = "linux") {
+                runs.push(vec!["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_editor", "--", "--ignored"]);
+            }
+            for args in &runs {
+                let o = Command::new("cargo").args(args).output()?;
+                let text = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
+                if !o.status.success() || !text.contains("1 passed") {
+                    let tail: Vec<&str> = text.lines().filter(|l| l.contains("panicked") || l.contains("FAILED") || l.contains("error")).take(6).collect();
+                    bail!("`cargo {}` failed: {}", args.join(" "), tail.join(" | "));
+                }
+            }
+            Ok((
+                format!(
+                    "{} display tests passed: painted frame read back pixel-exact, resize, 2x scale, parent destruction{}; effect panel opens, closes and reopens the plugin window",
+                    runs.len(),
+                    if cfg!(target_os = "linux") { "; rawDAWg hosts its exported CLAP delay editor via timer-support, X input drags a slider, the host sees the edit, close/reopen" } else { "" }
+                ),
+                None,
+            ))
+        }));
+    } else {
+        checks.push(blocked(
+            GUI02,
+            &["PLUG-01", "PLUG-02", "PLAT-03"],
+            "no display server (DISPLAY unset): run under WSLg/Xorg, or `xvfb-run -a cargo xtask verify --suite plugins`",
+        ));
+    }
     checks.push(check(
         "E2E-07 (headless subset) isolated scan of rawDAWg's own CLAP module into a catalog, hang/crash quarantine, safe-mode skip, hosted render equals native",
         &["PLUG-02", "PLUG-03", "T-PLUGIN", "E2E-07"],

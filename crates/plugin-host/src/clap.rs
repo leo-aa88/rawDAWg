@@ -45,6 +45,10 @@ impl HostHandlers for RawdawgHost {
     type Shared<'a> = Shared;
     type MainThread<'a> = MainThread;
     type AudioProcessor<'a> = ();
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Shared) {
+        crate::host::declare_editor_extensions(builder);
+    }
 }
 
 /// Maximum events forwarded to a plugin per block (bounded, preallocated).
@@ -89,6 +93,44 @@ impl ModuleCache {
     pub fn loaded(&self) -> impl Iterator<Item = &Arc<LoadedModule>> {
         self.modules.values()
     }
+}
+
+/// File descriptors that are ready now (non-blocking `poll`).
+#[cfg(unix)]
+fn poll_fds(fds: &[(std::os::fd::RawFd, clack_extensions::posix_fd::FdFlags)]) -> Vec<(std::os::fd::RawFd, clack_extensions::posix_fd::FdFlags)> {
+    use clack_extensions::posix_fd::FdFlags;
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|(fd, f)| libc::pollfd {
+            fd: *fd,
+            events: (if f.contains(FdFlags::READ) { libc::POLLIN } else { 0 }) | (if f.contains(FdFlags::WRITE) { libc::POLLOUT } else { 0 }),
+            revents: 0,
+        })
+        .collect();
+    if pfds.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: a valid array of pollfd for its length; timeout 0 never blocks.
+    let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    pfds.iter()
+        .filter(|p| p.revents != 0)
+        .map(|p| {
+            let mut f = FdFlags::empty();
+            if p.revents & libc::POLLIN != 0 {
+                f |= FdFlags::READ;
+            }
+            if p.revents & libc::POLLOUT != 0 {
+                f |= FdFlags::WRITE;
+            }
+            if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                f |= FdFlags::ERROR;
+            }
+            (p.fd, f)
+        })
+        .collect()
 }
 
 /// Static parameter descriptors for one plugin id, leaked once per process so they can be
@@ -199,6 +241,30 @@ pub struct ClapInstance {
     pub info: PluginDescription,
     /// Processing problems reported by RT halves (non-finite output, process errors).
     pub problems: Arc<std::sync::atomic::AtomicU32>,
+    /// The plugin's own editor, open in a rawDAWg window. The window is a main-thread object
+    /// (an `HWND` on Windows), so it sits in a [`MainThreadCell`] like the plugin instance.
+    editor: Option<MainThreadCell<OpenEditor>>,
+}
+
+/// A plugin editor shown in a top-level rawDAWg window.
+struct OpenEditor {
+    window: rawdawg_ui::window::NativeWindow,
+    resizable: bool,
+}
+
+/// Result of [`ClapInstance::editor_idle`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditorIdle {
+    /// The editor is still open.
+    pub open: bool,
+    /// Parameter values changed since the last call (edits in the plugin's editor).
+    pub edited: bool,
+}
+
+/// The embedded editor API of this platform.
+fn editor_config() -> clack_extensions::gui::GuiConfiguration<'static> {
+    use clack_extensions::gui::{GuiApiType, GuiConfiguration};
+    GuiConfiguration { api_type: if cfg!(target_os = "windows") { GuiApiType::WIN32 } else { GuiApiType::X11 }, is_floating: false }
 }
 
 impl ClapInstance {
@@ -206,7 +272,7 @@ impl ClapInstance {
     pub fn new(module: Arc<LoadedModule>, info: &PluginDescription) -> Result<Self, String> {
         let plugin_id = info.plugin_id.clone();
         let id_c = std::ffi::CString::new(plugin_id.as_str()).map_err(|_| "plugin id contains NUL".to_owned())?;
-        let mut instance = PluginInstance::<RawdawgHost>::new(|_| Shared::default(), |_| MainThread, &module.entry, &id_c, &crate::host::host_info())
+        let mut instance = PluginInstance::<RawdawgHost>::new(|_| Shared::default(), |_| MainThread::default(), &module.entry, &id_c, &crate::host::host_info())
             .map_err(|e| format!("cannot instantiate {plugin_id}: {e}"))?;
         let (descriptors, layout, latency, values) = {
             let mut handle = instance.plugin_handle();
@@ -255,6 +321,7 @@ impl ClapInstance {
             return_rx,
             info: info.clone(),
             problems: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            editor: None,
         })
     }
 
@@ -290,6 +357,160 @@ impl ClapInstance {
     fn with_instance<R>(&self, f: impl FnOnce(&mut PluginInstance<RawdawgHost>) -> R) -> Option<R> {
         let inst = self.cell.get()?;
         Some(f(&mut inst.borrow_mut()))
+    }
+
+    /// Whether the plugin offers an embedded editor rawDAWg can show on this platform.
+    pub fn has_editor(&self) -> bool {
+        self.with_handle(|h| h.get_extension::<clack_extensions::gui::PluginGui>().is_some_and(|g| g.is_api_supported(h, editor_config()))).unwrap_or(false)
+    }
+
+    pub fn editor_is_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// The native id of the window holding the plugin's editor (X11 window id / HWND).
+    pub fn editor_window_id(&self) -> Option<u64> {
+        self.editor.as_ref().and_then(|e| e.get()).map(|e| e.window.raw_id())
+    }
+
+    /// Open the plugin's editor in a new top-level window titled `title` (main thread).
+    pub fn open_editor(&mut self, title: &str) -> Result<(), String> {
+        use clack_extensions::gui::{GuiSize, PluginGui, Window as ClapWindow};
+        use rawdawg_ui::window::{NativeWindow, Parent};
+        if self.editor.is_some() {
+            return Ok(());
+        }
+        let opened = self.with_handle(|h| -> Result<OpenEditor, String> {
+            let gui = h.get_extension::<PluginGui>().ok_or("the plugin has no editor")?;
+            if !gui.is_api_supported(h, editor_config()) {
+                return Err("the plugin's editor does not support an embedded window on this platform".into());
+            }
+            gui.create(h, editor_config()).map_err(|e| format!("the plugin could not create its editor: {e:?}"))?;
+            let _ = gui.set_scale(h, 1.0);
+            let size = gui.get_size(h).filter(|s| s.width > 0 && s.height > 0 && s.width <= 16_384 && s.height <= 16_384).unwrap_or(GuiSize { width: 640, height: 480 });
+            let resizable = gui.can_resize(h);
+            let window = match NativeWindow::open(Parent::TopLevel, size.width, size.height, title) {
+                Ok(w) => w,
+                Err(e) => {
+                    gui.destroy(h);
+                    return Err(format!("cannot open a window for the editor: {e}"));
+                }
+            };
+            #[cfg(target_os = "windows")]
+            // SAFETY: a live HWND of ours that outlives the editor (destroyed after gui.destroy).
+            let parent = unsafe { ClapWindow::from_win32_hwnd(window.raw_id() as usize as *mut std::ffi::c_void) };
+            #[cfg(not(target_os = "windows"))]
+            let parent = ClapWindow::from_x11_handle(window.raw_id() as std::ffi::c_ulong);
+            // SAFETY: `parent` is a live window of ours; it stays alive until after the
+            // plugin's editor is destroyed (`close_editor` calls `gui.destroy` first).
+            if let Err(e) = unsafe { gui.set_parent(h, parent) } {
+                gui.destroy(h);
+                return Err(format!("the plugin refused the editor window: {e:?}"));
+            }
+            let _ = gui.show(h);
+            Ok(OpenEditor { window, resizable })
+        });
+        self.editor = Some(MainThreadCell::new(opened.ok_or("the plugin instance is not available on this thread")??));
+        Ok(())
+    }
+
+    /// Close the editor (main thread). The plugin destroys its window first, then ours goes.
+    pub fn close_editor(&mut self) {
+        let Some(editor) = self.editor.take() else { return };
+        self.with_handle(|h| {
+            if let Some(gui) = h.get_extension::<clack_extensions::gui::PluginGui>() {
+                gui.destroy(h);
+            }
+        });
+        drop(editor);
+        self.with_instance(|inst| {
+            inst.access_handler(|mt| {
+                mt.timers.borrow_mut().clear();
+                #[cfg(unix)]
+                mt.fds.borrow_mut().clear();
+            })
+        });
+    }
+
+    /// Service the open editor (main thread, every UI frame): window events, the plugin's
+    /// timers and file descriptors, resize / close / flush requests. Reports whether the
+    /// plugin's parameter values changed.
+    pub fn editor_idle(&mut self) -> EditorIdle {
+        use clack_extensions::gui::{GuiSize, PluginGui};
+        use rawdawg_ui::window::WindowEvent;
+        let Some(editor) = self.editor.as_mut().and_then(|e| e.get_mut()) else { return EditorIdle::default() };
+        let mut close = false;
+        let mut resize: Option<(u32, u32)> = None;
+        for e in editor.window.poll() {
+            match e {
+                WindowEvent::CloseRequested | WindowEvent::Destroyed => close = true,
+                WindowEvent::Resized(w, h) if editor.resizable => resize = Some((w, h)),
+                _ => {}
+            }
+        }
+        if close {
+            self.close_editor();
+            return EditorIdle { open: false, edited: false };
+        }
+        let now = std::time::Instant::now();
+        let Some(inst) = self.cell.get() else { return EditorIdle { open: true, edited: false } };
+        let (requested_size, closed_by_plugin, flush) = {
+            let mut inst = inst.borrow_mut();
+            let due = inst.access_handler(|mt| mt.due_timers(now));
+            #[cfg(unix)]
+            let ready: Vec<(std::os::fd::RawFd, clack_extensions::posix_fd::FdFlags)> = inst.access_handler(|mt| poll_fds(&mt.fds.borrow()));
+            let handle = inst.plugin_handle();
+            if let Some(timer) = handle.get_extension::<clack_extensions::timer::PluginTimer>() {
+                for id in due {
+                    timer.on_timer(&handle, id);
+                }
+            }
+            #[cfg(unix)]
+            if let Some(posix) = handle.get_extension::<clack_extensions::posix_fd::PluginPosixFd>() {
+                for (fd, flags) in ready {
+                    posix.on_fd(&handle, fd, flags);
+                }
+            }
+            if let (Some((w, h)), Some(gui)) = (resize, handle.get_extension::<PluginGui>()) {
+                let adjusted = gui.adjust_size(&handle, GuiSize { width: w, height: h }).unwrap_or(GuiSize { width: w, height: h });
+                let _ = gui.set_size(&handle, adjusted);
+            }
+            inst.access_shared_handler(|s| {
+                (
+                    s.gui_resize.lock().ok().and_then(|mut r| r.take()),
+                    s.gui_closed.swap(false, std::sync::atomic::Ordering::Relaxed),
+                    s.flush_requested.swap(false, std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+        };
+        if closed_by_plugin {
+            self.close_editor();
+            return EditorIdle { open: false, edited: false };
+        }
+        if let Some(size) = requested_size
+            && let Some(editor) = self.editor.as_mut().and_then(|e| e.get_mut())
+        {
+            let _ = editor.window.set_size(size.width, size.height);
+            self.with_handle(|h| {
+                if let Some(gui) = h.get_extension::<PluginGui>() {
+                    let _ = gui.set_size(h, size);
+                }
+            });
+        }
+        if flush && self.active.is_none() {
+            // the editor changed parameters while the plugin is idle: let it report them
+            self.with_instance(|inst| {
+                let params = inst.plugin_handle().get_extension::<PluginParams>();
+                if let (Some(params), Some(mut handle)) = (params, inst.inactive_plugin_handle()) {
+                    let input = EventBuffer::new();
+                    let mut out = EventBuffer::new();
+                    params.flush(&mut handle, &input.as_input(), &mut out.as_output());
+                }
+            });
+        }
+        let before = self.values.clone();
+        self.refresh_values();
+        EditorIdle { open: true, edited: before != self.values }
     }
 
     /// Refresh the cached parameter values from the plugin (main thread; call at UI rate).
@@ -442,6 +663,13 @@ pub const STATE_KEY: &str = "clap_state_b64";
 
 /// Error for a state blob that is still a `plugin-state/` file reference (unreadable file).
 pub(crate) const NOT_INLINE: &str = "the saved plugin state is still a plugin-state file reference (the file could not be read)";
+
+impl Drop for ClapInstance {
+    fn drop(&mut self) {
+        // the plugin's editor goes before the plugin and before our parent window
+        self.close_editor();
+    }
+}
 
 impl Processor for ClapInstance {
     fn type_id(&self) -> &'static str {

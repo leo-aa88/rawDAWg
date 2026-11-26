@@ -39,8 +39,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
         _ if channel.instrument.format != rawdawg_project::PluginFormat::Native && !channel.instrument.display_name.is_empty() => channel.instrument.display_name.as_str(),
         _ => "Instrument",
     };
+    let heading = format!("{title} — {}", channel.name);
     ui.horizontal(|ui| {
-        ui.heading(format!("{title} — {}", channel.name));
+        ui.heading(&heading);
+        if channel.instrument.format != rawdawg_project::PluginFormat::Native {
+            crate::plugins::plugin_window_button(app, ui, instance_id, &heading);
+        }
     });
     // instrument-specific header
     let mut sf2_change: Option<(u16, u16)> = None;
