@@ -1158,7 +1158,7 @@ fn long_audio_clips_stream_from_disk_with_accurate_offsets_and_no_dropouts_offli
 }
 
 #[test]
-fn streamed_clips_play_live_recover_after_a_loop_wrap_and_render_allocation_free() {
+fn streamed_clips_play_live_through_loop_wraps_without_a_gap_and_render_allocation_free() {
     use rawdawg_project::LoopRange;
     let (dir, mut p, _id) = long_clip_project("live");
     p.r#loop = Some(LoopRange { start_tick: Tick(0), end_tick: Tick(7680), enabled: true });
@@ -1180,8 +1180,8 @@ fn streamed_clips_play_live_recover_after_a_loop_wrap_and_render_allocation_free
     let t0 = std::time::Instant::now();
     let total_blocks = 10 * 48_000 / 256;
     for b in 0..total_blocks {
-        // pace roughly like a device so the worker can keep up (4× faster than real time)
-        let due = std::time::Duration::from_micros((b as u64 * 256 * 1_000_000 / 48_000) / 4);
+        // pace roughly like a device so the worker can keep up (2× faster than real time)
+        let due = std::time::Duration::from_micros((b as u64 * 256 * 1_000_000 / 48_000) / 2);
         if let Some(wait) = due.checked_sub(t0.elapsed()) {
             std::thread::sleep(wait);
         }
@@ -1191,12 +1191,20 @@ fn streamed_clips_play_live_recover_after_a_loop_wrap_and_render_allocation_free
     // first pass: 440 Hz in bar 1, 880 Hz in bar 2
     assert!((dominant_frequency(&out_l[20_000..40_000], 48_000.0) - 440.0).abs() < 1.0);
     assert!((dominant_frequency(&out_l[120_000..160_000], 48_000.0) - 880.0).abs() < 1.0);
-    // after the wrap at 4 s (frame 192 000): the clip at bar 1 sounds again within 300 ms
-    let after = &out_l[192_000 + 14_400..192_000 + 48_000];
-    assert!(rms(after) > 0.2, "stream recovered after the loop wrap: rms {}", rms(after));
-    assert!((dominant_frequency(after, 48_000.0) - 440.0).abs() < 1.0);
+    // after each wrap (frames 192 000 and 384 000) bar 1 sounds again at once, played from the
+    // clip's loop-entry head while the stream refills behind it, and bar 2 re-enters its clip
+    // the same way
+    for wrap in [192_000usize, 384_000] {
+        // every block right after the wrap sounds (a refill gap would be silent blocks)
+        for (k, block) in out_l[wrap..wrap + 9600].chunks(256).enumerate() {
+            assert!(rms(block) > 0.2, "no gap after the wrap at {wrap}: block {k} rms {}", rms(block));
+        }
+        assert!((dominant_frequency(&out_l[wrap + 2000..wrap + 40_000], 48_000.0) - 440.0).abs() < 1.0);
+    }
+    assert!((dominant_frequency(&out_l[192_000 + 100_000..192_000 + 140_000], 48_000.0) - 880.0).abs() < 1.0);
+    assert!(rms(&out_l[192_000 + 96_000..192_000 + 100_800]) > 0.2, "bar 2 re-enters without a gap");
     let dropouts = handle.status.stream_dropouts.get();
-    assert!(dropouts < 2 * 14_400, "wrap dropouts bounded: {dropouts} frames");
+    assert_eq!(dropouts, 0, "no streamed frame was missing through 2.5 loop passes");
     // steady state is allocation-free on the audio side
     let (_, allocs) = measure_rt(|| {
         for _ in 0..8 {

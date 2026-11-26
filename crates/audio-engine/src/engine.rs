@@ -718,7 +718,7 @@ impl Engine {
                             let src = clip.source_offset + local * clip.rate;
                             let g = clip_gain(clip.gain, clip.fade_in, clip.fade_out, clip.len_frames, local);
                             let i = offset + (f - start) as usize;
-                            match stream.read(src) {
+                            match stream.read_or_head(src) {
                                 Some((l, r)) => {
                                     bl[i] += l * g;
                                     br[i] += r * g;

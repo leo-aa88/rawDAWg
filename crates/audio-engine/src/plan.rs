@@ -361,9 +361,10 @@ fn audio_clip_nodes(
     rate: SampleRate,
     master_index: usize,
     assets: &dyn AssetResolver,
+    loop_frames: (i64, i64),
 ) -> (Vec<AudioClipNode>, Option<crate::stream::StreamWorker>) {
     let mut out = Vec::new();
-    let mut stream_requests: Vec<(rawdawg_sampler::stream::StreamInfo, u64)> = Vec::new();
+    let mut stream_requests: Vec<crate::stream::StreamRequest> = Vec::new();
     for clip in &project.clips {
         let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &clip.content else { continue };
         if clip.muted || out.len() >= MAX_AUDIO_CLIPS {
@@ -381,7 +382,20 @@ fn audio_clip_nodes(
             }
             _ => match assets.stream_info(asset_id) {
                 Some(info) if info.frames > 0 => {
-                    stream_requests.push((info.clone(), *source_offset_frames));
+                    // where the loop wrap enters this clip again: at the loop start when the clip
+                    // spans it, at the clip's own start when it starts inside the loop
+                    let start = tempo.tick_to_frame(clip.start_tick, rate);
+                    let eff = (playback_rate * f64::from(info.sample_rate) / rate.as_f64()).max(1e-6);
+                    let len = ((*source_length_frames as f64) / eff).ceil() as i64;
+                    let (ls, le) = loop_frames;
+                    let loop_entry = if start < ls && ls < start + len {
+                        Some(*source_offset_frames + ((ls - start) as f64 * eff) as u64)
+                    } else if ls <= start && start < le {
+                        Some(*source_offset_frames)
+                    } else {
+                        None
+                    };
+                    stream_requests.push(crate::stream::StreamRequest { info: info.clone(), first_frame: *source_offset_frames, loop_entry });
                     (ClipSource::Streamed(crate::stream::ClipStream::placeholder(info.frames)), info.sample_rate, info.frames)
                 }
                 _ => continue,
@@ -719,7 +733,8 @@ pub fn compile_with(
     let pattern_schedule =
         project.selected_pattern.or_else(|| project.patterns.first().map(|p| p.id)).map(|pid| Schedule::for_pattern(project, pid, &tempo, rate)).unwrap_or_default();
     let song_schedule = Schedule::for_song(project, &tempo, rate);
-    let (audio_clips, stream_worker) = audio_clip_nodes(project, &tempo, rate, master_index, assets);
+    let loop_frames = (song_schedule.loop_start_frame, song_schedule.loop_end_frame);
+    let (audio_clips, stream_worker) = audio_clip_nodes(project, &tempo, rate, master_index, assets, loop_frames);
     let _ = Db::UNITY;
     let plan = Plan {
         revision,

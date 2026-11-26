@@ -2,7 +2,11 @@
 //! thread decodes ahead into bounded SPSC queues; the audio thread keeps a fixed ring per
 //! clip and reads from it, requesting a refill (via atomics) after seeks/loop wraps and
 //! emitting silence — counted as a dropout — while data for the new position is missing.
-//! Offline renders wait outside the audio path until every stream is ready.
+//! A clip that is entered again after a loop wrap (it spans the loop start, or starts inside
+//! the loop) keeps a short decoded **head** at that entry point, read off the audio thread
+//! when the plan is built: after the wrap it plays from the head while the worker refills the
+//! ring right behind it, so looping never gaps. Offline renders wait outside the audio path
+//! until every stream is ready.
 
 use rawdawg_rt::{ControlQueue, QueueConsumer, QueueProducer};
 use rawdawg_sampler::stream::{StreamInfo, StreamReader};
@@ -14,6 +18,8 @@ pub const STREAM_BLOCK: usize = 1024;
 /// Blocks a stream queue holds (≈ 1.4 s at 48 kHz) and the RT ring length in frames.
 pub const STREAM_QUEUE_BLOCKS: usize = 64;
 pub const RING_FRAMES: usize = STREAM_BLOCK * 128;
+/// Frames of a loop-entry head (≈ 0.68 s at 48 kHz): the time the worker has to seek and refill.
+pub const HEAD_FRAMES: usize = STREAM_BLOCK * 32;
 /// Source frame used when a stream has nothing requested yet.
 const NO_WANT: u64 = u64::MAX;
 
@@ -49,10 +55,22 @@ pub struct ClipStream {
     ring_fill: usize,
     ring_head: usize,
     generation: u64,
+    /// Decoded frames at the clip's loop entry point (empty when the clip is never re-entered).
+    head_start: u64,
+    head_l: Vec<f32>,
+    head_r: Vec<f32>,
+}
+
+/// Frames decoded at a clip's loop entry point.
+pub struct LoopHead {
+    pub start: u64,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
 }
 
 impl ClipStream {
-    fn new(asset_frames: u64, queue: QueueConsumer<StreamBlock>, control: Arc<StreamControl>) -> Self {
+    fn new(asset_frames: u64, queue: QueueConsumer<StreamBlock>, control: Arc<StreamControl>, head: Option<LoopHead>) -> Self {
+        let head = head.unwrap_or(LoopHead { start: 0, left: Vec::new(), right: Vec::new() });
         Self {
             asset_frames,
             queue: Some(queue),
@@ -64,13 +82,66 @@ impl ClipStream {
             ring_fill: 0,
             ring_head: 0,
             generation: 0,
+            head_start: head.start,
+            head_l: head.left,
+            head_r: head.right,
         }
+    }
+
+    /// Sample at a fractional source position from the ring, or else from the loop-entry head;
+    /// reading from the head asks the worker to continue the ring right after it (RT-safe).
+    #[inline]
+    pub fn read_or_head(&mut self, pos: f64) -> Option<(f32, f32)> {
+        if let Some(v) = self.read(pos) {
+            return Some(v);
+        }
+        let v = self.read_head(pos)?;
+        // the ring resumes two frames before the head ends, so interpolating across the
+        // hand-over always finds both neighbours; skip when that request is already in flight
+        let resume = (self.head_start + self.head_l.len() as u64).saturating_sub(2);
+        let in_flight = self.ring_fill == 0 && self.last_request == resume;
+        if !in_flight && !self.has(resume, resume + 2) {
+            self.last_request = resume;
+            self.request(resume);
+        }
+        Some(v)
+    }
+
+    fn read_head(&self, pos: f64) -> Option<(f32, f32)> {
+        if pos < self.head_start as f64 {
+            return None;
+        }
+        let i = (pos.floor() as u64 - self.head_start) as usize;
+        if i + 1 >= self.head_l.len() {
+            return None;
+        }
+        let f = (pos - pos.floor()) as f32;
+        Some((self.head_l[i] + (self.head_l[i + 1] - self.head_l[i]) * f, self.head_r[i] + (self.head_r[i + 1] - self.head_r[i]) * f))
+    }
+
+    /// Frames in the loop-entry head (0 without one).
+    pub fn head_frames(&self) -> usize {
+        self.head_l.len()
     }
 
     /// A stream with no worker yet (replaced once the worker starts); reads always miss.
     pub fn placeholder(asset_frames: u64) -> Self {
         let control = Arc::new(StreamControl { want: AtomicU64::new(NO_WANT), generation: AtomicU64::new(0), stop: AtomicBool::new(false) });
-        Self { asset_frames, queue: None, control, last_request: NO_WANT, ring_l: Vec::new(), ring_r: Vec::new(), ring_start: 0, ring_fill: 0, ring_head: 0, generation: 0 }
+        Self {
+            asset_frames,
+            queue: None,
+            control,
+            last_request: NO_WANT,
+            ring_l: Vec::new(),
+            ring_r: Vec::new(),
+            ring_start: 0,
+            ring_fill: 0,
+            ring_head: 0,
+            generation: 0,
+            head_start: 0,
+            head_l: Vec::new(),
+            head_r: Vec::new(),
+        }
     }
 
     /// Request `source_frame` unless it was the last request already (RT-safe).
@@ -181,16 +252,43 @@ impl Drop for StreamWorker {
     }
 }
 
-/// Open readers for `infos` and start the worker. Returns the RT streams in order.
-pub fn start_streams(infos: &[(StreamInfo, u64)]) -> Result<(Vec<ClipStream>, StreamWorker), String> {
-    let mut rts = Vec::with_capacity(infos.len());
-    let mut feeds = Vec::with_capacity(infos.len());
-    for (info, first_frame) in infos {
+/// One streamed clip: where reading starts, and the loop entry point to keep a head of.
+pub struct StreamRequest {
+    pub info: StreamInfo,
+    pub first_frame: u64,
+    pub loop_entry: Option<u64>,
+}
+
+/// Decode `HEAD_FRAMES` at `start` (off the audio thread).
+fn decode_head(reader: &mut StreamReader, start: u64) -> Result<LoopHead, String> {
+    reader.seek(start).map_err(|e| e.to_string())?;
+    let (mut left, mut right) = (vec![0.0f32; HEAD_FRAMES], vec![0.0f32; HEAD_FRAMES]);
+    let mut got = 0;
+    while got < HEAD_FRAMES {
+        let end = (got + STREAM_BLOCK).min(HEAD_FRAMES);
+        let n = reader.read_into(&mut left[got..end], &mut right[got..end]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    left.truncate(got);
+    right.truncate(got);
+    Ok(LoopHead { start, left, right })
+}
+
+/// Open readers for `requests` and start the worker. Returns the RT streams in order.
+pub fn start_streams(requests: &[StreamRequest]) -> Result<(Vec<ClipStream>, StreamWorker), String> {
+    let mut rts = Vec::with_capacity(requests.len());
+    let mut feeds = Vec::with_capacity(requests.len());
+    for StreamRequest { info, first_frame, loop_entry } in requests {
         let mut reader = StreamReader::open(&info.path).map_err(|e| e.to_string())?;
+        // a head that cannot be read leaves the clip without one (it then gaps as before)
+        let head = loop_entry.and_then(|e| decode_head(&mut reader, e).map_err(|err| log::warn!("loop head for {}: {err}", info.path.display())).ok());
         reader.seek(*first_frame).map_err(|e| e.to_string())?;
         let (producer, consumer) = ControlQueue::create::<StreamBlock>(STREAM_QUEUE_BLOCKS);
         let control = Arc::new(StreamControl { want: AtomicU64::new(NO_WANT), generation: AtomicU64::new(0), stop: AtomicBool::new(false) });
-        rts.push(ClipStream::new(info.frames, consumer, control.clone()));
+        rts.push(ClipStream::new(info.frames, consumer, control.clone(), head));
         feeds.push(Feed { reader, producer, control, cursor: *first_frame, seen_generation: 0, done: false });
     }
     let stop = Arc::new(AtomicBool::new(false));
