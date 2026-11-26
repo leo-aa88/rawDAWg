@@ -1190,3 +1190,87 @@ fn the_effect_panel_opens_and_closes_a_hosted_plugins_own_window() {
     click_text(&mut h, "Open plugin window");
     assert!(is_open(&mut h), "reopens");
 }
+
+/// Open the "…" menu of rack row `index` (right-click) and click the entry `item`.
+fn rack_menu(h: &mut Harness, index: usize, item: &str) {
+    open_rack_menu(h, index, egui::PointerButton::Secondary);
+    let entry = h.drawn_nodes().into_iter().find(|(t, _)| t == item).map(|(_, r)| r).unwrap_or_else(|| panic!("menu entry {item:?} not drawn"));
+    h.click_at(entry.center(), egui::PointerButton::Primary);
+}
+
+/// Click the "…" button of rack row `index` with `button`.
+fn open_rack_menu(h: &mut Harness, index: usize, button: egui::PointerButton) {
+    h.frame(vec![]);
+    let grip = h.rect(super::rack_grip_id(h.app.project.channels[index].id));
+    let r = h
+        .drawn_nodes()
+        .into_iter()
+        .find(|(t, r)| t == "…" && r.center().y > grip.top() && r.center().y < grip.bottom() && r.left() > grip.right())
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| panic!("rack row {index} has no … button"));
+    h.click_at(r.center(), button);
+    // a popup's first frame is an invisible sizing pass; let it take its place
+    h.frame(vec![]);
+}
+
+#[test]
+fn rack_channels_are_duplicated_from_their_menu_and_reordered_by_dragging() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Rack;
+    h.frame(vec![]);
+    let first = h.app.project.channels[0].clone();
+    // put two notes on the first channel through its step row
+    for step in [0usize, 4] {
+        let r = h.rect(egui::Id::unique(("step", first.id, step)));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    }
+    assert_eq!(h.lane_notes().len(), 2);
+    let names = |h: &Harness| h.app.project.channels.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    let lane_len = |h: &Harness, id| h.app.project.patterns[0].lanes.iter().find(|l| l.channel_id == id).map_or(0, |l| l.notes.len());
+
+    // Duplicate: the sound and settings below the original, selected, no notes
+    let depth = h.app.history.undo_len();
+    rack_menu(&mut h, 0, "Duplicate");
+    assert_eq!(names(&h), vec![first.name.clone(), format!("{} 2", first.name)]);
+    let copy = h.app.project.channels[1].clone();
+    assert_eq!(copy.instrument.state, first.instrument.state);
+    assert_ne!(copy.instrument.id, first.instrument.id);
+    assert_eq!(h.app.selected_channel, Some(copy.id), "the copy is selected");
+    assert_eq!(lane_len(&h, copy.id), 0);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+
+    // Duplicate with notes (from the original): a third channel right below it, with notes
+    rack_menu(&mut h, 0, "Duplicate with notes");
+    assert_eq!(names(&h), vec![first.name.clone(), format!("{} 3", first.name), format!("{} 2", first.name)]);
+    let with_notes = h.app.project.channels[1].id;
+    assert_eq!(lane_len(&h, with_notes), 2, "the notes came along");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.channels.len(), 2, "one undo removes the copy and its notes");
+    assert_eq!(lane_len(&h, first.id), 2, "the original keeps its notes");
+
+    // drag the first row's grip below the last row: it moves to the end (one undo step)
+    let order = |h: &Harness| h.app.project.channels.iter().map(|c| c.id).collect::<Vec<_>>();
+    h.frame(vec![]);
+    let o = order(&h);
+    let top = h.rect(super::rack_grip_id(o[0]));
+    let bottom = h.rect(super::rack_grip_id(o[1]));
+    let depth = h.app.history.undo_len();
+    h.drag(top.center(), egui::pos2(bottom.center().x, bottom.bottom() + 8.0), egui::PointerButton::Primary);
+    assert_eq!(order(&h), vec![o[1], o[0]]);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // and back up with "Move up" from its menu
+    rack_menu(&mut h, 1, "Move up");
+    assert_eq!(order(&h), o);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(order(&h), vec![o[1], o[0]], "undo reverts the move");
+
+    // a left click opens the same menu, and it stays open while typing a new name
+    open_rack_menu(&mut h, 0, egui::PointerButton::Primary);
+    let field = h.rect(super::rack_rename_id(h.app.project.channels[0].id));
+    h.click_at(field.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Bassline".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(h.app.project.channels[0].name, "Bassline", "renamed from the menu");
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}

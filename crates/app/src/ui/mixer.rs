@@ -46,6 +46,35 @@ pub(crate) fn insert_handle_id(instance_id: InstanceId) -> egui::Id {
     egui::Id::unique(("insert-handle", instance_id))
 }
 
+/// A drag grip (three painted lines; no font glyph needed) for reordering a row. `active`
+/// while its row is being dragged.
+pub(crate) fn drag_grip(ui: &mut egui::Ui, id: egui::Id, active: bool, hint: &str) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
+    let handle = ui.interact(rect, id, Sense::drag());
+    let color = if active || handle.hovered() { theme::TEXT } else { theme::TEXT_SECONDARY };
+    for k in [-4.0f32, 0.0, 4.0] {
+        let y = rect.center().y + k;
+        ui.painter().hline(rect.center().x - 5.0..=rect.center().x + 5.0, y, egui::Stroke::new(1.5, color));
+    }
+    if handle.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(hint)
+}
+
+/// While a row from `from` is dragged: the index it would move to (see [`insert_drop_index`]),
+/// and an accent line `width` wide at that gap.
+pub(crate) fn drop_target(ui: &egui::Ui, rows: &[egui::Rect], from: usize, width: f32) -> Option<usize> {
+    let y = ui.ctx().pointer_interact_pos()?.y;
+    let target = insert_drop_index(rows, from, y);
+    if let (Some(first), true) = (rows.first(), target.is_some()) {
+        let gap = rows.iter().take_while(|r| r.center().y < y).count();
+        let line_y = rows.get(gap).map_or_else(|| rows.last().map_or(first.top(), |r| r.bottom()), |r| r.top());
+        ui.painter().hline(first.left()..=first.left() + width, line_y, egui::Stroke::new(2.0, theme::ACCENT));
+    }
+    target
+}
+
 /// Where a dragged insert lands: the gap nearest `pointer_y` among `rows` (top to bottom),
 /// as the `to_index` of `Command::MoveInsert` for the insert at `from`. `None` when it
 /// would stay where it is.
@@ -394,21 +423,9 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
             for (i, ins) in m.inserts.iter().enumerate() {
                 let row = ui.horizontal(|ui| {
                     // drag handle: drag the row up or down to reorder the chain
-                    let (rect, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
-                    let handle = ui.interact(rect, insert_handle_id(ins.id), Sense::drag());
-                    let dragging = app.mixer.insert_drag == Some(ins.id);
-                    let color = if dragging || handle.hovered() { theme::TEXT } else { theme::TEXT_SECONDARY };
-                    // grip: three short lines, painted (no font glyph needed)
-                    for k in [-4.0f32, 0.0, 4.0] {
-                        let y = rect.center().y + k;
-                        ui.painter().hline(rect.center().x - 5.0..=rect.center().x + 5.0, y, egui::Stroke::new(1.5, color));
-                    }
-                    let handle = handle.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to move this effect earlier or later in the chain");
+                    let handle = drag_grip(ui, insert_handle_id(ins.id), app.mixer.insert_drag == Some(ins.id), "Drag to move this effect earlier or later in the chain");
                     if handle.drag_started() {
                         app.mixer.insert_drag = Some(ins.id);
-                    }
-                    if handle.dragged() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                     }
                     if handle.drag_stopped() {
                         dropped = true;
@@ -455,15 +472,7 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
             if let Some(dragged) = app.mixer.insert_drag
                 && let Some(from) = m.inserts.iter().position(|i| i.id == dragged)
             {
-                let pointer_y = ui.ctx().pointer_interact_pos().map(|p| p.y);
-                let target = pointer_y.and_then(|y| insert_drop_index(&rows, from, y));
-                if let (Some(y), Some(first)) = (pointer_y, rows.first()) {
-                    let gap = rows.iter().take_while(|r| r.center().y < y).count();
-                    let line_y = rows.get(gap).map_or_else(|| rows.last().map_or(first.top(), |r| r.bottom()), |r| r.top());
-                    if target.is_some() {
-                        ui.painter().hline(first.left()..=first.left() + half, line_y, egui::Stroke::new(2.0, theme::ACCENT));
-                    }
-                }
+                let target = drop_target(ui, &rows, from, half);
                 if dropped {
                     if let Some(to_index) = target {
                         cmds.push(Command::MoveInsert { mixer_id: id, instance_id: dragged, to_index });

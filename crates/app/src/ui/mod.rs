@@ -2,6 +2,7 @@
 //! keyboards, synth parameter panel, settings, status.
 
 mod automation;
+mod channels;
 mod effect_panel;
 mod evolve;
 mod export;
@@ -177,6 +178,10 @@ pub(crate) struct App {
     /// Hosted plugins whose own editor changed parameters, with the time of the last change;
     /// their state is committed to the project once the editing pauses.
     pub plugin_editor_edits: HashMap<rawdawg_types::InstanceId, std::time::Instant>,
+    /// Rack channel being dragged by its grip to a new place.
+    pub rack_drag: Option<ChannelId>,
+    /// The name being typed in a rack channel's menu (reset each time the menu opens).
+    rack_rename: Option<(ChannelId, String)>,
     /// Third-party plugin catalog, loaded modules and scan state.
     pub plugin_host: crate::plugins::PluginHost,
     plugin_refresh_counter: u32,
@@ -283,6 +288,8 @@ impl App {
             assets: rawdawg_audio_engine::ProjectAssetCache::new(None),
             other_mirrors: HashMap::new(),
             plugin_editor_edits: HashMap::new(),
+            rack_drag: None,
+            rack_rename: None,
             plugin_host: crate::plugins::PluginHost::load(opts.safe_mode, persist_prefs, opts.catalog.clone()),
             plugin_refresh_counter: 0,
             instrument_panel: Default::default(),
@@ -1256,8 +1263,19 @@ impl App {
         let mut cmds: Vec<Command> = Vec::new();
         let mut select: Option<ChannelId> = None;
         let channels = self.project.channels.clone();
-        for ch in &channels {
-            ui.horizontal(|ui| {
+        let mut rows: Vec<egui::Rect> = Vec::with_capacity(channels.len());
+        let mut dropped = false;
+        let mut duplicate: Option<(ChannelId, bool)> = None;
+        for (ci, ch) in channels.iter().enumerate() {
+            let row = ui.horizontal(|ui| {
+                // drag grip: move the channel up or down the rack (one undo step)
+                let grip = mixer::drag_grip(ui, rack_grip_id(ch.id), self.rack_drag == Some(ch.id), "Drag to move this channel up or down the rack");
+                if grip.drag_started() {
+                    self.rack_drag = Some(ch.id);
+                }
+                if grip.drag_stopped() {
+                    dropped = true;
+                }
                 let selected = self.selected_channel == Some(ch.id);
                 if ui.selectable_label(selected, "IN").on_hover_text("Route typing/MIDI/on-screen keys here").clicked() {
                     select = Some(ch.id);
@@ -1270,16 +1288,45 @@ impl App {
                 if ui.toggle_value(&mut solo, "S").on_hover_text("Solo").changed() {
                     cmds.push(Command::SetChannelSolo { id: ch.id, solo });
                 }
-                if ui.button(egui::RichText::new(&ch.name).strong()).on_hover_text("Open instrument editor (right-click: rename/delete)").clicked() {
+                if ui.button(egui::RichText::new(&ch.name).strong()).on_hover_text("Open the instrument editor").clicked() {
                     select = Some(ch.id);
                     self.editor_view = EditorView::Synth;
                 }
-                let r = ui.small_button("…").on_hover_text("Rename / delete");
-                r.context_menu(|ui| {
-                    ui.label("Rename");
-                    let mut name = ch.name.clone();
-                    if ui.text_edit_singleline(&mut name).lost_focus() && name != ch.name && !name.trim().is_empty() {
-                        cmds.push(Command::RenameChannel { id: ch.id, name: name.trim().to_owned() });
+                let r = ui.small_button("…").on_hover_text("Rename, duplicate, move or delete this channel");
+                // left or right click opens it; it stays open while typing a new name (every entry closes it)
+                let toggle = (r.clicked() || r.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
+                if toggle.is_some() {
+                    self.rack_rename = None;
+                }
+                egui::Popup::menu(&r).open_memory(toggle).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.label("Rename (Enter applies)");
+                    if self.rack_rename.as_ref().is_none_or(|(id, _)| *id != ch.id) {
+                        self.rack_rename = Some((ch.id, ch.name.clone()));
+                    }
+                    let Some((_, name)) = self.rack_rename.as_mut() else { return };
+                    let field = ui.add(egui::TextEdit::singleline(name).id(rack_rename_id(ch.id)));
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let name = name.trim().to_owned();
+                        if !name.is_empty() && name != ch.name {
+                            cmds.push(Command::RenameChannel { id: ch.id, name });
+                        }
+                        self.rack_rename = None;
+                        ui.close();
+                    }
+                    if ui.button("Duplicate").on_hover_text("A copy of this channel's sound and settings, below it").clicked() {
+                        duplicate = Some((ch.id, false));
+                        ui.close();
+                    }
+                    if ui.button("Duplicate with notes").on_hover_text("The copy also gets this channel's notes in every pattern").clicked() {
+                        duplicate = Some((ch.id, true));
+                        ui.close();
+                    }
+                    if ci > 0 && ui.button("Move up").clicked() {
+                        cmds.push(Command::MoveChannel { id: ch.id, to_index: ci - 1 });
+                        ui.close();
+                    }
+                    if ci + 1 < channels.len() && ui.button("Move down").clicked() {
+                        cmds.push(Command::MoveChannel { id: ch.id, to_index: ci + 1 });
                         ui.close();
                     }
                     if ui.button("Delete channel (undoable)").clicked() {
@@ -1287,9 +1334,6 @@ impl App {
                         ui.close();
                     }
                 });
-                if r.clicked() {
-                    // the context menu opens on secondary click; a primary click opens it too
-                }
                 let mut gain = ch.gain_db.0;
                 let r = ui.add(egui::Slider::new(&mut gain, -60.0..=12.0).suffix(" dB").fixed_decimals(1).show_value(true));
                 if r.drag_started() {
@@ -1338,6 +1382,34 @@ impl App {
                 ui.separator();
                 sequencer::step_row(self, ui, ch.id, &mut cmds);
             });
+            rows.push(row.response.rect);
+        }
+        // while dragging: a line shows where the channel will land; release moves it
+        if let Some(dragged) = self.rack_drag
+            && let Some(from) = channels.iter().position(|c| c.id == dragged)
+        {
+            let width = rows.first().map_or(200.0, |r| r.width());
+            let target = mixer::drop_target(ui, &rows, from, width);
+            if dropped {
+                if let Some(to_index) = target {
+                    cmds.push(Command::MoveChannel { id: dragged, to_index });
+                }
+                self.rack_drag = None;
+            }
+        } else if dropped {
+            self.rack_drag = None;
+        }
+        if let Some((id, with_notes)) = duplicate {
+            // a plugin window's latest edits belong to the sound being copied
+            if let Some(inst) = channels.iter().find(|c| c.id == id).map(|c| c.instrument.id)
+                && self.plugin_editor_edits.remove(&inst).is_some()
+            {
+                self.commit_plugin_state(inst, "plugin window edit");
+            }
+            if let Some((cmd, new_id)) = channels::duplicate_channel(&self.project, id, with_notes) {
+                cmds.push(cmd);
+                select = Some(new_id);
+            }
         }
         if let Some(id) = select {
             self.selected_channel = Some(id);
@@ -1833,4 +1905,13 @@ impl App {
             self.editor_view = EditorView::Effect;
         }
     }
+}
+
+/// Id of a rack row's drag grip (stable, for input tests).
+pub(crate) fn rack_rename_id(id: ChannelId) -> egui::Id {
+    egui::Id::unique(("rack-rename", id))
+}
+
+pub(crate) fn rack_grip_id(id: ChannelId) -> egui::Id {
+    egui::Id::unique(("rack-grip", id))
 }
