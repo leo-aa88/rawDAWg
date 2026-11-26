@@ -1017,6 +1017,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             let mut runs: Vec<Vec<&str>> = vec![
                 vec!["test", "-q", "-p", "rawdawg-ui", "--test", "editor_window", "--", "--ignored"],
                 vec!["test", "-q", "-p", "rawdawg", "--bin", "rawdawg", "the_effect_panel_opens", "--", "--ignored"],
+                vec!["test", "-q", "-p", "rawdawg-plugin-host", "--test", "editor_lifecycle", "--", "--ignored"],
             ];
             if cfg!(target_os = "linux") {
                 runs.push(vec!["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_editor", "--", "--ignored"]);
@@ -1032,7 +1033,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             }
             Ok((
                 format!(
-                    "{} display tests passed: painted frame read back pixel-exact, resize, 2x scale, parent destruction{}; effect panel opens, closes and reopens the plugin window",
+                    "{} display tests passed: painted frame read back pixel-exact, resize, 2x scale, parent destruction{}; effect panel opens, closes and reopens the plugin window; hosted CLAP and VST3 editors open, stay alive, close and reopen",
                     runs.len(),
                     if cfg!(target_os = "linux") { "; rawDAWg hosts its exported CLAP (timer-support) and VST3 (IRunLoop) delay editors, X input drags a slider, the host sees the edit, close/reopen" } else { "" }
                 ),
