@@ -409,6 +409,13 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Tests: every parameter of all 17 exported plugins through both built modules against the native readouts, step mappings and read-back (`hosted_readouts_…` in `crates/plugin-host/tests/clap_host.rs` and `vst3_host.rs`); the export test now checks stepped values are whole numbers inside the declared range; UI test reads the drawn panel through egui's accessibility tree; unit tests for text cleaning, the unit-label rule and the bounded cache. Mutation checks: restoring the 0…1 export range fails the host test; restoring the old panel readout fails the UI test (`0.889` drawn instead of `322.2 ms`).
 - Commands: `cargo fmt --all --check` (0), `cargo clippy --workspace --all-targets -- -D warnings` (0), `cargo test --workspace --no-fail-fast` (374 passed, 0 failed), `cargo xtask verify --suite all` (21 PASS, 5 BLOCKED: PL-03/04/05, HW-01, GUI-01).
 
+### Slice 7 — large plugin states in `plugin-state/` files; failed restores keep a stand-in (DATA-01, PLUG-02)
+
+- `crates/project/src/plugin_state.rs` (ADR 0005): at save and autosave, canonical base64 blobs over 16 KiB in third-party states (`*_b64` fields) are written as raw bytes to content-addressed `plugin-state/<sha256>.bin` and referenced from the manifest; load and autosave recovery read them back (exact name, size ≤ 64 MiB, SHA-256 checked), so the loaded model equals the saved one. Unchanged blobs are not rewritten; blobs no manifest (project, previous, autosaves) refers to are removed, never other files and never when a manifest is unreadable. Base64 moved from `plugin-host` to `rawdawg-types` (re-exported).
+- A reference whose file is missing or damaged keeps the instance a stand-in with the reason, and saving keeps the reference; the plugin comes back when the file does.
+- **Defect fixed:** a hosted plugin whose saved state failed to restore was hosted with default settings (warning only), so the next edit overwrote the saved state. It now stays a stand-in that keeps the state (PLUGIN_API.md §3). The host returns an explicit error for a state field that is not inline instead of treating it as empty.
+- Tests: three `plugin_state` unit tests (round trip, missing/damaged/forged references incl. traversal and size limit, content addressing and pruning incl. autosave references and unreadable manifests, non-canonical base64), UI test `large_hosted_plugin_state_…` (the hosted rawDAWg Synth's 47 KB state: save, layout on disk, reopen with the edited value, missing file → stand-in with the file named and reference kept on save, file back → hosted, unrestorable state → stand-in). Mutation check: restoring the old warn-and-continue restore fails the UI test.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -435,6 +442,8 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - 0001 toolchain, pins, licenses (repo LICENSE is AGPL-3.0 placed by owner; final license still an owner decision).
 - 0002 RT ownership and crate layout deviations (`rt` crate added; `plugin-api` folded into `dsp::processor`; sequencer/mixer inside `audio-engine` for now).
 - 0003 mipmapped wavetables replace PolyBLEP (31 dB measured < 35 dB gate).
+- 0004 hosted plugins: one instance split between the UI mirror and the realtime plan.
+- 0005 large opaque plugin state in content-addressed `plugin-state/` files; unreadable or unrestorable states keep a stand-in.
 
 ## Open gates (not passed; do not mark as done)
 
@@ -465,7 +474,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 ## Next action
 
-M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset, lintian clean; slice 2: reference benchmarks in `docs/verification/benchmarks.md`; slice 3: parser fuzzing with five fixed findings and a passing 30-minute soak in `docs/verification/robustness.md`; slice 4: dependency audit, user guide quickstart, real-time convolution at 30 s; slice 5: grammar-based expression fuzzing, audio-thread clamp panic fixed; slice 6: plugin-formatted readouts for hosted plugins, stepped CLAP export parameters fixed). Next, in order:
+M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset, lintian clean; slice 2: reference benchmarks in `docs/verification/benchmarks.md`; slice 3: parser fuzzing with five fixed findings and a passing 30-minute soak in `docs/verification/robustness.md`; slice 4: dependency audit, user guide quickstart, real-time convolution at 30 s; slice 5: grammar-based expression fuzzing, audio-thread clamp panic fixed; slice 6: plugin-formatted readouts for hosted plugins, stepped CLAP export parameters fixed; slice 7: large plugin states in `plugin-state/` files, failed restores keep a stand-in). Next, in order:
 1. Investigate the max-block spikes on bare metal (Ubuntu 24.04, real-time-priority thread) before optimising anything.
 2. CI: the workflow runs on GitHub only when the owner pushes (not done by the agent).
-3. M7 follow-ups: plugin editors (export `gui`/`IPlugView`, host embedding on X11/XWayland), large opaque state spill; validators/independent hosts when available. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.
+3. M7 follow-ups: plugin editors (export `gui`/`IPlugView`, host embedding on X11/XWayland); validators/independent hosts when available. Carried leftovers: insert drag-reorder, pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.

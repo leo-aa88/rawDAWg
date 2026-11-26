@@ -1,4 +1,6 @@
-//! Minimal standard base64 (RFC 4648, padded) for opaque plugin state inside project JSON.
+//! Minimal standard base64 (RFC 4648, padded) for opaque plugin state inside project JSON
+//! (written by the plugin host, spilled to and read back from `plugin-state/` files by the
+//! project crate).
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

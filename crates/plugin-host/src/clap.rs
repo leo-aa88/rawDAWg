@@ -440,6 +440,9 @@ fn to_plugin_value(d: &ParamDescriptor, normalized: f32) -> f64 {
 /// Project-side JSON envelope for an external instance's state.
 pub const STATE_KEY: &str = "clap_state_b64";
 
+/// Error for a state blob that is still a `plugin-state/` file reference (unreadable file).
+pub(crate) const NOT_INLINE: &str = "the saved plugin state is still a plugin-state file reference (the file could not be read)";
+
 impl Processor for ClapInstance {
     fn type_id(&self) -> &'static str {
         self.type_id
@@ -523,7 +526,8 @@ impl Processor for ClapInstance {
         {
             return Err(format!("state belongs to {id}, not {}", self.plugin_id));
         }
-        let Some(b64) = obj.get(STATE_KEY).and_then(|s| s.as_str()) else { return Ok(()) };
+        let Some(field) = obj.get(STATE_KEY) else { return Ok(()) };
+        let Some(b64) = field.as_str() else { return Err(NOT_INLINE.into()) };
         let raw = crate::b64::decode(b64)?;
         self.texts.clear();
         self.load_plugin_state(&raw)

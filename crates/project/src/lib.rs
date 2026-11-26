@@ -6,6 +6,7 @@ pub mod commands;
 pub mod lock;
 pub mod model;
 pub mod persist;
+pub mod plugin_state;
 pub mod preset;
 pub mod smf;
 pub mod validate;

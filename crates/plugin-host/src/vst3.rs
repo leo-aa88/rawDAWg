@@ -1147,9 +1147,13 @@ impl Processor for Vst3Instance {
         {
             return Err(format!("state belongs to {id}, not {}", self.plugin_id));
         }
-        let Some(c) = obj.get(COMPONENT_STATE_KEY).and_then(|s| s.as_str()) else { return Ok(()) };
+        let Some(field) = obj.get(COMPONENT_STATE_KEY) else { return Ok(()) };
+        let Some(c) = field.as_str() else { return Err(crate::clap::NOT_INLINE.into()) };
         let component = crate::b64::decode(c)?;
-        let controller = obj.get(CONTROLLER_STATE_KEY).and_then(|s| s.as_str()).map(crate::b64::decode).transpose()?;
+        let controller = match obj.get(CONTROLLER_STATE_KEY) {
+            None => None,
+            Some(v) => Some(crate::b64::decode(v.as_str().ok_or(crate::clap::NOT_INLINE)?)?),
+        };
         self.texts.clear();
         self.load_plugin_state(&component, controller.as_deref())?;
         if let Some(pending) = obj.get("pending").and_then(|p| p.as_object()) {

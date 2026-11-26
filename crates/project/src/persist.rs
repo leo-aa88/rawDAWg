@@ -65,7 +65,11 @@ pub fn load_project_dir(path: &Path) -> Result<Project, PersistError> {
         return Err(PersistError::TooLarge { bytes: meta.len(), max: crate::MAX_PROJECT_JSON_BYTES });
     }
     let bytes = fs::read(&file).map_err(io(&file))?;
-    parse_project(&bytes)
+    let mut project = parse_project(&bytes)?;
+    // large plugin states saved beside the manifest; unreadable ones stay references and the
+    // instance opens as a stand-in (crate::plugin_state)
+    let _ = crate::plugin_state::inline(&dir, &mut project);
+    Ok(project)
 }
 
 /// Parse and validate project JSON bytes.
@@ -108,7 +112,8 @@ pub fn save_project_dir(dir: &Path, p: &Project) -> Result<(), PersistError> {
         let d = dir.join(sub);
         fs::create_dir_all(&d).map_err(io(&d))?;
     }
-    let bytes = project_to_json(p);
+    let on_disk = crate::plugin_state::spill(dir, p)?;
+    let bytes = project_to_json(on_disk.as_ref().unwrap_or(p));
     let target = dir.join(PROJECT_FILE);
     let tmp = dir.join(format!("{PROJECT_FILE}.tmp-{}", std::process::id()));
     {
@@ -139,6 +144,7 @@ pub fn save_project_dir(dir: &Path, p: &Project) -> Result<(), PersistError> {
     if !marker.is_file() {
         let _ = fs::write(&marker, MARKER_TEXT);
     }
+    crate::plugin_state::prune_unreferenced(dir);
     #[cfg(unix)]
     {
         if let Ok(d) = fs::File::open(dir) {
@@ -166,9 +172,10 @@ pub fn autosave(dir: &Path, p: &Project) -> Result<PathBuf, PersistError> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
     let target = d.join(format!("{now:013}-{:08}.json", p.revision));
     let tmp = d.join(format!("{now:013}-{:08}.json.tmp-{}", p.revision, std::process::id()));
+    let on_disk = crate::plugin_state::spill(dir, p)?;
     {
         let mut f = fs::File::create(&tmp).map_err(io(&tmp))?;
-        f.write_all(&project_to_json(p)).map_err(io(&tmp))?;
+        f.write_all(&project_to_json(on_disk.as_ref().unwrap_or(p))).map_err(io(&tmp))?;
         f.sync_all().map_err(io(&tmp))?;
     }
     fs::rename(&tmp, &target).map_err(|e| PersistError::Io { path: target.clone(), source: e })?;
@@ -179,6 +186,7 @@ pub fn autosave(dir: &Path, p: &Project) -> Result<PathBuf, PersistError> {
         let old = names.remove(0);
         let _ = fs::remove_file(old);
     }
+    crate::plugin_state::prune_unreferenced(dir);
     Ok(target)
 }
 

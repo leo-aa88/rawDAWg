@@ -73,7 +73,11 @@ impl App {
     /// Use a recovery candidate as the working project (dirty; the saved manifest stays until Save).
     pub(crate) fn recover_from(&mut self, candidate: &RecoveryCandidate) {
         match std::fs::read(&candidate.path).map_err(|e| e.to_string()).and_then(|b| rawdawg_project::persist::parse_project(&b).map_err(|e| e.to_string())) {
-            Ok(p) => {
+            Ok(mut p) => {
+                if let Some(dir) = &self.project_path {
+                    // large plugin states of the autosave live in the project's plugin-state/
+                    let _ = rawdawg_project::plugin_state::inline(dir, &mut p);
+                }
                 self.send(EngineCommand::Panic { source: None });
                 self.project = p;
                 self.history = History::new();

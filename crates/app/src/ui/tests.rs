@@ -918,3 +918,90 @@ fn hosted_effect_panel_shows_the_plugins_value_text_and_named_choices() {
     let target = rawdawg_project::AutomationTarget { instance_id: ext.id, param_id: time.id.0 };
     assert_eq!(super::automation::value_text(&h.app, &target, Some(&time), 0.5), time_native.format(0.5));
 }
+
+#[test]
+fn large_hosted_plugin_state_is_saved_beside_the_manifest_and_a_missing_file_keeps_a_stand_in() {
+    use rawdawg_project::plugin_state::{FILE_REF_KEY, SPILL_ABOVE_BYTES};
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-pstate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("Big.rawdawg");
+    rawdawg_project::save_project_dir(&dir, &rawdawg_project::Project::new_default("Big", serde_json::json!({}))).unwrap();
+    let dir_s = dir.to_str().unwrap().to_owned();
+    let open = |with_catalog: bool| {
+        let mut h = Harness::new(Some(&dir_s));
+        if with_catalog {
+            h.app.plugin_host.catalog.insert_library(hosted_catalog());
+            h.app.rebuild_mirrors();
+            h.app.recompile();
+            h.frame(vec![]);
+        }
+        h
+    };
+
+    // the hosted rawDAWg Synth (CLAP) replaces channel 1's instrument; one parameter is edited
+    let mut h = open(true);
+    let lib_path = hosted_catalog().path;
+    let synth = h.app.plugin_host.catalog.find(rawdawg_plugin_host::Format::Clap, "rawdawg.synth", None).map(|(_, p)| p.clone()).unwrap();
+    h.app.selected_channel = Some(h.app.project.channels[0].id);
+    let master = h.app.project.mixer.master_id;
+    h.app.add_catalog_plugin(&synth, &lib_path, master);
+    h.frame(vec![]);
+    let id = h.app.project.channels[0].instrument.id;
+    let mirror = h.app.other_mirrors.get_mut(&id).expect("hosted synth");
+    let cutoff = *mirror.descriptors().iter().find(|d| d.name.contains("Cutoff")).expect("a cutoff parameter");
+    assert!(mirror.set_param(cutoff.id, 0.37));
+    let state: serde_json::Value = serde_json::from_slice(&mirror.save_state()).unwrap();
+    h.app.apply(rawdawg_project::Command::SetInstanceState { instance_id: id, state_version: 1, state: state.clone() });
+    let raw = rawdawg_plugin_host::b64::decode(state[rawdawg_plugin_host::clap::STATE_KEY].as_str().unwrap()).unwrap();
+    assert!(raw.len() > SPILL_ABOVE_BYTES, "the synth's own state is {} bytes", raw.len());
+    h.app.save_project_checked();
+    assert!(h.app.status_line.starts_with("Saved"), "{}", h.app.status_line);
+    drop(h);
+
+    // on disk: the manifest names the blob, the blob holds the plugin's bytes
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+    let field = &manifest["channels"][0]["instrument"]["state"][rawdawg_plugin_host::clap::STATE_KEY];
+    let rel = field[FILE_REF_KEY].as_str().expect("a plugin-state reference").to_owned();
+    assert_eq!(field["bytes"], raw.len());
+    assert_eq!(std::fs::read(dir.join(&rel)).unwrap(), raw);
+    assert!(std::fs::metadata(dir.join("project.json")).unwrap().len() < raw.len() as u64, "the manifest no longer carries the blob");
+
+    // reopening restores the edited value in the live plugin
+    let h = open(true);
+    let live = h.app.other_mirrors.get(&id).expect("hosted again after reopening");
+    assert!(rawdawg_plugin_host::is_hosted(live.as_ref()));
+    assert!((live.param(cutoff.id).unwrap() - 0.37).abs() < 1e-4);
+    assert_eq!(h.app.project.channels[0].instrument.state, state, "the loaded model carries the state inline");
+    drop(h);
+
+    // without the file the instrument stays a stand-in and saving keeps the reference
+    let blob = dir.join(&rel);
+    let kept = root.join("blob.bin");
+    std::fs::rename(&blob, &kept).unwrap();
+    let mut h = open(true);
+    assert!(h.app.other_mirrors.get(&id).is_none_or(|m| !rawdawg_plugin_host::is_hosted(m.as_ref())), "not hosted with a default state");
+    let notes = missing_plugin_notes(&h.app.project, &h.app.plugin_host).join("; ");
+    assert!(notes.contains("missing or damaged") && notes.contains(&rel), "{notes}");
+    h.app.save_project_checked();
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+    assert_eq!(manifest["channels"][0]["instrument"]["state"][rawdawg_plugin_host::clap::STATE_KEY][FILE_REF_KEY], rel.as_str(), "reference saved unchanged");
+    drop(h);
+
+    // once the file is back, the plugin and its state are back
+    std::fs::rename(&kept, &blob).unwrap();
+    let h = open(true);
+    let live = h.app.other_mirrors.get(&id).expect("hosted once the file is back");
+    assert!((live.param(cutoff.id).unwrap() - 0.37).abs() < 1e-4);
+
+    // a saved state the plugin cannot restore also keeps a stand-in (never a default-state plugin)
+    let mut damaged = h.app.project.channels[0].instrument.clone();
+    damaged.id = rawdawg_types::InstanceId::new();
+    damaged.state[rawdawg_plugin_host::clap::STATE_KEY] = serde_json::json!("@@@@");
+    let mut mirrors = std::collections::HashMap::new();
+    let mut h = h;
+    let err = crate::plugins::ensure_external_mirror(&mut h.app.plugin_host, &mut mirrors, &damaged).expect_err("refused");
+    assert!(err.contains("could not be restored") && err.contains("keeps the state"), "{err}");
+    assert!(mirrors.is_empty());
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}

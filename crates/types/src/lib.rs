@@ -9,6 +9,7 @@
 //! * parameter descriptors with normalized/physical mapping ([`params`]),
 //! * engine budgets ([`limits`]).
 
+pub mod b64;
 pub mod events;
 pub mod ids;
 pub mod limits;

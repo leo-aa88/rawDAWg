@@ -11,7 +11,8 @@
 //! Native plugin code executes as the user; scanner isolation is crash
 //! containment, not a security sandbox.
 
-pub mod b64;
+/// Base64 for opaque state (moved to `rawdawg-types`; re-exported for existing callers).
+pub use rawdawg_types::b64;
 pub mod catalog;
 pub mod clap;
 pub mod describe;

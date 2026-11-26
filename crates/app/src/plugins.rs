@@ -175,6 +175,11 @@ impl PluginHost {
         match inst.format {
             PluginFormat::Native => None,
             PluginFormat::Clap | PluginFormat::Vst3 => {
+                // a saved state that could not be read back from plugin-state/ keeps the instance
+                // a stand-in: hosting it with defaults would overwrite the saved state on the next edit
+                if let Some(file) = rawdawg_project::plugin_state::unresolved_reference(&inst.state) {
+                    return Some(format!("its saved state file {file} is missing or damaged; the stand-in keeps the reference until the file is back"));
+                }
                 if self.lookup(inst).is_some() {
                     None
                 } else if let Some(q) = inst.path_hint.as_deref().and_then(|p| self.catalog.quarantined(std::path::Path::new(p))) {
@@ -199,9 +204,9 @@ impl PluginHost {
         };
         if !inst.state.is_null() {
             let bytes = serde_json::to_vec(&inst.state).map_err(|e| e.to_string())?;
-            if let Err(e) = live.load_state(&bytes) {
-                log::warn!("{}: saved plugin state not restored: {e}", desc.name);
-            }
+            // PLUGIN_API.md §3: a state that fails to restore keeps its bytes and shows a
+            // placeholder, instead of a live plugin with defaults that a later edit would save
+            live.load_state(&bytes).map_err(|e| format!("its saved state could not be restored ({e}); the stand-in keeps the state"))?;
         }
         Ok(live)
     }
