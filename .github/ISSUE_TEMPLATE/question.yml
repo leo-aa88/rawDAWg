@@ -1,0 +1,21 @@
+name: Question
+description: Ask how something works or how to use it.
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, please check the user guide (`docs/USER_GUIDE.md`), especially the
+        keyboard map and troubleshooting sections, and `PROGRESS.md` for known limitations.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What you tried, your OS and version (`rawdawg --version`), and anything you saw on screen or in the terminal.

@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest something rawDAWg should do.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        rawDAWg aims for maximum expressiveness with minimum cognitive overhead: the best
+        requests describe the sound or the workflow you want, not a setting. It stays native
+        and offline (no web or Electron front end, no cloud features).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The musical result or workflow, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: How you imagine it working. Sketches and references to other instruments or DAWs are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you tried
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Sound design (synth, sampler, effects)
+        - Arranging (rack, piano roll, playlist, automation)
+        - Mixing
+        - Recording
+        - Plugins
+        - Files, import and export
+        - User interface
+        - Other

@@ -56,6 +56,18 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// The Debian package version: a semver pre-release (`0.2.0-rc.1`) becomes `0.2.0~rc.1`, which
+/// Debian orders before `0.2.0` (a plain hyphen would be read as a Debian revision).
+pub fn deb_version() -> String {
+    version().replacen('-', "~", 1)
+}
+
+/// The MSI product version: Windows Installer accepts only numeric `major.minor.build`, so a
+/// pre-release suffix is dropped (file names keep the full version).
+pub fn msi_version() -> &'static str {
+    version().split(['-', '+']).next().unwrap_or("0.0.0")
+}
+
 pub fn version() -> &'static str {
     rawdawg_types::VERSION
 }
@@ -297,7 +309,7 @@ pub fn mime_xml() -> String {
 pub fn deb_control(installed_kib: u64) -> String {
     format!(
         "Package: {PACKAGE}\nVersion: {ver}\nSection: sound\nPriority: optional\nArchitecture: amd64\nMaintainer: {MAINTAINER}\nInstalled-Size: {installed_kib}\nDepends: libc6 (>= 2.34), libgcc-s1, libasound2t64 (>= 1.2) | libasound2 (>= 1.2)\nRecommends: pipewire-alsa | pulseaudio\nSuggests: jackd2\nHomepage: {HOMEPAGE}\nDescription: native experimental digital audio workstation\n {DISPLAY_NAME}: {TAGLINE}\n A native Rust digital audio workstation with its own synthesizer and\n effect suite, CLAP/VST3 hosting and CLAP/VST3 exports of its\n instruments and effects. Offline, dark only.\n",
-        ver = version()
+        ver = deb_version()
     )
 }
 
@@ -497,8 +509,9 @@ pub fn deb_changelog(root: &Path) -> String {
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "Wed, 25 Nov 2026 00:00:00 +0000".into());
     format!(
-        "{PACKAGE} ({ver}) unstable; urgency=medium\n\n  * {DISPLAY_NAME} {ver} built from source. See /usr/share/doc/{PACKAGE}/README.md\n    and the project's PROGRESS.md for what this version contains and which\n    release gates remain open.\n\n -- {MAINTAINER}  {date}\n",
-        ver = version()
+        "{PACKAGE} ({deb_ver}) unstable; urgency=medium\n\n  * {DISPLAY_NAME} {ver} built from source. See /usr/share/doc/{PACKAGE}/README.md\n    and the project's PROGRESS.md for what this version contains and which\n    release gates remain open.\n\n -- {MAINTAINER}  {date}\n",
+        ver = version(),
+        deb_ver = deb_version()
     )
 }
 
@@ -624,7 +637,7 @@ pub fn package_msi(root: &Path) -> anyhow::Result<Produced> {
         .arg("-d")
         .arg(format!("Payload={}", payload.display()))
         .arg("-d")
-        .arg(format!("Version={}", version()))
+        .arg(format!("Version={}", msi_version()))
         .arg(root.join("packaging").join("windows").join("rawdawg.wxs")))?;
     let mut produced = Produced { artifacts: vec![msi.clone()], staging: payload, warnings: vec!["unsigned MSI (signing is an owner decision)".into()] };
     produced.artifacts.push(checksums(&out_dir, &[msi])?);
@@ -739,6 +752,16 @@ impl Sha256 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn package_versions_follow_each_format_rules() {
+        // the build's own version is plain x.y.z unless a release stamped a pre-release
+        let v = version();
+        assert_eq!(deb_version(), v.replacen('-', "~", 1));
+        assert!(msi_version().split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())), "{}", msi_version());
+        assert!(v.starts_with(msi_version()));
+        assert!(deb_control(1).contains(&format!("Version: {}\n", deb_version())));
+    }
 
     #[test]
     fn checksums_from_separate_package_runs_accumulate() {

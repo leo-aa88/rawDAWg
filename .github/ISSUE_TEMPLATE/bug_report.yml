@@ -1,0 +1,81 @@
+name: Bug report
+description: Something crashes, sounds wrong, or behaves differently from the user guide.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If a project or file is needed to reproduce the bug, attach one you
+        made yourself; do not attach commercial sample libraries or other people's music.
+        A crash inside a third-party plugin: please use the "Plugin compatibility" form instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead? For audio problems, describe what you heard.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps, ideally from a new project. CLI commands if the bug reproduces headless (`rawdawg --headless-render ...`).
+      placeholder: |
+        1. New project, add a Reverb insert on the master
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: Terminal output (start rawdawg from a terminal; `RUST_LOG=debug` gives more detail), the status line text, or a panic message.
+      render: text
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Synth / waveform / modular graph
+        - Sampler / SoundFont
+        - Effects
+        - Mixer / routing
+        - Rack / piano roll / playlist / automation
+        - Recording / audio input
+        - Audio device / latency / dropouts
+        - MIDI
+        - Project files / presets / recovery
+        - Import / export (WAV, FLAC, MP3, MIDI, stems)
+        - Plugin hosting (CLAP / VST3)
+        - rawDAWg plugins in another host
+        - Installer / package (deb, MSI, portable)
+        - User interface
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `rawdawg --version`, or the commit (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, how you installed rawDAWg (deb, MSI, portable, from source), audio interface and driver/API (WASAPI, ASIO, ALSA, PipeWire, JACK), sample rate and buffer size, display scale.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This report contains no copyrighted material I do not own.
+          required: true

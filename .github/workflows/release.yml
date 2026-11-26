@@ -1,0 +1,347 @@
+# Build and publish a rawDAWg release: the Ubuntu .deb, the Windows MSI and the Windows portable
+# zip (each with the rawDAWg binary and the CLAP and VST3 plugins) attached to a GitHub Release,
+# with SHA-256 checksums.
+#
+# - A release is cut manually via workflow_dispatch (choose a semver bump), or by pushing a
+#   vX.Y.Z (or vX.Y.Z-pre.N) tag.
+# - Releases only commits that passed CI: the version job refuses a commit without a successful
+#   `CI` run (fmt, clippy, every test and verification suite, packaging, on Ubuntu and
+#   Windows). The pull-request dry run of the packaging is that CI workflow, which builds and
+#   checks the same packages on every PR, so this workflow does not repeat it.
+# - Git tags are the source of truth for release versions. A release never commits to main:
+#   the dispatch path computes the next version from the latest vX.Y.Z tag and pushes ONLY that
+#   tag. The version is stamped from the tag into [workspace.package] in Cargo.toml at build
+#   time (Cargo.lock is refreshed for the workspace crates only, checked), so
+#   `rawdawg --version`, the package metadata and the file names all match the tag. The
+#   committed version is the floor used between releases; bump it in a normal PR when wanted.
+# - Every package is smoke-tested before publishing: the packaged binary must report the
+#   release version and render the demo project offline.
+# - Packages are unsigned. Signing and the legal publisher identity are owner decisions.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver bump over the latest vX.Y.Z release tag"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# Read-only by default. The version and publish jobs elevate only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+# Actions are pinned to release commits (verified with `gh api repos/<owner>/<repo>/commits/<tag>`):
+#   actions/checkout v7.0.1, Swatinem/rust-cache v2.9.3, actions/upload-artifact v7.0.2,
+#   actions/download-artifact v8.0.2, softprops/action-gh-release v3.0.4.
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # pushes the release tag (never commits to main)
+      actions: read     # reads the CI runs of the commit being released
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ok="$(gh run list --repo "${{ github.repository }}" --workflow ci.yml --commit "$SHA" --json conclusion --jq '[.[] | select(.conclusion == "success")] | length')"
+          if [ "${ok:-0}" -lt 1 ]; then
+            echo "::error::No successful CI run for ${SHA}. Push the commit (or wait for its CI run) and release once CI is green."
+            gh run list --repo "${{ github.repository }}" --workflow ci.yml --commit "$SHA" || true
+            exit 1
+          fi
+          echo "CI passed for ${SHA}"
+
+      - name: Resolve release version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUMP: ${{ github.event.inputs.bump }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          read_cargo_version() {
+            # the version line of [workspace.package] (the first `version =` in the manifest)
+            sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' Cargo.toml | head -1
+          }
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            git fetch --tags --force
+            # Base the bump on the highest existing vX.Y.Z tag, falling back to the version
+            # in Cargo.toml when there are no tags yet.
+            latest=""
+            while IFS= read -r t; do
+              if [[ "$t" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then latest="$t"; break; fi
+            done < <(git tag -l 'v*' --sort=-v:refname)
+            if [ -n "$latest" ]; then base="${latest#v}"; else base="$(read_cargo_version)"; fi
+            base="${base%%-*}"
+
+            IFS='.' read -r major minor patch <<< "$base"
+            case "${INPUT_BUMP:-patch}" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "unknown bump: $INPUT_BUMP" >&2; exit 1 ;;
+            esac
+            version="${major}.${minor}.${patch}"
+            tag="v${version}"
+            echo "Base ${base}, bump ${INPUT_BUMP:-patch} -> ${version}"
+
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              echo "tag ${tag} already exists" >&2; exit 1
+            fi
+
+            # Tag ONLY; never push a commit to main. A tag pushed with GITHUB_TOKEN does not
+            # start another workflow run, so there is no recursion into the tag trigger.
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "rawDAWg $tag" "${{ github.sha }}"
+            git push origin "$tag"
+          else
+            # Tag push: the tag is the source of truth.
+            tag="$REF_NAME"
+            version="${tag#v}"
+          fi
+
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::${tag} is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE"; exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: Ubuntu 24.04 package
+            os: ubuntu-24.04
+            artifact: release-ubuntu
+          - name: Windows packages
+            os: windows-2022
+            artifact: release-windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Free disk space (Ubuntu runner)
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          # This job only builds; it never pushes. Do not leave a token in git.
+          persist-credentials: false
+
+      - name: Install Ubuntu build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libjack-jackd2-dev libudev-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev lintian
+
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+
+      # Fails closed: if the substitution does not land, the packages would carry the wrong
+      # version while the release is named after the tag.
+      - name: Stamp version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i '/^\[workspace.package\]/,/^\[/{s/^version = ".*"$/version = "'"$VERSION"'"/}' Cargo.toml
+          grep -A3 '^\[workspace.package\]' Cargo.toml
+          stamped="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"$/\1/p}' Cargo.toml | head -1)"
+          if [ "$stamped" != "$VERSION" ]; then echo "::error::version stamp failed (got '$stamped')"; exit 1; fi
+          # refresh the workspace crates' versions in Cargo.lock, and nothing else
+          cargo update --workspace --offline || cargo update --workspace
+          other="$(git diff -U0 Cargo.lock | grep '^[-+]' | grep -v '^\(+++\|---\)' | grep -v '^[-+]version = ' || true)"
+          if [ -n "$other" ]; then echo "::error::Cargo.lock changed beyond workspace versions:"; echo "$other"; exit 1; fi
+
+      - name: Package (deb)
+        if: runner.os == 'Linux'
+        run: cargo xtask package --format deb
+
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Put dotnet tools on PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
+
+      - name: Package (msi)
+        if: runner.os == 'Windows'
+        run: cargo xtask package --format msi
+
+      - name: Package (portable)
+        if: runner.os == 'Windows'
+        run: cargo xtask package --format portable
+
+      - name: Smoke test the packaged binary
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # relative paths only: Windows binaries get them unchanged from Git Bash
+          mkdir -p target/smoke && cd target/smoke
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            dpkg-deb -x ../package/rawdawg-"$VERSION"-x86_64.deb pkg
+            exe=pkg/usr/bin/rawdawg
+          else
+            cp ../package/rawdawg-"$VERSION"-x86_64.zip portable.zip
+            pwsh -NoProfile -Command "Expand-Archive -Path portable.zip -DestinationPath pkg -Force"
+            exe=pkg/rawdawg-"$VERSION"-x86_64/rawdawg.exe
+          fi
+          got="$("$exe" --version | tr -d '\r')"
+          if [ "$got" != "rawdawg $VERSION" ]; then echo "::error::packaged binary reports '$got', expected 'rawdawg $VERSION'"; exit 1; fi
+          "$exe" --headless-render ../../fixtures/demo.rawdawg --output demo.wav
+          test "$(wc -c < demo.wav)" -gt 100000
+          echo "packaged binary: $got, demo rendered"
+
+      - name: Check that every package was produced
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd target/package
+          if [ "$RUNNER_OS" = "Linux" ]; then files="rawdawg-$VERSION-x86_64.deb"; else files="rawdawg-$VERSION-x86_64.msi rawdawg-$VERSION-x86_64.zip"; fi
+          for f in $files; do
+            ls -l "$f"
+            grep -q "  $f\$" SHA256SUMS || { echo "::error::no checksum for $f"; exit 1; }
+          done
+          sha256sum -c SHA256SUMS
+
+      - name: Upload packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/package/*.deb
+            target/package/*.msi
+            target/package/*.zip
+            target/package/lintian.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # creates the GitHub Release
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f lintian.txt
+          sha256sum ./*.deb ./*.msi ./*.zip | sed 's|\./||' | tee SHA256SUMS.txt
+          ls -l
+
+      - name: Release notes header
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          cat > notes.md <<EOF
+          **rawDAWg ${VERSION}**: Less thinking. More noise.
+
+          > Packages are **unsigned** (Windows SmartScreen will warn). Release gates that need real
+          > audio hardware, a manual GUI pass or independent plugin hosts are tracked as open in
+          > [PROGRESS.md](https://github.com/${{ github.repository }}/blob/${TAG}/PROGRESS.md).
+
+          | Platform | File |
+          |---|---|
+          | Ubuntu 24.04 (x86-64) | \`rawdawg-${VERSION}-x86_64.deb\` |
+          | Windows 11 (x64) installer | \`rawdawg-${VERSION}-x86_64.msi\` |
+          | Windows 11 (x64) portable | \`rawdawg-${VERSION}-x86_64.zip\` |
+
+          Ubuntu:
+
+          \`\`\`bash
+          sudo apt install ./rawdawg-${VERSION}-x86_64.deb
+          rawdawg
+          \`\`\`
+
+          Windows: run the MSI, or unzip the portable build and start \`rawdawg.exe\`.
+
+          Each package installs the rawDAWg CLAP and VST3 plugins for other hosts. Verify the
+          downloads with \`sha256sum -c SHA256SUMS.txt\`. See the
+          [user guide](https://github.com/${{ github.repository }}/blob/${TAG}/docs/USER_GUIDE.md).
+          EOF
+          cat notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: rawDAWg ${{ needs.version.outputs.tag }}
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          body_path: notes.md
+          files: |
+            dist/*.deb
+            dist/*.msi
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

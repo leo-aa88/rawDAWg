@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/leo-aa88/rawDAWg/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue. See SECURITY.md.
+  - name: Read the user guide first
+    url: https://github.com/leo-aa88/rawDAWg/blob/main/docs/USER_GUIDE.md
+    about: Keyboard map, CLI options, plugins, installing and troubleshooting.
+  - name: Known open gates
+    url: https://github.com/leo-aa88/rawDAWg/blob/main/PROGRESS.md
+    about: What has been verified, what has not been run yet, and the known issues.

@@ -23,3 +23,11 @@ and `.rawdawgpreset`. Artifacts follow the `rawdawg-<version>-<arch>` basename. 
 Not produced on purpose: AppImage, Snap, Flatpak (CLAUDE.md). Packages are unsigned; signing,
 legal publisher identity and name clearance are owner decisions. The `Maintainer` field carries the
 display brand only until the owner records a legal identity.
+
+## Releases
+
+`.github/workflows/release.yml` builds these packages for a release: run it from the Actions tab
+(choosing a semver bump) or push a `vX.Y.Z` tag. It only releases commits with a green CI run,
+stamps the tag's version into the workspace (`rawdawg --version`, package metadata and file names
+match the tag), smoke-tests each package and publishes them with `SHA256SUMS.txt` on a GitHub
+Release. Pre-release tags (`v0.2.0-rc.1`) become Debian `0.2.0~rc.1` and MSI version `0.2.0`.

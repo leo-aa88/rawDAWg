@@ -1,0 +1,59 @@
+name: Plugin compatibility
+description: A third-party plugin misbehaves in rawDAWg, or a rawDAWg plugin misbehaves in another host.
+title: "[Plugin]: "
+labels: ["plugins"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Third-party plugins run inside rawDAWg as native code. rawDAWg scans each module in a
+        separate process and quarantines modules that crash, hang or fail to load, but it cannot
+        contain a crash inside a plugin while it is processing. Please do not attach plugin
+        binaries or licence keys.
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Which way round?
+      options:
+        - A third-party plugin hosted in rawDAWg
+        - A rawDAWg plugin (rawDAWg Synth, effects) in another host
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin
+      description: Name, vendor and version.
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      options:
+        - CLAP
+        - VST3
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: rawDAWg version (`rawdawg --version`), or the other host's name and version.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Scan result or quarantine reason (Settings › Plugins), stand-in message, crash, wrong sound, editor window problem, automation or state not restored...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, display server on Linux (X11 / XWayland / Wayland), audio device, sample rate and buffer size.
+      render: text
+    validations:
+      required: true

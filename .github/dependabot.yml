@@ -1,0 +1,38 @@
+# Dependabot version updates. Security updates are enabled separately in the repository's
+# Settings → Code security ("Dependabot security updates"). Every update goes through CI,
+# including `cargo deny` (licences, advisories, sources).
+version: 2
+updates:
+  # Rust dependencies (Cargo.toml + Cargo.lock)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "rust"]
+    commit-message:
+      prefix: "deps(rust)"
+    groups:
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # egui, eframe and wgpu move together and change APIs every minor release; update them
+      # deliberately in one PR with the UI tests and a display check.
+      - dependency-name: "egui"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "eframe"
+        update-types: ["version-update:semver-minor"]
+
+  # GitHub Actions used in .github/workflows/ (pinned to commit SHAs)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "deps(ci)"
+    groups:
+      actions:
+        patterns: ["*"]
