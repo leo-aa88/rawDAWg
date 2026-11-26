@@ -28,11 +28,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
+use vst3::ComRef;
+#[cfg(target_os = "linux")]
 use vst3::Steinberg::Linux::{IEventHandlerTrait as _, ITimerHandlerTrait as _};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-#[cfg(target_os = "linux")]
-use vst3::ComRef;
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 /// Maximum events forwarded per block (bounded, preallocated).
