@@ -3728,6 +3728,7 @@ dependencies = [
  "rawdawg-plugin-api",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "rawdawg-ui",
  "serde_json",
  "vst3",
 ]

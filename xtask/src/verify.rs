@@ -1011,7 +1011,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
     // plugin editor windows need a display server: X11 (WSLg, Xorg, Xvfb) on Linux, the
     // desktop session on Windows
     let display = cfg!(target_os = "windows") || std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
-    const GUI02: &str = "GUI-02 plugin editors on a real display: editor window, exported CLAP editor hosted by rawDAWg with input, panel open/close";
+    const GUI02: &str = "GUI-02 plugin editors on a real display: editor window, exported CLAP and VST3 editors hosted by rawDAWg with input, panel open/close";
     if display {
         checks.push(check(GUI02, &["PLUG-01", "PLUG-02", "PLAT-03"], || {
             let mut runs: Vec<Vec<&str>> = vec![
@@ -1020,6 +1020,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             ];
             if cfg!(target_os = "linux") {
                 runs.push(vec!["test", "-q", "-p", "rawdawg-plugin-host", "--test", "clap_editor", "--", "--ignored"]);
+                runs.push(vec!["test", "-q", "-p", "rawdawg-plugin-host", "--test", "vst3_editor", "--", "--ignored"]);
             }
             for args in &runs {
                 let o = Command::new("cargo").args(args).output()?;
@@ -1033,7 +1034,7 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
                 format!(
                     "{} display tests passed: painted frame read back pixel-exact, resize, 2x scale, parent destruction{}; effect panel opens, closes and reopens the plugin window",
                     runs.len(),
-                    if cfg!(target_os = "linux") { "; rawDAWg hosts its exported CLAP delay editor via timer-support, X input drags a slider, the host sees the edit, close/reopen" } else { "" }
+                    if cfg!(target_os = "linux") { "; rawDAWg hosts its exported CLAP (timer-support) and VST3 (IRunLoop) delay editors, X input drags a slider, the host sees the edit, close/reopen" } else { "" }
                 ),
                 None,
             ))

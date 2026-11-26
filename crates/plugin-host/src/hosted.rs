@@ -72,6 +72,10 @@ pub trait HostedInstance: Processor {
         crate::clap::EditorIdle::default()
     }
     fn close_editor(&mut self) {}
+    /// The native id of the window holding an open editor (X11 window id / HWND).
+    fn editor_window_id(&self) -> Option<u64> {
+        None
+    }
     /// `clap:<id>` / `vst3:<cid>`.
     fn live_id(&self) -> String {
         Processor::type_id(self).to_owned()
@@ -115,6 +119,9 @@ impl HostedInstance for ClapInstance {
     fn close_editor(&mut self) {
         ClapInstance::close_editor(self)
     }
+    fn editor_window_id(&self) -> Option<u64> {
+        ClapInstance::editor_window_id(self)
+    }
 }
 
 impl HostedInstance for Vst3Instance {
@@ -138,6 +145,24 @@ impl HostedInstance for Vst3Instance {
     }
     fn refresh_values(&mut self) {
         Vst3Instance::refresh_values(self)
+    }
+    fn has_editor(&self) -> bool {
+        Vst3Instance::has_editor(self)
+    }
+    fn editor_is_open(&self) -> bool {
+        Vst3Instance::editor_is_open(self)
+    }
+    fn open_editor(&mut self, title: &str) -> Result<(), String> {
+        Vst3Instance::open_editor(self, title)
+    }
+    fn editor_idle(&mut self) -> crate::clap::EditorIdle {
+        Vst3Instance::editor_idle(self)
+    }
+    fn close_editor(&mut self) {
+        Vst3Instance::close_editor(self)
+    }
+    fn editor_window_id(&self) -> Option<u64> {
+        Vst3Instance::editor_window_id(self)
     }
 }
 

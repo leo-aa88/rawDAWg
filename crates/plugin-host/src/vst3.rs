@@ -27,8 +27,12 @@ use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use vst3::Steinberg::Linux::{IEventHandlerTrait as _, ITimerHandlerTrait as _};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
+#[cfg(target_os = "linux")]
+use vst3::ComRef;
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 /// Maximum events forwarded per block (bounded, preallocated).
@@ -775,6 +779,97 @@ pub struct Vst3Instance {
     return_rx: Receiver<Returned>,
     pub info: PluginDescription,
     pub problems: Arc<std::sync::atomic::AtomicU32>,
+    /// The plugin's own editor, open in a rawDAWg window (main-thread objects).
+    editor: Option<MainThreadCell<Vst3Editor>>,
+    /// Whether the controller offers an embeddable view (asked once).
+    has_editor: std::cell::Cell<Option<bool>>,
+}
+
+/// The embedded view type of this platform.
+#[cfg(target_os = "windows")]
+const VIEW_PLATFORM: &CStr = c"HWND";
+#[cfg(not(target_os = "windows"))]
+const VIEW_PLATFORM: &CStr = c"X11EmbedWindowID";
+
+/// What a hosted editor asked for through our `IPlugFrame` (and, on Linux, `IRunLoop`).
+#[derive(Default)]
+struct FrameState {
+    resize: Option<(i32, i32)>,
+    #[cfg(target_os = "linux")]
+    timers: Vec<(ComPtr<Linux::ITimerHandler>, std::time::Duration, std::time::Instant)>,
+    #[cfg(target_os = "linux")]
+    fds: Vec<(ComPtr<Linux::IEventHandler>, i32)>,
+}
+
+/// The host side of a plugin view: resize requests, and the run loop VST3 plugins on Linux
+/// use for timers and file descriptors (serviced by [`Vst3Instance::editor_idle`]).
+pub struct HostPlugFrame {
+    state: std::rc::Rc<RefCell<FrameState>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Class for HostPlugFrame {
+    type Interfaces = (IPlugFrame, Linux::IRunLoop);
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Class for HostPlugFrame {
+    type Interfaces = (IPlugFrame,);
+}
+
+impl IPlugFrameTrait for HostPlugFrame {
+    unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
+        // SAFETY: the plugin's rect, checked for null.
+        let Some(r) = (unsafe { new_size.as_ref() }) else { return kInvalidArgument };
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if !(1..=16_384).contains(&w) || !(1..=16_384).contains(&h) {
+            return kInvalidArgument;
+        }
+        self.state.borrow_mut().resize = Some((w, h));
+        kResultOk
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Linux::IRunLoopTrait for HostPlugFrame {
+    unsafe fn registerEventHandler(&self, handler: *mut Linux::IEventHandler, fd: Linux::FileDescriptor) -> tresult {
+        // SAFETY: a live handler from the plugin; `to_com_ptr` keeps it alive while registered.
+        let Some(h) = (unsafe { ComRef::from_raw(handler) }) else { return kInvalidArgument };
+        let mut st = self.state.borrow_mut();
+        if fd < 0 || st.fds.len() >= crate::host::MAX_TIMERS {
+            return kResultFalse;
+        }
+        st.fds.push((h.to_com_ptr(), fd));
+        kResultOk
+    }
+    unsafe fn unregisterEventHandler(&self, handler: *mut Linux::IEventHandler) -> tresult {
+        self.state.borrow_mut().fds.retain(|(h, _)| h.as_ptr() != handler);
+        kResultOk
+    }
+    unsafe fn registerTimer(&self, handler: *mut Linux::ITimerHandler, milliseconds: Linux::TimerInterval) -> tresult {
+        // SAFETY: as above.
+        let Some(h) = (unsafe { ComRef::from_raw(handler) }) else { return kInvalidArgument };
+        let mut st = self.state.borrow_mut();
+        if st.timers.len() >= crate::host::MAX_TIMERS {
+            return kResultFalse;
+        }
+        let period = std::time::Duration::from_millis(milliseconds.max(u64::from(crate::host::MIN_TIMER_MS)));
+        st.timers.push((h.to_com_ptr(), period, std::time::Instant::now() + period));
+        kResultOk
+    }
+    unsafe fn unregisterTimer(&self, handler: *mut Linux::ITimerHandler) -> tresult {
+        self.state.borrow_mut().timers.retain(|(h, ..)| h.as_ptr() != handler);
+        kResultOk
+    }
+}
+
+/// A plugin view shown in a top-level rawDAWg window.
+struct Vst3Editor {
+    view: ComPtr<IPlugView>,
+    _frame: ComWrapper<HostPlugFrame>,
+    frame_state: std::rc::Rc<RefCell<FrameState>>,
+    window: rawdawg_ui::window::NativeWindow,
+    resizable: bool,
 }
 
 /// Main-thread-only COM objects.
@@ -883,6 +978,8 @@ impl Vst3Instance {
             return_rx,
             info: info.clone(),
             problems: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            editor: None,
+            has_editor: std::cell::Cell::new(None),
         })
     }
 
@@ -903,6 +1000,163 @@ impl Vst3Instance {
     }
     pub fn problem_count(&self) -> u32 {
         self.problems.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the controller has an editor view rawDAWg can embed on this platform.
+    pub fn has_editor(&self) -> bool {
+        if let Some(known) = self.has_editor.get() {
+            return known;
+        }
+        let Some(m) = self.cell.get() else { return false };
+        // SAFETY: main thread; the view (if any) is released right away.
+        let ok =
+            unsafe { ComPtr::from_raw(m.controller.createView(c"editor".as_ptr())) }.is_some_and(|v| unsafe { v.isPlatformTypeSupported(VIEW_PLATFORM.as_ptr()) } == kResultTrue);
+        self.has_editor.set(Some(ok));
+        ok
+    }
+
+    pub fn editor_is_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// The native id of the window holding the plugin's editor (X11 window id / HWND).
+    pub fn editor_window_id(&self) -> Option<u64> {
+        self.editor.as_ref().and_then(|e| e.get()).map(|e| e.window.raw_id())
+    }
+
+    /// Open the controller's editor view in a new top-level window (main thread).
+    pub fn open_editor(&mut self, title: &str) -> Result<(), String> {
+        use rawdawg_ui::window::{NativeWindow, Parent};
+        if self.editor.is_some() {
+            return Ok(());
+        }
+        let m = self.cell.get().ok_or("the plugin instance is not available on this thread")?;
+        // SAFETY: main thread; createView hands us one reference.
+        let view = unsafe { ComPtr::from_raw(m.controller.createView(c"editor".as_ptr())) }.ok_or("the plugin has no editor")?;
+        // SAFETY: a live view; calls on the main thread in the order the SDK specifies.
+        unsafe {
+            if view.isPlatformTypeSupported(VIEW_PLATFORM.as_ptr()) != kResultTrue {
+                return Err("the plugin's editor does not support an embedded window on this platform".into());
+            }
+            let frame_state = std::rc::Rc::new(RefCell::new(FrameState::default()));
+            let frame = ComWrapper::new(HostPlugFrame { state: frame_state.clone() });
+            let frame_ptr = frame.to_com_ptr::<IPlugFrame>().ok_or("frame interface")?;
+            view.setFrame(frame_ptr.as_ptr());
+            let mut rect = ViewRect { left: 0, top: 0, right: 640, bottom: 480 };
+            view.getSize(&mut rect);
+            let (w, h) = ((rect.right - rect.left).clamp(1, 16_384) as u32, (rect.bottom - rect.top).clamp(1, 16_384) as u32);
+            let resizable = view.canResize() == kResultTrue;
+            let window = match NativeWindow::open(Parent::TopLevel, w, h, title) {
+                Ok(w) => w,
+                Err(e) => {
+                    view.setFrame(std::ptr::null_mut());
+                    return Err(format!("cannot open a window for the editor: {e}"));
+                }
+            };
+            if view.attached(window.raw_id() as usize as *mut c_void, VIEW_PLATFORM.as_ptr()) != kResultOk {
+                view.setFrame(std::ptr::null_mut());
+                return Err("the plugin could not attach its editor to the window".into());
+            }
+            self.editor = Some(MainThreadCell::new(Vst3Editor { view, _frame: frame, frame_state, window, resizable }));
+        }
+        Ok(())
+    }
+
+    /// Close the editor: the view is removed before our window goes.
+    pub fn close_editor(&mut self) {
+        let Some(mut cell) = self.editor.take() else { return };
+        if let Some(ed) = cell.get_mut() {
+            // SAFETY: main thread; the view is attached to our window.
+            unsafe {
+                ed.view.removed();
+                ed.view.setFrame(std::ptr::null_mut());
+            }
+        }
+        drop(cell);
+    }
+
+    /// Service the open editor (main thread, every UI frame): window events, the plugin's
+    /// run-loop timers and file descriptors, resize requests, and edits to forward.
+    pub fn editor_idle(&mut self) -> crate::clap::EditorIdle {
+        use crate::clap::EditorIdle;
+        use rawdawg_ui::window::WindowEvent;
+        let Some(ed) = self.editor.as_mut().and_then(|e| e.get_mut()) else { return EditorIdle::default() };
+        let mut close = false;
+        for e in ed.window.poll() {
+            match e {
+                WindowEvent::CloseRequested | WindowEvent::Destroyed => close = true,
+                WindowEvent::Resized(w, h) if ed.resizable => {
+                    let mut r = ViewRect { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+                    // SAFETY: main thread, attached view.
+                    unsafe {
+                        ed.view.checkSizeConstraint(&mut r);
+                        ed.view.onSize(&mut r);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.close_editor();
+            return EditorIdle::default();
+        }
+        let requested = ed.frame_state.borrow_mut().resize.take();
+        if let Some((w, h)) = requested {
+            let _ = ed.window.set_size(w as u32, h as u32);
+            let mut r = ViewRect { left: 0, top: 0, right: w, bottom: h };
+            // SAFETY: main thread, attached view.
+            unsafe { ed.view.onSize(&mut r) };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let now = std::time::Instant::now();
+            // clone the due handlers out: a callback may (un)register timers
+            let due: Vec<ComPtr<Linux::ITimerHandler>> = ed
+                .frame_state
+                .borrow_mut()
+                .timers
+                .iter_mut()
+                .filter(|t| now >= t.2)
+                .map(|t| {
+                    t.2 = now + t.1;
+                    t.0.clone()
+                })
+                .collect();
+            for h in due {
+                // SAFETY: a registered handler (we hold a reference).
+                unsafe { h.onTimer() };
+            }
+            let fds: Vec<(ComPtr<Linux::IEventHandler>, i32)> = ed.frame_state.borrow().fds.clone();
+            for (h, fd) in fds {
+                let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd; timeout 0 never blocks.
+                if unsafe { libc::poll(&mut p, 1, 0) } > 0 && p.revents != 0 {
+                    // SAFETY: as above.
+                    unsafe { h.onFDIsSet(fd) };
+                }
+            }
+        }
+        // edits the editor made through our component handler: the controller already has
+        // them; the processor gets them as parameter events (or pending sets while idle)
+        let edits: Vec<(u32, f64)> = self.cell.get().and_then(|m| m.handler.edits.lock().ok().map(|mut e| std::mem::take(&mut *e))).unwrap_or_default();
+        let had_edits = !edits.is_empty();
+        let mut forward = Vec::with_capacity(edits.len());
+        for (id, v) in edits {
+            let Some(i) = self.descriptors.iter().position(|d| d.id.0 == id) else { continue };
+            let v = (v as f32).clamp(0.0, 1.0);
+            self.values[i] = v;
+            if self.active.is_none() {
+                self.pending.retain(|(p, _)| *p != id);
+                if self.pending.len() < MAX_POINTS {
+                    self.pending.push((id, v));
+                }
+            } else {
+                forward.push((ParamId(id), v));
+            }
+        }
+        let before = self.values.clone();
+        self.refresh_values();
+        EditorIdle { open: true, edited: had_edits || before != self.values, forward }
     }
 
     /// Refresh cached values from the controller, folding in edits the plugin reported.
@@ -1077,6 +1331,13 @@ impl Vst3Instance {
         }
         self.refresh_values();
         Ok(())
+    }
+}
+
+impl Drop for Vst3Instance {
+    fn drop(&mut self) {
+        // the plugin's view goes before the plugin and before our parent window
+        self.close_editor();
     }
 }
 

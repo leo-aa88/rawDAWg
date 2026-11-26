@@ -252,13 +252,17 @@ struct OpenEditor {
     resizable: bool,
 }
 
-/// Result of [`ClapInstance::editor_idle`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Result of servicing an open plugin editor ([`ClapInstance::editor_idle`],
+/// [`crate::vst3::Vst3Instance::editor_idle`]).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditorIdle {
     /// The editor is still open.
     pub open: bool,
     /// Parameter values changed since the last call (edits in the plugin's editor).
     pub edited: bool,
+    /// Edits the owner must forward to the running audio processor as parameter events
+    /// (VST3: the editor's `performEdit`; CLAP plugins apply their own editor's edits).
+    pub forward: Vec<(ParamId, f32)>,
 }
 
 /// The embedded editor API of this platform.
@@ -450,10 +454,10 @@ impl ClapInstance {
         }
         if close {
             self.close_editor();
-            return EditorIdle { open: false, edited: false };
+            return EditorIdle::default();
         }
         let now = std::time::Instant::now();
-        let Some(inst) = self.cell.get() else { return EditorIdle { open: true, edited: false } };
+        let Some(inst) = self.cell.get() else { return EditorIdle { open: true, ..Default::default() } };
         let (requested_size, closed_by_plugin, flush) = {
             let mut inst = inst.borrow_mut();
             let due = inst.access_handler(|mt| mt.due_timers(now));
@@ -485,7 +489,7 @@ impl ClapInstance {
         };
         if closed_by_plugin {
             self.close_editor();
-            return EditorIdle { open: false, edited: false };
+            return EditorIdle::default();
         }
         if let Some(size) = requested_size
             && let Some(editor) = self.editor.as_mut().and_then(|e| e.get_mut())
@@ -510,7 +514,7 @@ impl ClapInstance {
         }
         let before = self.values.clone();
         self.refresh_values();
-        EditorIdle { open: true, edited: before != self.values }
+        EditorIdle { open: true, edited: before != self.values, forward: Vec::new() }
     }
 
     /// Refresh the cached parameter values from the plugin (main thread; call at UI rate).

@@ -384,6 +384,10 @@ impl crate::ui::App {
         for id in &open {
             let Some(h) = self.other_mirrors.get_mut(id).and_then(|m| hosted_mut(m.as_mut())) else { continue };
             let idle = h.editor_idle();
+            // VST3 editors edit through the host: their values reach the running processor here
+            for (param, value) in idle.forward {
+                self.send(rawdawg_audio_engine::commands::EngineCommand::Param { instance: *id, id: param, value });
+            }
             if idle.edited {
                 self.plugin_editor_edits.insert(*id, now);
             }

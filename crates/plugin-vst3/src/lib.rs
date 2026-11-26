@@ -30,6 +30,8 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComRef, ComWrapper, uid};
 
+mod editor;
+
 pub use rawdawg_plugin_api::exported::{URL, VENDOR};
 pub use rawdawg_plugin_api::wrap::{WRAP_BYPASS as WRAP_BYPASS_ID, WRAP_MIX as WRAP_MIX_ID};
 
@@ -672,15 +674,29 @@ impl IProcessContextRequirementsTrait for Component {
     }
 }
 
-/// Edit controller for one exported plugin: parameter info and values from the native
-/// descriptors (plus the wrapper's), formatting through the descriptors.
-pub struct Controller {
+/// The controller's state, shared with its editor view (UI thread only).
+pub struct ControllerState {
     plugin: &'static ExportedPlugin,
     /// Main-thread processor copy holding the controller's parameter values.
     mirror: RefCell<Box<dyn Processor>>,
     visible: Vec<&'static ParamDescriptor>,
     bypass: Cell<bool>,
     mix: Cell<f32>,
+    /// The host's component handler (edits from the editor go through it).
+    handler: RefCell<Option<vst3::ComPtr<IComponentHandler>>>,
+}
+
+/// Edit controller for one exported plugin: parameter info and values from the native
+/// descriptors (plus the wrapper's), formatting through the descriptors, and the editor.
+pub struct Controller {
+    state: std::rc::Rc<ControllerState>,
+}
+
+impl std::ops::Deref for Controller {
+    type Target = ControllerState;
+    fn deref(&self) -> &ControllerState {
+        &self.state
+    }
 }
 
 impl Class for Controller {
@@ -691,8 +707,12 @@ impl Controller {
     pub fn new(plugin: &'static ExportedPlugin) -> Result<Self, String> {
         let mirror = plugin.make()?;
         let visible = visible_descriptors(plugin, mirror.descriptors());
-        Ok(Self { plugin, mirror: RefCell::new(mirror), visible, bypass: Cell::new(false), mix: Cell::new(1.0) })
+        let state = ControllerState { plugin, mirror: RefCell::new(mirror), visible, bypass: Cell::new(false), mix: Cell::new(1.0), handler: RefCell::new(None) };
+        Ok(Self { state: std::rc::Rc::new(state) })
     }
+}
+
+impl ControllerState {
     fn descriptor(&self, id: u32) -> Option<&'static ParamDescriptor> {
         self.visible.iter().copied().find(|d| d.id.0 == id)
     }
@@ -805,6 +825,24 @@ impl IEditControllerTrait for Controller {
         self.value(id).unwrap_or(0.0)
     }
     unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
+        self.state.set_normalized(id, value)
+    }
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        // SAFETY: the host passes a live handler (or null); `to_com_ptr` takes its own reference.
+        *self.handler.borrow_mut() = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr());
+        kResultOk
+    }
+    unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
+        // SAFETY: a NUL-terminated string from the host.
+        if name.is_null() || unsafe { std::ffi::CStr::from_ptr(name) } != c"editor" {
+            return std::ptr::null_mut();
+        }
+        editor::PlugView::create(self.state.clone())
+    }
+}
+
+impl ControllerState {
+    fn set_normalized(&self, id: u32, value: f64) -> tresult {
         if !value.is_finite() {
             return kInvalidArgument;
         }
@@ -826,13 +864,6 @@ impl IEditControllerTrait for Controller {
                 }
             }
         }
-    }
-    unsafe fn setComponentHandler(&self, _handler: *mut IComponentHandler) -> tresult {
-        kResultOk
-    }
-    unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
-        // No custom editor yet: hosts fall back to their generic parameter view.
-        std::ptr::null_mut()
     }
 }
 

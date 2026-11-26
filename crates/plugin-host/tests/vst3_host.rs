@@ -129,7 +129,7 @@ fn bundle_is_described_with_buses_params_and_stable_class_ids() {
     assert!(comp.is_effect && !comp.is_instrument);
     assert_eq!((comp.audio_inputs, comp.audio_outputs), (2, 1), "main + aux sidechain");
     assert_eq!(comp.main_input_channels, 2);
-    assert!(!comp.has_gui, "no editor yet");
+    assert!(comp.has_gui, "the exported plugins have an editor (IPlugView)");
     let expected = rawdawg_plugin_api::exported_plugins();
     for p in &expected {
         let (pcid, _) = p.vst3_class_ids();

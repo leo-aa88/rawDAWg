@@ -311,6 +311,10 @@ impl Drop for X11Window {
         }
         let _ = self.conn.free_gc(self.gc);
         let _ = self.conn.free_colormap(self.colormap);
-        let _ = self.conn.flush();
+        // a round trip: once dropped, the window is really gone for every other connection
+        // (a host checking or reusing the parent right after closing must not see it)
+        if let Ok(cookie) = self.conn.get_input_focus() {
+            let _ = cookie.reply();
+        }
     }
 }
