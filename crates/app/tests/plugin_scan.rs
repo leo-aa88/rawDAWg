@@ -210,17 +210,29 @@ fn scanner_child_describes_a_vst3_bundle_and_the_cli_scans_both_formats() {
         }
         ScanOutcome::Quarantined(q) => panic!("quarantined: {}", q.reason.summary()),
     }
-    // the CLI scans CLAP and VST3 roots: ~/.vst3 under a temporary HOME holds the bundle
+    // the CLI scans CLAP and VST3 roots: the per-user VST3 folder under a temporary home holds
+    // the bundle (Linux: $HOME/.vst3; Windows: %LOCALAPPDATA%\Programs\Common\VST3, with the
+    // system folder %COMMONPROGRAMFILES% pointed at an empty directory)
     let home = dir.join("home");
-    let vst3_root = home.join(".vst3");
+    let vst3_root = if cfg!(target_os = "windows") { home.join("Programs").join("Common").join("VST3") } else { home.join(".vst3") };
     std::fs::create_dir_all(&vst3_root).unwrap();
+    let empty_system = dir.join("system");
+    std::fs::create_dir_all(&empty_system).unwrap();
     let installed = built_vst3_bundle(&vst3_root);
     assert!(installed.is_dir());
     let clap_root = dir.join("clap");
     std::fs::create_dir_all(&clap_root).unwrap();
     std::fs::copy(built_clap_module(), clap_root.join("rawDAWg.clap")).unwrap();
     let catalog_file = dir.join("plugins.json");
-    let out = std::process::Command::new(EXE).args(["--scan-plugins", "--catalog"]).arg(&catalog_file).env("CLAP_PATH", &clap_root).env("HOME", &home).output().expect("run");
+    let out = std::process::Command::new(EXE)
+        .args(["--scan-plugins", "--catalog"])
+        .arg(&catalog_file)
+        .env("CLAP_PATH", &clap_root)
+        .env("HOME", &home)
+        .env("LOCALAPPDATA", &home)
+        .env("COMMONPROGRAMFILES", &empty_system)
+        .output()
+        .expect("run");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON report");
     assert_eq!(report["scanned"], 2, "{report}");
