@@ -436,7 +436,7 @@ impl Synth {
                         self.release_sustained(source, ev.channel);
                     }
                 }
-                CC_TIMBRE => {
+                CC_TIMBRE if self.patch.cc74_brightness => {
                     self.timbre[ch] = value;
                     for v in self.voices.iter_mut() {
                         if v.key.is_some_and(|k| k.channel == ev.channel) {
@@ -565,6 +565,16 @@ impl Synth {
                     }
                     params::TRANSPOSE => p.tuning.transpose_semitones = phys as i32 - 48,
                     params::DETUNE => p.tuning.detune_cents = phys as f32,
+                    params::CC74_BRIGHTNESS => {
+                        p.cc74_brightness = phys >= 0.5;
+                        if !p.cc74_brightness {
+                            // switched off: every channel back to neutral brightness
+                            self.timbre = [0.5; 16];
+                            for v in self.voices.iter_mut() {
+                                v.set_timbre(0.5);
+                            }
+                        }
+                    }
                     _ => return false,
                 }
             }
@@ -903,6 +913,7 @@ impl Processor for Synth {
                 params::MAX_VOICES => f64::from(p.max_voices - 1),
                 params::TRANSPOSE => f64::from(p.tuning.transpose_semitones + 48),
                 params::DETUNE => p.tuning.detune_cents.into(),
+                params::CC74_BRIGHTNESS => f64::from(u8::from(p.cc74_brightness)),
                 _ => return None,
             },
             ParamBlock::Layer { layer: li, offset } => {

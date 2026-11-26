@@ -401,6 +401,8 @@ pub(crate) fn commit_patch(app: &mut App, instance_id: InstanceId, patch: rawdaw
         app.status_line = format!("Patch rejected: {e}");
         return;
     }
+    // the committed sound plays at its own level (an Evolve level match was for its card only)
+    app.synth_panel.evolve.preview_trim_db = None;
     let value: serde_json::Value = serde_json::to_value(&patch).unwrap_or(serde_json::Value::Null);
     app.apply(Command::SetInstanceState { instance_id, state_version: 1, state: value });
 }

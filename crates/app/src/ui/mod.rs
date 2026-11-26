@@ -191,8 +191,9 @@ pub(crate) struct App {
     pub keyboard: keyboard::KeyboardState,
     pub settings: settings::SettingsState,
     midi_rescan_counter: u32,
-    /// Per MIDI device: its clock mapped onto the process clock (timestamped input).
-    midi_clocks: HashMap<u16, rawdawg_midi::MidiClock>,
+    /// Per MIDI device: its clock mapped onto the process clock, and its latency (timestamped
+    /// input, `rawdawg_audio_engine::timing`).
+    midi_clocks: HashMap<u16, (rawdawg_midi::MidiClock, rawdawg_audio_engine::timing::JitterBuffer)>,
     /// Deterministic tests only: every live event sent to the engine.
     #[cfg(test)]
     pub live_log: Vec<TimedEvent>,
@@ -457,10 +458,11 @@ impl App {
 
     pub(crate) fn recompile(&mut self) {
         let mut project = self.engine_project();
+        // the assets of the project the engine plays (an autosave being compared may have more)
+        self.assets.sync(self.project_path.clone(), &project);
         let AudioState::Running(sys) = &mut self.audio else { return };
         project.sample_rate_hz = sys.sample_rate;
         self.plan_revision += 1;
-        self.assets.sync(self.project_path.clone(), &self.project);
         // retired plans are dropped here (off RT): hosted plugins hand their audio halves back
         sys.handle.collect_retired();
         for m in self.other_mirrors.values_mut() {
@@ -766,6 +768,8 @@ impl App {
     pub(crate) fn undo(&mut self) {
         if let Ok(label) = self.history.undo(&mut self.project) {
             self.status_line = format!("Undid: {label}");
+            // the document changed under any preview: its level match no longer applies
+            self.synth_panel.evolve.preview_trim_db = None;
             self.rebuild_mirrors();
             self.recompile();
         }
@@ -774,6 +778,8 @@ impl App {
     pub(crate) fn redo(&mut self) {
         if let Ok(label) = self.history.redo(&mut self.project) {
             self.status_line = format!("Redid: {label}");
+            // the document changed under any preview: its level match no longer applies
+            self.synth_panel.evolve.preview_trim_db = None;
             self.rebuild_mirrors();
             self.recompile();
         }
@@ -793,19 +799,24 @@ impl App {
         }
     }
 
-    /// A timestamped MIDI event: placed on the audio stream at the time it was sent plus one
-    /// device buffer, so delivery jitter (USB, the MIDI thread, the UI frame) does not move it.
+    /// A timestamped MIDI event: placed on the audio stream at the time it was sent plus a
+    /// steady latency, so delivery jitter (USB, the MIDI thread, the UI frame) does not move it.
     fn live_timed(&mut self, event: TimedEvent, time: rawdawg_midi::MidiTime) {
         let EventSource::MidiDevice(dev) = event.source else { return self.live(event) };
         if time.is_untimed() {
             return self.live(event);
         }
-        let wall = self.midi_clocks.entry(dev).or_default().wall_time(time);
         let AudioState::Running(sys) = &self.audio else { return self.live(event) };
         let st = &sys.handle.status;
-        let (frame, block_wall) = (st.block_start_frame.load(std::sync::atomic::Ordering::Acquire), st.block_wall_us.load(std::sync::atomic::Ordering::Relaxed));
-        let latency = u64::from(sys.stream.config.requested_buffer_frames.unwrap_or(512));
-        let target = midi_target_frame(frame, block_wall, sys.sample_rate.0, wall, latency);
+        let (frame, block_wall, block) = (
+            st.block_start_frame.load(std::sync::atomic::Ordering::Acquire),
+            st.block_wall_us.load(std::sync::atomic::Ordering::Relaxed),
+            st.block_frames.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let sr = sys.sample_rate.0;
+        let (clock, jitter) = self.midi_clocks.entry(dev).or_default();
+        let wall = clock.wall_time(time);
+        let target = rawdawg_audio_engine::timing::place_event(jitter, frame, block_wall, block, sr, wall, rawdawg_rt::clock::now_us());
         #[cfg(test)]
         self.live_log.push(event);
         if let Some(channel) = self.selected_channel {
@@ -1976,13 +1987,4 @@ pub(crate) fn rack_rename_id(id: ChannelId) -> egui::Id {
 
 pub(crate) fn rack_grip_id(id: ChannelId) -> egui::Id {
     egui::Id::unique(("rack-grip", id))
-}
-
-/// The stream frame a MIDI message sent at process-clock time `wall_us` plays at: its time on
-/// the stream clock (the last block started at `block_start_frame`, `block_wall_us`) plus a
-/// constant `latency_frames`.
-pub(crate) fn midi_target_frame(block_start_frame: u64, block_wall_us: u64, sample_rate: u32, wall_us: u64, latency_frames: u64) -> u64 {
-    let dt_us = wall_us as i64 - block_wall_us as i64;
-    let frames = (dt_us as f64 * f64::from(sample_rate) / 1_000_000.0).round() as i64;
-    (block_start_frame as i64 + frames).max(0) as u64 + latency_frames
 }

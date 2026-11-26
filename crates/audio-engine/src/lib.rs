@@ -11,6 +11,7 @@ pub mod plan;
 pub mod record;
 pub mod schedule;
 pub mod stream;
+pub mod timing;
 
 pub use assets::{AssetResolver, NoAssets, ProjectAssetCache};
 pub use commands::{EngineCommand, RecordedEvent, TransportMode};

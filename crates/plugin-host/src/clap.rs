@@ -788,6 +788,16 @@ pub struct ClapProcessor {
     values: Vec<f32>,
 }
 
+/// A note on `pitch`: with its id, or (a pitch id: the note has none) with "any id", as CLAP
+/// expects for notes without ids.
+fn note_target(ch: u16, pitch: u8, note_id: u32) -> Pckn {
+    if note_id & rawdawg_types::events::PITCH_NOTE_ID != 0 {
+        Pckn::new(0u16, ch, u16::from(pitch), Match::<u32>::All)
+    } else {
+        Pckn::new(0u16, ch, u16::from(pitch), note_id & 0x7FFF_FFFF)
+    }
+}
+
 /// Who a per-note event addresses: the note with that id, or (a pitch id) the note on that key.
 fn expression_target(ch: u16, note_id: u32) -> Pckn {
     if note_id & rawdawg_types::events::PITCH_NOTE_ID != 0 {
@@ -808,14 +818,14 @@ impl ClapProcessor {
             match e.kind {
                 EventKind::NoteOn { note_id, pitch, velocity } => {
                     if self.layout.accepts_clap_notes || !self.layout.accepts_midi {
-                        self.events_in.push(&NoteOnEvent::new(t, Pckn::new(0u16, ch, u16::from(pitch), note_id & 0x7FFF_FFFF), f64::from(velocity)));
+                        self.events_in.push(&NoteOnEvent::new(t, note_target(ch, pitch, note_id), f64::from(velocity)));
                     } else {
                         self.events_in.push(&MidiEvent::new(t, 0, [0x90 | ch as u8, pitch & 0x7F, (velocity * 127.0).round().clamp(1.0, 127.0) as u8]));
                     }
                 }
                 EventKind::NoteOff { note_id, pitch } => {
                     if self.layout.accepts_clap_notes || !self.layout.accepts_midi {
-                        self.events_in.push(&NoteOffEvent::new(t, Pckn::new(0u16, ch, u16::from(pitch), note_id & 0x7FFF_FFFF), 0.0));
+                        self.events_in.push(&NoteOffEvent::new(t, note_target(ch, pitch, note_id), 0.0));
                     } else {
                         self.events_in.push(&MidiEvent::new(t, 0, [0x80 | ch as u8, pitch & 0x7F, 0]));
                     }

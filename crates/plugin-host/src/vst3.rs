@@ -1571,6 +1571,9 @@ impl Vst3Processor {
                     if list.len() >= MAX_EVENTS {
                         continue;
                     }
+                    // SAFETY: `Event` is a plain C struct with a union of plain C structs (integers,
+                    // floats, pointers): all-zero bytes are a valid value, and every field the
+                    // event type uses is written before the event is handed to the plugin.
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
@@ -1581,6 +1584,9 @@ impl Vst3Processor {
                     if list.len() >= MAX_EVENTS {
                         continue;
                     }
+                    // SAFETY: `Event` is a plain C struct with a union of plain C structs (integers,
+                    // floats, pointers): all-zero bytes are a valid value, and every field the
+                    // event type uses is written before the event is handed to the plugin.
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
@@ -1593,6 +1599,9 @@ impl Vst3Processor {
                     }
                     // a note without an id is addressed by its pitch
                     let pitch = if note_id & PITCH_NOTE_ID != 0 { (note_id & 0x7F) as i16 } else { -1 };
+                    // SAFETY: `Event` is a plain C struct with a union of plain C structs (integers,
+                    // floats, pointers): all-zero bytes are a valid value, and every field the
+                    // event type uses is written before the event is handed to the plugin.
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kPolyPressureEvent as u16;
@@ -1605,6 +1614,9 @@ impl Vst3Processor {
                         continue;
                     }
                     let Some((type_id, normalized)) = note_expression_to_vst3(expression, value) else { continue };
+                    // SAFETY: `Event` is a plain C struct with a union of plain C structs (integers,
+                    // floats, pointers): all-zero bytes are a valid value, and every field the
+                    // event type uses is written before the event is handed to the plugin.
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kNoteExpressionValueEvent as u16;

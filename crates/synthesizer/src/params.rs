@@ -28,6 +28,8 @@ pub const BEND_RANGE: u32 = 42;
 pub const MAX_VOICES: u32 = 43;
 pub const TRANSPOSE: u32 = 44;
 pub const DETUNE: u32 = 45;
+/// Channel CC 74 sets the brightness of the channel's notes (MPE "timbre"); off by default.
+pub const CC74_BRIGHTNESS: u32 = 46;
 
 /// Layer core block.
 pub const LAYER_BASE: u32 = 100;
@@ -151,7 +153,7 @@ const fn time(id: u32, key: &'static str, name: &'static str, default_n: f32, ca
     ParamDescriptor::continuous(id, key, name, ParamUnit::Seconds, ParamMapping::LogWithZero { min: 0.001, max: 30.0 }, default_n, cat).with_smoothing(0.0)
 }
 
-const GLOBAL: [ParamDescriptor; 22] = [
+const GLOBAL: [ParamDescriptor; 23] = [
     ParamDescriptor::continuous(MASTER_GAIN, "master.gain", "Master", ParamUnit::Decibel, ParamMapping::Linear { min: -60.0, max: 12.0 }, 50.0 / 72.0, ParamCategory::Mix),
     ParamDescriptor::continuous(VELOCITY_SENS, "velocity.sensitivity", "Velocity", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 1.0 }, 0.7, ParamCategory::Envelope),
     time(AMP_ATTACK, "amp.attack", "Attack", 0.0, ParamCategory::Envelope),
@@ -178,6 +180,7 @@ const GLOBAL: [ParamDescriptor; 22] = [
     ParamDescriptor::continuous(MAX_VOICES, "voice.max", "Voices", ParamUnit::None, ParamMapping::Discrete { steps: 64 }, 31.0 / 63.0, ParamCategory::Topology).stepped(),
     ParamDescriptor::continuous(TRANSPOSE, "tuning.transpose", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Pitch).stepped(),
     ParamDescriptor::continuous(DETUNE, "tuning.detune", "Detune", ParamUnit::Cents, ParamMapping::Linear { min: -100.0, max: 100.0 }, 0.5, ParamCategory::Pitch),
+    ParamDescriptor::continuous(CC74_BRIGHTNESS, "midi.cc74_brightness", "CC 74 → brightness (MPE)", ParamUnit::None, ParamMapping::Toggle, 0.0, ParamCategory::Routing).stepped(),
 ];
 
 macro_rules! layer_block {
@@ -636,13 +639,13 @@ const M: [[ParamDescriptor; MOD_COUNT]; 16] = [
     mod_block!(15),
 ];
 
-pub const DESCRIPTOR_COUNT: usize = 22 + 4 * LAYER_CORE_COUNT + 4 * GEN_COUNT + 4 * LFO_COUNT + 16 * MOD_COUNT;
+pub const DESCRIPTOR_COUNT: usize = GLOBAL.len() + 4 * LAYER_CORE_COUNT + 4 * GEN_COUNT + 4 * LFO_COUNT + 16 * MOD_COUNT;
 
 const fn concat_all() -> [ParamDescriptor; DESCRIPTOR_COUNT] {
     let mut out = [GLOBAL[0]; DESCRIPTOR_COUNT];
     let mut n = 0;
     let mut i = 0;
-    while i < 22 {
+    while i < GLOBAL.len() {
         out[n] = GLOBAL[i];
         n += 1;
         i += 1;
@@ -711,7 +714,7 @@ mod tests {
             assert!(keys.insert(d.key), "duplicate key {}", d.key);
             assert!(decode(d.id.0).is_some(), "undecodable id {}", d.id.0);
         }
-        assert_eq!(DESCRIPTORS.len(), 238);
+        assert_eq!(DESCRIPTORS.len(), 239);
         assert_eq!(decode_layer_param(layer_param(2, L_PAN)), Some((2, L_PAN)));
         assert_eq!(decode_layer_param(5), None);
         assert_eq!(decode(layer_param(4, 0)), None);

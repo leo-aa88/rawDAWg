@@ -202,8 +202,19 @@ fn brightness_and_channel_timbre_move_the_filter_cutoff() {
     let bright = centroid(&[expr(0, 1, NoteExpression::Brightness, 1.0)]);
     let dark = centroid(&[expr(0, 1, NoteExpression::Brightness, 0.0)]);
     assert!(bright > neutral * 1.3 && dark < neutral * 0.8, "dark {dark:.0} < neutral {neutral:.0} < bright {bright:.0} Hz");
-    // MPE: CC 74 on the note's channel does the same; on another channel it does nothing
     let cc = |ch: u8, value: f32| TimedEvent::new(0, EventSource::Host, ch, EventKind::Control { cc: 74, value });
+    // CC 74 is opt-in: by default (old projects, MIDI files using CC 74 for anything) it does nothing
+    let ignored = centroid(&[cc(0, 1.0)]);
+    assert!((ignored - neutral).abs() < neutral * 0.02, "CC 74 ignored unless enabled: {ignored:.0} vs {neutral:.0}");
+    // with "CC 74 → brightness (MPE)" on: CC 74 on the note's channel is brightness; on another
+    // channel it does nothing
+    patch.cc74_brightness = true;
+    let centroid = |events: &[TimedEvent]| {
+        let mut h = Harness::new(patch.clone());
+        h.render(4800, &[on(0, 1, 45)]);
+        h.render(2400, events);
+        features(&h.render(9600, &[]).0, SR).1
+    };
     let timbre = centroid(&[cc(0, 1.0)]);
     assert!((timbre - bright).abs() < bright * 0.02, "CC 74 = brightness: {timbre:.0} vs {bright:.0}");
     let elsewhere = centroid(&[cc(1, 1.0)]);
@@ -224,4 +235,23 @@ fn expression_resets_at_the_next_note_on() {
     let (fresh, _) = h.render(4800, &[]);
     assert!((dominant_frequency(&fresh, SR) - 440.0).abs() < 1.0, "a new note starts in tune");
     assert!(rms(&fresh) > rms(&bent) * 2.0, "and at full volume");
+}
+
+#[test]
+fn switching_cc74_brightness_off_returns_every_note_to_neutral() {
+    use rawdawg_types::ParamId;
+    let mut patch = Patch { layers: vec![Layer::basic(BasicWave::Saw)], cc74_brightness: true, ..Patch::default() };
+    patch.filter.cutoff_hz = 1000.0;
+    let mut h = Harness::new(patch.clone());
+    h.render(4800, &[on(0, 1, 45), TimedEvent::new(0, EventSource::Host, 0, EventKind::Control { cc: 74, value: 1.0 })]);
+    let bright = features(&h.render(9600, &[]).0, SR).1;
+    let off = TimedEvent::new(0, EventSource::Host, 0, EventKind::Param { id: ParamId(rawdawg_synthesizer::params::CC74_BRIGHTNESS), value: 0.0 });
+    h.render(2400, &[off]);
+    let after = features(&h.render(9600, &[]).0, SR).1;
+    patch.cc74_brightness = false;
+    let mut plain = Harness::new(patch);
+    plain.render(7200, &[on(0, 1, 45)]);
+    let neutral = features(&plain.render(9600, &[]).0, SR).1;
+    assert!(bright > neutral * 1.3, "on: {bright:.0} vs {neutral:.0}");
+    assert!((after - neutral).abs() < neutral * 0.03, "off again: the sounding note is neutral ({after:.0} vs {neutral:.0})");
 }

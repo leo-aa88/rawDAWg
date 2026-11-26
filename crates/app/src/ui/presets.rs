@@ -57,7 +57,9 @@ fn scan_user_presets(st: &mut PresetBrowserState) {
     }
 }
 
-fn preview(app: &mut App, instance: InstanceId, patch: &Patch) {
+pub(crate) fn preview(app: &mut App, instance: InstanceId, patch: &Patch) {
+    // a different sound now plays: an Evolve card's level match no longer applies
+    app.synth_panel.evolve.preview_trim_db = None;
     if app.synth_panel.presets.preview_backup.is_none() {
         app.synth_panel.presets.preview_backup = Some((instance, app.synth_mirrors[&instance].save_state()));
     }

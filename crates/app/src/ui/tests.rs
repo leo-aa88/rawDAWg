@@ -1633,6 +1633,17 @@ fn the_recovery_offer_compares_the_autosave_and_plays_either_version_before_choo
         notes: vec![Note { id: NoteId::new(), tick: Tick(0), duration_ticks: Tick(960), pitch: 60, velocity: 0.8, channel: 0 }],
     });
     h.app.apply(Command::RenameChannel { id: cid, name: "Lead".into() });
+    // a sample imported after the save (only the autosave knows it)
+    let wav = root.join("late.wav");
+    {
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..4800 {
+            w.write_sample(((i as f32 * 0.05).sin() * 8000.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    let late_asset = rawdawg_types::AssetId::from_hex(&h.app.import_asset_only(&wav).unwrap()).unwrap();
     h.app.autosave_now(&dir);
     drop(h);
     let mut h = Harness::new(None);
@@ -1650,8 +1661,13 @@ fn the_recovery_offer_compares_the_autosave_and_plays_either_version_before_choo
     assert!(changes.iter().any(|l| l.contains("Lead")), "{changes:?}");
     h.frame(vec![]);
     assert!(h.drawn_texts().iter().any(|t| t.contains("0 → 1 notes")), "the summary is shown");
-    // listen to the autosave: the engine plays it, the document stays the saved version
+    // listen to the autosave: the engine plays it (with the sample imported after the save),
+    // the document stays the saved version
     click(&mut h, "Autosave");
+    {
+        use rawdawg_audio_engine::AssetResolver;
+        assert!(h.app.assets.sample(&late_asset).is_some(), "the autosave's own sample resolves while listening to it");
+    }
     let notes = |p: &rawdawg_project::Project| p.patterns[0].lanes.iter().map(|l| l.notes.len()).sum::<usize>();
     assert_eq!(notes(&h.app.engine_project()), 1, "the engine plays the autosave");
     assert_eq!(notes(&h.app.project), 0, "nothing is changed until you choose");
@@ -1722,33 +1738,75 @@ fn the_typing_keyboard_ignores_key_repeat_releases_on_focus_loss_and_keeps_note_
 
 #[test]
 fn timestamped_midi_lands_at_a_constant_latency_whatever_the_delivery_jitter() {
+    use rawdawg_audio_engine::timing::{JitterBuffer, place_event};
     use rawdawg_midi::{MidiClock, MidiTime};
-    // a phrase sent every 2.5 ms (120 frames at 48 kHz) by a device whose clock is far ahead;
-    // each message arrives 0.3 to 9 ms late, and the UI polls every 16.7 ms
-    let sr = 48_000u32;
-    let (device_ahead, latency) = (7_000_000_000u64, 256u64);
-    // the stream: block 0 started at stream frame 0 at process time 1 s
-    let (block_frame, block_wall) = (0u64, 1_000_000u64);
-    let mut clock = MidiClock::default();
-    let mut jitter = 99u64;
-    let mut targets = Vec::new();
-    for k in 0..400u64 {
-        let sent = 1_000_000 + k * 2_500;
-        jitter = jitter.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let delivered = sent + 300 + (jitter >> 33) % 8_700;
-        // polled on the next UI frame (the arrival stamp is the delivery itself)
-        let wall = clock.wall_time(MidiTime { device_us: sent + device_ahead, arrival_us: delivered });
-        targets.push((k, super::midi_target_frame(block_frame, block_wall, sr, wall, latency)));
+    // a device with a far-off clock sends every 2.5 ms; messages arrive 0.3–9 ms late and the
+    // UI polls every 16.7 ms; the audio stream runs 1024-frame blocks (an ALSA/Pulse default)
+    let (sr, block) = (48_000u32, 1024u32);
+    let block_us = f64::from(block) / f64::from(sr) * 1e6;
+    let device_ahead = 7_000_000_000u64;
+    let (mut clock, mut jb) = (MidiClock::default(), JitterBuffer::default());
+    let mut rng = 99u64;
+    let mut msgs: Vec<(u64, u64)> = (0..2_000u64)
+        .map(|k| {
+            let sent = 1_000_000 + k * 2_500;
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (sent, sent + 300 + (rng >> 33) % 8_700)
+        })
+        .collect();
+    msgs.sort_by_key(|m| m.1);
+    let (mut out, mut i, mut poll) = (Vec::new(), 0usize, 1_000_000u64);
+    while i < msgs.len() {
+        poll += 16_667;
+        let b = ((poll - 1_000_000) as f64 / block_us).floor() as u64;
+        let (bstart, bwall) = (b * u64::from(block), 1_000_000 + (b as f64 * block_us) as u64);
+        let next_block = ((poll - 1_000_000) as f64 / block_us).ceil() as u64 * u64::from(block);
+        while i < msgs.len() && msgs[i].1 <= poll {
+            let (sent, arrival) = msgs[i];
+            let wall = clock.wall_time(MidiTime { device_us: sent + device_ahead, arrival_us: arrival });
+            let target = place_event(&mut jb, bstart, bwall, block, sr, wall, poll);
+            let true_frame = ((sent - 1_000_000) as f64 * f64::from(sr) / 1e6).round() as i64;
+            out.push((target as i64 - true_frame, target >= next_block));
+            i += 1;
+        }
     }
-    // after a quarter-second warm-up every note lands at latency + its true frame, within the
-    // fastest delivery seen (≥ 0.3 ms = 15 frames) and rounding; the 9 ms of jitter is gone
-    for (k, t) in &targets[100..] {
-        let true_frame = k * 120;
-        let err = *t as i64 - (true_frame + latency) as i64;
-        assert!((0..=30).contains(&err), "message {k}: frame {t} vs {} (error {err} frames)", true_frame + latency);
-    }
-    let gaps: Vec<i64> = targets[100..].windows(2).map(|w| w[1].1 as i64 - w[0].1 as i64).collect();
-    assert!(gaps.iter().all(|g| (110..=130).contains(g)), "spacing kept: {:?}", &gaps[..10]);
-    // without the device clock (arrival times only) the spacing would wander by the jitter
-    assert!(super::midi_target_frame(0, 1_000_000, sr, 1_009_000, 0) - super::midi_target_frame(0, 1_000_000, sr, 1_000_300, 0) > 400);
+    // after a second every note is on time (none late); against the true send times the latency
+    // holds within 3.5 ms (the buffer's slow fall-back plus the device clock estimate), where
+    // polling alone would scatter notes over 16 ms and more
+    let steady = &out[400..];
+    assert!(steady.iter().all(|(_, on_time)| *on_time), "{} late", steady.iter().filter(|o| !o.1).count());
+    let (lo, hi) = steady.iter().fold((i64::MAX, i64::MIN), |(lo, hi), (l, _)| (lo.min(*l), hi.max(*l)));
+    assert!(hi - lo <= 168, "latency varies by {} frames", hi - lo);
+    assert!(hi < 2 * 1024 + 48 * 40, "latency {hi} frames stays below two blocks + 40 ms");
+}
+
+#[test]
+fn an_evolve_level_match_never_applies_to_another_sound() {
+    let mut h = Harness::new(None);
+    let ch = h.app.project.channels[0].clone();
+    let instance = ch.instrument.id;
+    let base = h.app.synth_mirrors[&instance].patch().clone();
+    let mut loud = base.clone();
+    loud.master_db += 9.0;
+    let gain = |h: &Harness| h.app.engine_project().channels[0].gain_db.0;
+    // previewing the card: matched
+    super::evolve::preview(&mut h.app, instance, &loud);
+    assert!(gain(&h) < ch.gain_db.0 - 8.0);
+    // a knob tweak on the card keeps the match (no jump while auditioning)
+    h.app.synth_mirrors.get_mut(&instance).unwrap().set_param(rawdawg_types::ParamId(rawdawg_synthesizer::params::AMP_ATTACK), 0.3);
+    assert!(gain(&h) < ch.gain_db.0 - 8.0);
+    // a preset from the preset browser is a different sound: its own level
+    let mut preset = base.clone();
+    preset.master_db -= 3.0;
+    super::presets::preview(&mut h.app, instance, &preset);
+    assert_eq!(gain(&h), ch.gain_db.0, "the preset plays at its own level");
+    // committing another sound or undoing ends it too
+    super::evolve::cancel_preview(&mut h.app);
+    super::evolve::preview(&mut h.app, instance, &loud);
+    assert!(h.app.synth_panel.evolve.preview_trim_db.is_some());
+    super::synth_panel::commit_patch(&mut h.app, instance, preset.clone());
+    assert_eq!(gain(&h), ch.gain_db.0, "a committed sound plays at its own level");
+    super::evolve::preview(&mut h.app, instance, &loud);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(gain(&h), h.app.project.channels[0].gain_db.0, "undo ends the match");
 }

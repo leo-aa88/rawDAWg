@@ -59,6 +59,8 @@ pub struct EngineStatus {
     /// at the start of the last block: timed live input (MIDI) is placed on this clock.
     pub block_start_frame: AtomicU64,
     pub block_wall_us: AtomicU64,
+    /// Length of the last block (frames), for [`crate::timing`].
+    pub block_frames: std::sync::atomic::AtomicU32,
     /// Timed live events whose frame had already passed (played at the next block start).
     pub late_events: Counter,
     /// Master output (mono sum) for the live scope.
@@ -97,6 +99,7 @@ impl Default for EngineStatus {
             stream_dropouts: Counter::new(),
             block_start_frame: AtomicU64::new(0),
             block_wall_us: AtomicU64::new(0),
+            block_frames: std::sync::atomic::AtomicU32::new(0),
             late_events: Counter::new(),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
@@ -357,7 +360,19 @@ impl Engine {
 
     /// Deliver a live event to a channel's instrument at `offset` frames into this block (and
     /// echo it to the recorder with the project frame it lands on).
+    /// Drop held timed events from `source` (all when `None`); bounded, no allocation.
+    fn purge_pending(&mut self, source: Option<EventSource>) {
+        self.pending_live.retain(|(_, e, _)| source.is_some_and(|s| e.source != s));
+    }
+
     fn place_live(&mut self, channel: rawdawg_types::ChannelId, event: TimedEvent, offset: u32) {
+        // an all-notes-off (a disconnected device's release, focus loss) also cancels that
+        // source's notes still waiting for a later block, or they would start after it
+        if let EventKind::AllNotesOff { source } = event.kind {
+            self.purge_pending(source);
+        } else if matches!(event.kind, EventKind::Reset) {
+            self.purge_pending(None);
+        }
         let Some(ci) = self.plan.channel_index(channel) else {
             self.status.dropped_events.incr();
             return;
@@ -447,6 +462,8 @@ impl Engine {
                 }
             }
             EngineCommand::Panic { source } => {
+                // held timed events of that source must not start notes after the panic
+                self.purge_pending(source);
                 for ci in 0..self.plan.channels.len() {
                     let ev = TimedEvent::new(0, source.unwrap_or(EventSource::Transport), 0, EventKind::AllNotesOff { source });
                     if !self.stage.push(ci, ev) {
@@ -955,6 +972,7 @@ impl Engine {
         self.stage.clear();
         self.block_frames = frames;
         self.status.block_wall_us.store(rawdawg_rt::clock::now_us(), Ordering::Relaxed);
+        self.status.block_frames.store(frames as u32, Ordering::Relaxed);
         self.status.block_start_frame.store(self.rendered, Ordering::Release);
         let block_end = self.rendered + frames as u64;
         let mut i = 0;

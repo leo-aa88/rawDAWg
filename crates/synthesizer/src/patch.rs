@@ -655,6 +655,10 @@ pub struct Patch {
     pub master_db: f32,
     /// Velocity → amplitude sensitivity 0..1 (0 = ignore velocity).
     pub velocity_sensitivity: f32,
+    /// Channel CC 74 moves the brightness of that channel's notes (MPE controllers send their
+    /// "timbre" there). Off by default: plenty of MIDI files and knobs use CC 74 for other things.
+    #[serde(default)]
+    pub cc74_brightness: bool,
     #[serde(default = "default_lfos")]
     pub lfos: Vec<Lfo>,
     #[serde(default)]
@@ -756,6 +760,7 @@ impl Default for Patch {
             tuning: Tuning::default(),
             master_db: -10.0,
             velocity_sensitivity: 0.7,
+            cc74_brightness: false,
             lfos: default_lfos(),
             mod_routes: vec![],
             mutation: MutationInfo::default(),

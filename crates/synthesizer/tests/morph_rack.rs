@@ -129,7 +129,7 @@ fn x_automation_glides_while_the_held_note_keeps_sounding_in_every_corner() {
     assert!(step < natural * 2.5, "no click when X moves: {step} vs {natural}");
     assert_eq!(r.param(ParamId(PARAM_X)), Some(1.0));
     assert_eq!(r.param(ParamId(PARAM_Y)), Some(0.0));
-    // the rack's own parameters never reach the corner synths (Y = 1 would be a synth param id)
+    // the rack's own parameters mean nothing to the corner synths (their ids are outside the synth's)
     let (y_moved, _) = render(r.as_mut(), 40, |b| if b == 0 { vec![param(PARAM_Y, 1.0)] } else { vec![] });
     assert!((dominant_frequency(&y_moved[20 * BLOCK..], SR) - 440.0).abs() < 1.0, "C/D at the bottom: still the sine pair");
 }
@@ -187,4 +187,23 @@ fn processing_is_allocation_free_with_notes_and_pad_moves() {
         }
     });
     assert_eq!(allocs, 0);
+}
+
+#[test]
+fn every_event_of_a_crowded_block_reaches_every_corner() {
+    // more events in one block than the engine's per-block bound: the rack copies nothing, so a
+    // corner can never miss a note-off and keep a note hanging
+    let mut r = rack([sine(), pluck_pair(), sine(), pluck_pair()], 0.5, 0.5);
+    let n = rawdawg_types::limits::EngineLimits::DEFAULT.max_scheduled_events_per_block + 200;
+    let mut evs: Vec<TimedEvent> = (0..n).map(|i| TimedEvent::note_on(0, EventSource::Transport, 0, i, 40 + (i % 40) as u8, 0.5)).collect();
+    evs.extend((0..n).map(|i| TimedEvent::note_off(200, EventSource::Transport, 0, i, 40 + (i % 40) as u8)));
+    rawdawg_types::events::sort_events(&mut evs);
+    let transport = TransportView::stopped(SR);
+    let (mut l, mut rr) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+    let mut outs: [&mut [f32]; 2] = [&mut l, &mut rr];
+    let mut ctx = ProcessContext { audio: AudioBlock::output_only(BLOCK, &mut outs), events: &evs, transport: &transport };
+    r.process(&mut ctx);
+    // long enough for every release to finish
+    render(r.as_mut(), 400, |_| vec![]);
+    assert_eq!(r.active_voices(), 0, "every note was released in every corner");
 }

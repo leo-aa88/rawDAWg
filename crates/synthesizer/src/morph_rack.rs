@@ -11,7 +11,7 @@ use crate::synth::Synth;
 use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail};
 use rawdawg_dsp::smooth::Smoother;
 use rawdawg_dsp::{AudioBlock, BusLayout};
-use rawdawg_types::events::{EventKind, TimedEvent};
+use rawdawg_types::events::EventKind;
 use rawdawg_types::limits::EngineLimits;
 use rawdawg_types::params::{ParamCategory, ParamDescriptor, ParamMapping, ParamUnit};
 use rawdawg_types::{ParamId, ids::native_types};
@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 
 pub const TYPE_ID: &str = native_types::MORPH;
 pub const DISPLAY_NAME: &str = "Morph rack";
-pub const PARAM_X: u32 = 1;
-pub const PARAM_Y: u32 = 2;
+/// Ids no synth parameter uses (the synth ignores unknown ids), so the rack can hand its events
+/// to the corner synths unchanged.
+pub const PARAM_X: u32 = 9001;
+pub const PARAM_Y: u32 = 9002;
 /// Pad movements glide over this time (automation and gestures alike), so they never click.
 const XY_SMOOTHING_S: f32 = 0.02;
 
@@ -119,8 +121,6 @@ pub struct MorphRack {
     y: Smoother,
     /// Per-renderer output buffers (left, right), sized in `prepare`.
     buffers: Vec<[Vec<f32>; 2]>,
-    /// The block's events without the rack's own parameter changes, capacity from `prepare`.
-    events: Vec<TimedEvent>,
     sample_rate: f64,
     prepared: bool,
 }
@@ -138,7 +138,6 @@ impl MorphRack {
             x: Smoother::new(x, XY_SMOOTHING_S, 48_000.0),
             y: Smoother::new(y, XY_SMOOTHING_S, 48_000.0),
             buffers: Vec::new(),
-            events: Vec::new(),
             sample_rate: 48_000.0,
             prepared: false,
         }
@@ -210,7 +209,6 @@ impl Processor for MorphRack {
             s.prepare(spec)?;
         }
         self.buffers = (0..self.synths.len()).map(|_| [vec![0.0; spec.max_frames], vec![0.0; spec.max_frames]]).collect();
-        self.events = Vec::with_capacity(EngineLimits::DEFAULT.max_scheduled_events_per_block as usize);
         self.sample_rate = spec.sample_rate;
         let sr = spec.sample_rate as f32;
         self.x = Smoother::new(self.state.x, XY_SMOOTHING_S, sr);
@@ -226,19 +224,15 @@ impl Processor for MorphRack {
             return;
         }
         // the rack's own parameters; everything else goes to every corner
-        self.events.clear();
+        // the rack's own parameters; the corners get every event as it is (they ignore the
+        // rack's parameter ids), so nothing is copied and nothing can be lost
         let mut has_events = false;
         for ev in ctx.events {
             match ev.kind {
                 EventKind::Param { id, value } if id.0 == PARAM_X || id.0 == PARAM_Y => {
                     self.set_param(id, value);
                 }
-                _ => {
-                    if self.events.len() < self.events.capacity() {
-                        self.events.push(*ev);
-                        has_events = true;
-                    }
-                }
+                _ => has_events = true,
             }
         }
         let start = self.renderer_weights(self.x.current(), self.y.current());
@@ -255,7 +249,7 @@ impl Processor for MorphRack {
             }
             let [bl, br] = &mut self.buffers[r];
             let mut outs: [&mut [f32]; 2] = [&mut bl[..frames], &mut br[..frames]];
-            let mut sub = ProcessContext { audio: AudioBlock::output_only(frames, &mut outs), events: &self.events, transport: ctx.transport };
+            let mut sub = ProcessContext { audio: AudioBlock::output_only(frames, &mut outs), events: ctx.events, transport: ctx.transport };
             synth.process(&mut sub);
         }
         // mix: each sample's weights from the gliding pad position

@@ -56,21 +56,49 @@ pub struct ClipStream {
     ring_head: usize,
     generation: u64,
     /// Decoded frames at the clip's loop entry point (empty when the clip is never re-entered).
+    /// Shared with the head cache; plans are dropped off the audio thread, so the audio thread
+    /// never frees them.
     head_start: u64,
-    head_l: Vec<f32>,
-    head_r: Vec<f32>,
+    head_l: Arc<[f32]>,
+    head_r: Arc<[f32]>,
 }
 
 /// Frames decoded at a clip's loop entry point.
+#[derive(Clone)]
 pub struct LoopHead {
     pub start: u64,
-    pub left: Vec<f32>,
-    pub right: Vec<f32>,
+    pub left: Arc<[f32]>,
+    pub right: Arc<[f32]>,
+}
+
+/// Decoded heads by (file, size, modification time, entry frame): recompiles (every edit) reuse
+/// them instead of decoding again. Bounded; the oldest go first.
+struct HeadCache {
+    entries: std::collections::VecDeque<(HeadKey, LoopHead)>,
+    /// Heads decoded (not taken from the cache) per file: diagnostics and tests.
+    decoded: Vec<(std::path::PathBuf, u64)>,
+}
+
+type HeadKey = (std::path::PathBuf, u64, Option<std::time::SystemTime>, u64);
+
+/// Heads kept (≈ 256 KB each at f32 stereo).
+const HEAD_CACHE_ENTRIES: usize = 64;
+
+static HEADS: std::sync::Mutex<HeadCache> = std::sync::Mutex::new(HeadCache { entries: std::collections::VecDeque::new(), decoded: Vec::new() });
+
+fn head_key(path: &std::path::Path, entry: u64) -> HeadKey {
+    let meta = std::fs::metadata(path).ok();
+    (path.to_path_buf(), meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()), entry)
+}
+
+/// How many loop heads of the file at `path` were decoded rather than reused.
+pub fn heads_decoded(path: &std::path::Path) -> u64 {
+    HEADS.lock().map(|c| c.decoded.iter().find(|(p, _)| p == path).map_or(0, |(_, n)| *n)).unwrap_or(0)
 }
 
 impl ClipStream {
     fn new(asset_frames: u64, queue: QueueConsumer<StreamBlock>, control: Arc<StreamControl>, head: Option<LoopHead>) -> Self {
-        let head = head.unwrap_or(LoopHead { start: 0, left: Vec::new(), right: Vec::new() });
+        let head = head.unwrap_or(LoopHead { start: 0, left: Arc::from(Vec::new()), right: Arc::from(Vec::new()) });
         Self {
             asset_frames,
             queue: Some(queue),
@@ -139,8 +167,8 @@ impl ClipStream {
             ring_head: 0,
             generation: 0,
             head_start: 0,
-            head_l: Vec::new(),
-            head_r: Vec::new(),
+            head_l: Arc::from(Vec::new()),
+            head_r: Arc::from(Vec::new()),
         }
     }
 
@@ -259,6 +287,29 @@ pub struct StreamRequest {
     pub loop_entry: Option<u64>,
 }
 
+/// The head at `start` of the file at `path`: from the cache, or decoded `HEAD_FRAMES` (off the
+/// audio thread) and cached.
+fn loop_head(reader: &mut StreamReader, path: &std::path::Path, start: u64) -> Result<LoopHead, String> {
+    let key = head_key(path, start);
+    if let Ok(cache) = HEADS.lock()
+        && let Some((_, h)) = cache.entries.iter().find(|(k, _)| *k == key)
+    {
+        return Ok(h.clone());
+    }
+    let head = decode_head(reader, start)?;
+    if let Ok(mut cache) = HEADS.lock() {
+        if cache.entries.len() >= HEAD_CACHE_ENTRIES {
+            cache.entries.pop_front();
+        }
+        cache.entries.push_back((key, head.clone()));
+        match cache.decoded.iter_mut().find(|(p, _)| p == path) {
+            Some((_, n)) => *n += 1,
+            None => cache.decoded.push((path.to_path_buf(), 1)),
+        }
+    }
+    Ok(head)
+}
+
 /// Decode `HEAD_FRAMES` at `start` (off the audio thread).
 fn decode_head(reader: &mut StreamReader, start: u64) -> Result<LoopHead, String> {
     reader.seek(start).map_err(|e| e.to_string())?;
@@ -274,7 +325,7 @@ fn decode_head(reader: &mut StreamReader, start: u64) -> Result<LoopHead, String
     }
     left.truncate(got);
     right.truncate(got);
-    Ok(LoopHead { start, left, right })
+    Ok(LoopHead { start, left: Arc::from(left), right: Arc::from(right) })
 }
 
 /// Open readers for `requests` and start the worker. Returns the RT streams in order.
@@ -284,7 +335,7 @@ pub fn start_streams(requests: &[StreamRequest]) -> Result<(Vec<ClipStream>, Str
     for StreamRequest { info, first_frame, loop_entry } in requests {
         let mut reader = StreamReader::open(&info.path).map_err(|e| e.to_string())?;
         // a head that cannot be read leaves the clip without one (it then gaps as before)
-        let head = loop_entry.and_then(|e| decode_head(&mut reader, e).map_err(|err| log::warn!("loop head for {}: {err}", info.path.display())).ok());
+        let head = loop_entry.and_then(|e| loop_head(&mut reader, &info.path, e).map_err(|err| log::warn!("loop head for {}: {err}", info.path.display())).ok());
         reader.seek(*first_frame).map_err(|e| e.to_string())?;
         let (producer, consumer) = ControlQueue::create::<StreamBlock>(STREAM_QUEUE_BLOCKS);
         let control = Arc::new(StreamControl { want: AtomicU64::new(NO_WANT), generation: AtomicU64::new(0), stop: AtomicBool::new(false) });

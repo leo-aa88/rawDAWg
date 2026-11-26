@@ -1553,3 +1553,131 @@ fn timed_live_events_land_on_their_stream_frame_or_are_counted_late() {
     let (_, late) = run(&|b| if b == 1 { many.borrow_mut().take().unwrap() } else { vec![] }, 3);
     assert_eq!(late, 10);
 }
+
+#[test]
+fn timed_events_placed_from_the_engines_own_stamps_are_never_late_with_large_blocks() {
+    use rawdawg_audio_engine::timing::{JitterBuffer, place_event};
+    use rawdawg_types::events::{EventSource, TimedEvent};
+    let p = project_with_notes(&[]);
+    let ch = p.channels[0].id;
+    let limits = EngineLimits::DEFAULT;
+    let plan = compile(&p, 1, 1024, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 1024, &limits);
+    engine.install_plan(plan);
+    let (mut l, mut r) = (vec![0.0f32; 1024], vec![0.0f32; 1024]);
+    let mut jb = JitterBuffer::default();
+    for b in 0..40u32 {
+        engine.render_block(&mut l, &mut r);
+        let st = &handle.status;
+        let (frame, wall, block) = (
+            st.block_start_frame.load(std::sync::atomic::Ordering::Acquire),
+            st.block_wall_us.load(std::sync::atomic::Ordering::Relaxed),
+            st.block_frames.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert_eq!(block, 1024);
+        // a message sent just now, and one sent 15 ms ago (a UI frame of polling delay)
+        let now = rawdawg_rt::clock::now_us();
+        for (k, sent) in [now, now.saturating_sub(15_000)].into_iter().enumerate() {
+            let at = place_event(&mut jb, frame, wall, block, 48_000, sent, now);
+            let event = TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, b * 2 + k as u32, 60, 0.8);
+            handle.send(EngineCommand::LiveAt { channel: ch, event, stream_frame: at }).unwrap();
+        }
+    }
+    engine.render_block(&mut l, &mut r);
+    assert_eq!(handle.status.late_events.get(), 0, "placed from the engine's stamps, nothing is late");
+}
+
+#[test]
+fn panic_and_a_devices_all_notes_off_cancel_its_held_notes() {
+    use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
+    let p = project_with_notes(&[]);
+    let ch = p.channels[0].id;
+    let limits = EngineLimits::DEFAULT;
+    let run = |release: Option<EngineCommand>| -> f32 {
+        let plan = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+        let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+        engine.install_plan(plan);
+        let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+        engine.render_block(&mut l, &mut r);
+        // a note due two blocks from now from the device, and a typing note due as well
+        let note = |src, id| EngineCommand::LiveAt { channel: ch, event: TimedEvent::note_on(0, src, 0, id, 60, 0.8), stream_frame: 256 + 600 };
+        handle.send(note(EventSource::MidiDevice(0), 1)).unwrap();
+        if let Some(c) = release {
+            handle.send(c).unwrap();
+        }
+        let mut peak = 0.0f32;
+        for _ in 0..20 {
+            engine.render_block(&mut l, &mut r);
+            peak = l.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        peak
+    };
+    assert!(run(None) > 0.01, "the held note plays on its frame");
+    assert_eq!(run(Some(EngineCommand::Panic { source: None })), 0.0, "Panic cancels it");
+    assert_eq!(run(Some(EngineCommand::Panic { source: Some(EventSource::MidiDevice(0)) })), 0.0, "a panic of its source cancels it");
+    assert!(run(Some(EngineCommand::Panic { source: Some(EventSource::TypingKeyboard) })) > 0.01, "another source's panic does not");
+    // the release a disconnected device produces (an all-notes-off sent at once) cancels it too
+    let off = EngineCommand::Live { channel: ch, event: TimedEvent::new(0, EventSource::MidiDevice(0), 0, EventKind::AllNotesOff { source: Some(EventSource::MidiDevice(0)) }) };
+    assert_eq!(run(Some(off)), 0.0, "no note starts after the device's release");
+}
+
+#[test]
+fn loop_heads_are_decoded_once_and_reused_by_every_recompile() {
+    use rawdawg_audio_engine::AssetResolver;
+    let (dir, p, id) = long_clip_project("heads");
+    let mut cache = rawdawg_audio_engine::ProjectAssetCache::new(Some(dir.clone()));
+    cache.sync(Some(dir.clone()), &p);
+    let path = cache.stream_info(&id).expect("streamed").path;
+    let limits = EngineLimits::DEFAULT;
+    // no loop range: the Loop button can still loop the song at any time, so heads exist
+    assert!(p.r#loop.is_none());
+    for revision in 1..=5 {
+        let out = compile(&p, revision, 256, &limits, &Default::default(), &cache).unwrap();
+        drop(out);
+    }
+    // two clips (bar 1 at the song start, bar 2 inside the loop): one decode each, ever
+    assert_eq!(rawdawg_audio_engine::stream::heads_decoded(&path), 2, "five compiles, two heads decoded");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn a_morph_rack_keeps_its_notes_and_automated_position_across_a_recompile() {
+    use rawdawg_synthesizer::morph_rack::{MorphRackState, PARAM_X};
+    use rawdawg_synthesizer::patch::{Layer, Patch};
+    // a held note; corner A a sine, corner B the same an octave up
+    let mut p = project_with_notes(&[(0, 3840, 57)]);
+    let sine = Patch { layers: vec![Layer::basic(rawdawg_dsp::oscillator::BasicWave::Sine)], ..Patch::default() };
+    let mut up = sine.clone();
+    up.layers[0].coarse_semitones = 12;
+    let state = MorphRackState::new([sine.clone(), up.clone(), sine, up], 0.0, 0.0);
+    p.channels[0].instrument = rawdawg_project::Instance::native(rawdawg_types::ids::native_types::MORPH, serde_json::to_value(&state).unwrap());
+    let rack = p.channels[0].instrument.id;
+    let limits = EngineLimits::DEFAULT;
+    let first = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap();
+    let live = first.fingerprints.clone();
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    engine.install_plan(first.plan);
+    handle.send(EngineCommand::Play).unwrap();
+    // automation (a parameter event) moves X to corner B while the note plays
+    handle.send(EngineCommand::Param { instance: rack, id: rawdawg_types::ParamId(PARAM_X), value: 1.0 }).unwrap();
+    let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+    let mut out = Vec::new();
+    for _ in 0..80 {
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    // an unrelated edit recompiles: the rack's state is unchanged, so the running rack continues
+    p.channels[0].name = "Renamed".into();
+    let second = compile(&p, 2, 256, &limits, &live, &rawdawg_audio_engine::NoAssets).unwrap();
+    assert!(handle.publish_plan(second.plan).is_ok());
+    let swap_at = out.len();
+    for _ in 0..80 {
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+    }
+    assert!((dominant_frequency(&out[swap_at - 8192..swap_at], 48_000.0) - 440.0).abs() < 1.0, "at B before the edit");
+    assert!((dominant_frequency(&out[swap_at + 1024..swap_at + 9216], 48_000.0) - 440.0).abs() < 1.0, "still at B after it (not back at the saved X)");
+    for (k, block) in out[swap_at - 256..swap_at + 2048].chunks(256).enumerate() {
+        assert!(rms(block) > 0.01, "the note keeps sounding through the swap (block {k})");
+    }
+}

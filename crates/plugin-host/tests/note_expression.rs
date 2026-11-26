@@ -24,18 +24,24 @@ fn built_module(package: &str, stem: &str) -> PathBuf {
     p
 }
 
-/// The exported VST3 module laid out as a bundle (copied under a temp name, then renamed).
+/// The exported VST3 module laid out as a bundle, built once per process (tests run in
+/// parallel and must never load a file another thread is still copying).
 fn vst3_bundle() -> PathBuf {
-    let module = built_module("rawdawg-plugin-vst3", "rawdawg_vst3");
-    let base = std::env::temp_dir().join(format!("rawdawg-noteexpr-{}", std::process::id()));
-    let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
-    let dir = base.join("rawDAWg.vst3").join("Contents").join(arch);
-    std::fs::create_dir_all(&dir).unwrap();
-    let target = dir.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" });
-    let tmp = dir.join("partial.tmp");
-    std::fs::copy(&module, &tmp).unwrap();
-    std::fs::rename(&tmp, &target).unwrap();
-    base.join("rawDAWg.vst3")
+    static BUNDLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUNDLE
+        .get_or_init(|| {
+            let module = built_module("rawdawg-plugin-vst3", "rawdawg_vst3");
+            let base = std::env::temp_dir().join(format!("rawdawg-noteexpr-{}", std::process::id()));
+            let arch = if cfg!(target_os = "windows") { "x86_64-win" } else { "x86_64-linux" };
+            let dir = base.join("rawDAWg.vst3").join("Contents").join(arch);
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join(if cfg!(target_os = "windows") { "rawDAWg.vst3" } else { "rawDAWg.so" });
+            let tmp = dir.join("partial.tmp");
+            std::fs::copy(&module, &tmp).unwrap();
+            std::fs::rename(&tmp, &target).unwrap();
+            base.join("rawDAWg.vst3")
+        })
+        .clone()
 }
 
 fn ev(block: usize, kind: EventKind) -> (usize, TimedEvent) {
@@ -71,6 +77,52 @@ fn scenario(with_expression: bool) -> Vec<(usize, TimedEvent)> {
 
 fn spec() -> PrepareSpec {
     PrepareSpec::new(SR, BLOCK, BusLayout::Stereo)
+}
+
+/// Notes without ids (as from a MIDI stream or a host that sends none): started, pressed,
+/// shaped (when the format can address such notes) and released by pitch.
+fn pitch_scenario(with_expressions: bool) -> Vec<(usize, TimedEvent)> {
+    use rawdawg_types::events::pitch_note_id;
+    let (a, b) = (pitch_note_id(57), pitch_note_id(64));
+    let mut v = Vec::new();
+    v.extend([
+        ev(0, EventKind::NoteOn { note_id: a, pitch: 57, velocity: 0.8 }),
+        ev(0, EventKind::NoteOn { note_id: b, pitch: 64, velocity: 0.7 }),
+        ev(30, EventKind::NotePressure { note_id: a, value: 0.7 }),
+        ev(100, EventKind::NoteOff { note_id: a, pitch: 57 }),
+        ev(100, EventKind::NoteOff { note_id: b, pitch: 64 }),
+    ]);
+    // a note with a real id that equals the other note's pitch (64): an expression for it must not
+    // reach the id-less note on key 64 (sending a key as an id would make the two collide)
+    v.extend([ev(0, EventKind::NoteOn { note_id: 64, pitch: 52, velocity: 0.6 }), x(50, 64, NoteExpression::Volume, 0.0), ev(100, EventKind::NoteOff { note_id: 64, pitch: 52 })]);
+    if with_expressions {
+        v.extend([x(20, a, NoteExpression::Tuning, 7.0), x(40, b, NoteExpression::Volume, 0.4), x(60, a, NoteExpression::Pan, 0.1)]);
+    }
+    v
+}
+
+/// A patch whose aftertouch closes the amp, so the scenario's pressure is heard (route
+/// parameters are not exposed to hosts, so it travels as the plugin's state).
+fn pressure_patch() -> Vec<u8> {
+    use rawdawg_synthesizer::patch::{ModRoute, ModSource, ModTarget, Patch};
+    let mut p = Patch::default();
+    p.mod_routes.push(ModRoute { source: ModSource::Aftertouch, target: ModTarget::Amp, depth: -0.8, enabled: true });
+    p.to_json()
+}
+
+/// A hosted instance's saved state with the plugin's own bytes (`key`) replaced by `patch`
+/// (the exported synth's state is its patch).
+fn with_patch(saved: &[u8], key: &str, patch: &[u8]) -> Vec<u8> {
+    let mut env: serde_json::Value = serde_json::from_slice(saved).expect("envelope");
+    env[key] = serde_json::Value::String(rawdawg_plugin_host::b64::encode(patch));
+    serde_json::to_vec(&env).unwrap()
+}
+
+fn native_with_pressure() -> Box<dyn Processor> {
+    let mut p = native();
+    p.load_state(&pressure_patch()).unwrap();
+    p.prepare(&spec()).unwrap();
+    p
 }
 
 /// Render the scenario through a prepared processor; returns left then right channel.
@@ -138,4 +190,49 @@ fn vst3_note_expressions_reach_the_exported_synth() {
     let mut synth = Vst3Instance::new(loaded, &desc).expect("instantiate");
     let mut rt = synth.activate_for_rt(&spec()).expect("activate");
     check("VST3", &mut rt);
+}
+
+fn check_pitch(format: &str, hosted: &mut dyn Processor, with_expressions: bool) {
+    let reference = render(native_with_pressure().as_mut(), &pitch_scenario(with_expressions));
+    let no_pressure: Vec<(usize, TimedEvent)> = pitch_scenario(false).into_iter().filter(|(_, e)| !matches!(e.kind, EventKind::NotePressure { .. })).collect();
+    assert!(max_diff(&reference, &render(native_with_pressure().as_mut(), &no_pressure)) > 0.02, "pressure changes the sound");
+    let got = render(hosted, &pitch_scenario(with_expressions));
+    let d = max_diff(&got, &reference);
+    assert!(d < 1e-5, "{format}: notes without ids play, are pressed and released like native (max diff {d})");
+    let n = got.len() / 2;
+    assert!(got[n - 4096..n].iter().all(|s| s.abs() < 1e-6), "{format}: released, nothing hangs");
+}
+
+#[test]
+fn clap_notes_without_ids_are_addressed_by_key() {
+    let module = built_module("rawdawg-plugin-clap", "rawdawg_clap");
+    // SAFETY: our own freshly built module.
+    let library = unsafe { rawdawg_plugin_host::describe::describe_clap_library(&module) }.expect("describe");
+    let desc = library.plugins.iter().find(|p| p.plugin_id == "rawdawg.synth").expect("synth").clone();
+    let mut cache = ModuleCache::default();
+    // SAFETY: the module passed the description above.
+    let loaded = unsafe { cache.load(&library.path) }.expect("load");
+    let mut synth = ClapInstance::new(loaded, &desc).expect("instantiate");
+    let state = with_patch(&synth.save_state(), rawdawg_plugin_host::clap::STATE_KEY, &pressure_patch());
+    synth.load_state(&state).expect("state");
+    let mut rt = synth.activate_for_rt(&spec()).expect("activate");
+    // CLAP addresses expressions of id-less notes by key: all of them reach the synth
+    check_pitch("CLAP", &mut rt, true);
+}
+
+#[test]
+fn vst3_notes_without_ids_are_addressed_by_pitch() {
+    let bundle = vst3_bundle();
+    // SAFETY: our own freshly built module.
+    let library = unsafe { describe_vst3_module(&bundle) }.expect("describe");
+    let desc = library.plugins.iter().find(|p| p.name == "rawDAWg Synth").expect("synth").clone();
+    let mut cache = Vst3ModuleCache::default();
+    // SAFETY: the module was described above.
+    let loaded = unsafe { cache.load(&library.path) }.expect("load");
+    let mut synth = Vst3Instance::new(loaded, &desc).expect("instantiate");
+    let state = with_patch(&synth.save_state(), rawdawg_plugin_host::vst3::COMPONENT_STATE_KEY, &pressure_patch());
+    synth.load_state(&state).expect("state");
+    let mut rt = synth.activate_for_rt(&spec()).expect("activate");
+    // VST3 addresses note expressions by id only, so id-less notes get pressure, not expressions
+    check_pitch("VST3", &mut rt, false);
 }
