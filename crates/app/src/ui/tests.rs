@@ -141,6 +141,29 @@ impl Harness {
         panic!("{id:?} kept moving");
     }
 
+    /// One frame with the window out of focus (another application took it).
+    fn frame_unfocused(&mut self) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))),
+            focused: false,
+            events: vec![egui::Event::WindowFocused(false)],
+            ..Default::default()
+        };
+        let app = &mut self.app;
+        let parts = self.parts;
+        let mut out = self.ctx.run_ui(input, |ui| {
+            app.step(ui.ctx());
+            app.draw_parts(ui, parts);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A key event as the OS sends it (`repeat`: auto-repeat while held).
+    fn key_event(&mut self, key: egui::Key, pressed: bool, repeat: bool, modifiers: egui::Modifiers) {
+        // the platform reports a change of held modifiers before the key, as egui expects
+        self.frame(vec![egui::Event::ModifiersChanged(modifiers), egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers }]);
+    }
+
     fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
         self.frame(vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
         self.frame(vec![egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers }]);
@@ -1646,4 +1669,86 @@ fn the_recovery_offer_compares_the_autosave_and_plays_either_version_before_choo
     assert_eq!(h.app.project.channels[0].name, "Lead");
     assert!(h.app.history.is_dirty());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_typing_keyboard_ignores_key_repeat_releases_on_focus_loss_and_keeps_note_identity() {
+    use rawdawg_types::events::EventKind;
+    let mut h = Harness::new(None);
+    h.app.typing_enabled = true;
+    h.app.prefs.typing_octave = 0;
+    let none = egui::Modifiers::NONE;
+    let log = |h: &mut Harness| std::mem::take(&mut h.app.live_log).into_iter().map(|e| e.kind).collect::<Vec<_>>();
+    // press Z: one note-on at C4; the OS repeats the key while held: no more notes
+    h.key_event(egui::Key::Z, true, false, none);
+    for _ in 0..5 {
+        h.key_event(egui::Key::Z, true, true, none);
+    }
+    let on = log(&mut h);
+    assert_eq!(on.len(), 1, "{on:?}");
+    let EventKind::NoteOn { note_id, pitch: 60, .. } = on[0] else { panic!("{on:?}") };
+    // change the octave while holding, then release: the note-off has the original id and pitch
+    h.app.prefs.typing_octave = 1;
+    h.key_event(egui::Key::Z, false, false, none);
+    assert_eq!(log(&mut h), vec![EventKind::NoteOff { note_id, pitch: 60 }], "released with the pitch it started with");
+    // the next press plays in the new octave, under a new id
+    h.key_event(egui::Key::Z, true, false, none);
+    let on2 = log(&mut h);
+    let EventKind::NoteOn { note_id: id2, pitch: 72, .. } = on2[0] else { panic!("{on2:?}") };
+    assert_ne!(id2, note_id);
+    // focus goes to another window while two keys are held: both are released at once
+    h.key_event(egui::Key::C, true, false, none);
+    log(&mut h);
+    h.frame_unfocused();
+    let mut released: Vec<(u32, u8)> = log(&mut h)
+        .into_iter()
+        .map(|k| match k {
+            EventKind::NoteOff { note_id, pitch } => (note_id, pitch),
+            other => panic!("only releases on focus loss: {other:?}"),
+        })
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released.len(), 2, "{released:?}");
+    assert!(released.iter().any(|(id, p)| *id == id2 && *p == 72));
+    // a key-up arriving after the focus came back releases nothing twice
+    h.frame(vec![egui::Event::WindowFocused(true)]);
+    h.key_event(egui::Key::Z, false, false, none);
+    assert!(log(&mut h).is_empty(), "no stuck or doubled notes");
+    // with Ctrl held, keys are shortcuts, not notes
+    h.key_event(egui::Key::X, true, false, egui::Modifiers::CTRL);
+    h.key_event(egui::Key::X, false, false, egui::Modifiers::CTRL);
+    assert!(log(&mut h).is_empty(), "Ctrl+key plays nothing");
+}
+
+#[test]
+fn timestamped_midi_lands_at_a_constant_latency_whatever_the_delivery_jitter() {
+    use rawdawg_midi::{MidiClock, MidiTime};
+    // a phrase sent every 2.5 ms (120 frames at 48 kHz) by a device whose clock is far ahead;
+    // each message arrives 0.3 to 9 ms late, and the UI polls every 16.7 ms
+    let sr = 48_000u32;
+    let (device_ahead, latency) = (7_000_000_000u64, 256u64);
+    // the stream: block 0 started at stream frame 0 at process time 1 s
+    let (block_frame, block_wall) = (0u64, 1_000_000u64);
+    let mut clock = MidiClock::default();
+    let mut jitter = 99u64;
+    let mut targets = Vec::new();
+    for k in 0..400u64 {
+        let sent = 1_000_000 + k * 2_500;
+        jitter = jitter.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let delivered = sent + 300 + (jitter >> 33) % 8_700;
+        // polled on the next UI frame (the arrival stamp is the delivery itself)
+        let wall = clock.wall_time(MidiTime { device_us: sent + device_ahead, arrival_us: delivered });
+        targets.push((k, super::midi_target_frame(block_frame, block_wall, sr, wall, latency)));
+    }
+    // after a quarter-second warm-up every note lands at latency + its true frame, within the
+    // fastest delivery seen (≥ 0.3 ms = 15 frames) and rounding; the 9 ms of jitter is gone
+    for (k, t) in &targets[100..] {
+        let true_frame = k * 120;
+        let err = *t as i64 - (true_frame + latency) as i64;
+        assert!((0..=30).contains(&err), "message {k}: frame {t} vs {} (error {err} frames)", true_frame + latency);
+    }
+    let gaps: Vec<i64> = targets[100..].windows(2).map(|w| w[1].1 as i64 - w[0].1 as i64).collect();
+    assert!(gaps.iter().all(|g| (110..=130).contains(g)), "spacing kept: {:?}", &gaps[..10]);
+    // without the device clock (arrival times only) the spacing would wander by the jitter
+    assert!(super::midi_target_frame(0, 1_000_000, sr, 1_009_000, 0) - super::midi_target_frame(0, 1_000_000, sr, 1_000_300, 0) > 400);
 }

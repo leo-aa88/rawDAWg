@@ -5,5 +5,5 @@
 pub mod input;
 pub mod parser;
 
-pub use input::{MidiDeviceInfo, MidiInputManager, MidiMessage};
+pub use input::{MidiClock, MidiDeviceInfo, MidiInputManager, MidiMessage, MidiTime};
 pub use parser::{MidiParser, NoteRegistry};

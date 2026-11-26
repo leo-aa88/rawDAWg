@@ -191,6 +191,11 @@ pub(crate) struct App {
     pub keyboard: keyboard::KeyboardState,
     pub settings: settings::SettingsState,
     midi_rescan_counter: u32,
+    /// Per MIDI device: its clock mapped onto the process clock (timestamped input).
+    midi_clocks: HashMap<u16, rawdawg_midi::MidiClock>,
+    /// Deterministic tests only: every live event sent to the engine.
+    #[cfg(test)]
+    pub live_log: Vec<TimedEvent>,
     /// Set after the one automatic retry with the device-default buffer.
     buffer_fallback_tried: bool,
     screenshot: Option<(PathBuf, std::time::Duration)>,
@@ -298,6 +303,9 @@ impl App {
             keyboard: Default::default(),
             settings: settings::SettingsState::from_request(&req),
             midi_rescan_counter: 0,
+            midi_clocks: HashMap::new(),
+            #[cfg(test)]
+            live_log: Vec::new(),
             buffer_fallback_tried: false,
             screenshot: opts.screenshot.clone(),
             started: std::time::Instant::now(),
@@ -778,8 +786,30 @@ impl App {
     }
 
     pub(crate) fn live(&mut self, event: TimedEvent) {
+        #[cfg(test)]
+        self.live_log.push(event);
         if let Some(channel) = self.selected_channel {
             self.send(EngineCommand::Live { channel, event });
+        }
+    }
+
+    /// A timestamped MIDI event: placed on the audio stream at the time it was sent plus one
+    /// device buffer, so delivery jitter (USB, the MIDI thread, the UI frame) does not move it.
+    fn live_timed(&mut self, event: TimedEvent, time: rawdawg_midi::MidiTime) {
+        let EventSource::MidiDevice(dev) = event.source else { return self.live(event) };
+        if time.is_untimed() {
+            return self.live(event);
+        }
+        let wall = self.midi_clocks.entry(dev).or_default().wall_time(time);
+        let AudioState::Running(sys) = &self.audio else { return self.live(event) };
+        let st = &sys.handle.status;
+        let (frame, block_wall) = (st.block_start_frame.load(std::sync::atomic::Ordering::Acquire), st.block_wall_us.load(std::sync::atomic::Ordering::Relaxed));
+        let latency = u64::from(sys.stream.config.requested_buffer_frames.unwrap_or(512));
+        let target = midi_target_frame(frame, block_wall, sys.sample_rate.0, wall, latency);
+        #[cfg(test)]
+        self.live_log.push(event);
+        if let Some(channel) = self.selected_channel {
+            self.send(EngineCommand::LiveAt { channel, event, stream_frame: target });
         }
     }
 
@@ -910,11 +940,11 @@ impl App {
         if !events.is_empty() {
             self.midi_activity = self.midi_activity.wrapping_add(events.len() as u64);
         }
-        for (ev, _ts) in events {
+        for (ev, time) in events {
             if self.handle_midi_control(&ev) {
                 continue;
             }
-            self.live(ev);
+            self.live_timed(ev, time);
         }
     }
 
@@ -1484,6 +1514,11 @@ impl App {
                     if overflow > 0 {
                         ui.label(egui::RichText::new(format!("dropped {overflow}")).color(theme::ERROR)).on_hover_text("Control queue overflow or events for unknown channels");
                     }
+                    let late = st.late_events.get();
+                    if late > 0 {
+                        ui.label(egui::RichText::new(format!("late MIDI {late}")).color(theme::WARNING))
+                            .on_hover_text("MIDI notes that arrived after the moment they should have played (placed at once); a larger audio buffer gives them more room");
+                    }
                     if let Some(e) = &self.plan_error {
                         ui.label(egui::RichText::new(e).color(theme::ERROR));
                     }
@@ -1941,4 +1976,13 @@ pub(crate) fn rack_rename_id(id: ChannelId) -> egui::Id {
 
 pub(crate) fn rack_grip_id(id: ChannelId) -> egui::Id {
     egui::Id::unique(("rack-grip", id))
+}
+
+/// The stream frame a MIDI message sent at process-clock time `wall_us` plays at: its time on
+/// the stream clock (the last block started at `block_start_frame`, `block_wall_us`) plus a
+/// constant `latency_frames`.
+pub(crate) fn midi_target_frame(block_start_frame: u64, block_wall_us: u64, sample_rate: u32, wall_us: u64, latency_frames: u64) -> u64 {
+    let dt_us = wall_us as i64 - block_wall_us as i64;
+    let frames = (dt_us as f64 * f64::from(sample_rate) / 1_000_000.0).round() as i64;
+    (block_start_frame as i64 + frames).max(0) as u64 + latency_frames
 }

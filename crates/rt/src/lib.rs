@@ -12,6 +12,7 @@
 //!   allocator (`alloc-guard` feature) that counts allocations inside the scope.
 
 pub mod alloc_guard;
+pub mod clock;
 pub mod handoff;
 pub mod queue;
 pub mod scope;

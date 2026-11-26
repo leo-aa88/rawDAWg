@@ -233,6 +233,14 @@ fn render_block_is_allocation_free_under_traffic() {
                     })
                     .unwrap();
             }
+            if i % 5 == 0 {
+                // timed (MIDI) input: some due now, some held for later blocks, some late
+                let now = handle.status.block_start_frame.load(std::sync::atomic::Ordering::Relaxed);
+                for (k, at) in [now + 10, now + 5000, now.saturating_sub(100)].into_iter().enumerate() {
+                    let event = TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 5000 + i as u32 * 3 + k as u32, 50 + (i % 30) as u8, 0.6);
+                    handle.send(EngineCommand::LiveAt { channel, event, stream_frame: at }).unwrap();
+                }
+            }
             if i == 200 {
                 handle.send(EngineCommand::SeekTick(0)).unwrap();
             }
@@ -1491,4 +1499,57 @@ fn removing_a_pattern_takes_its_automation_along_and_undo_brings_it_back() {
     broken.automation[0].pattern_id = Some(rawdawg_types::PatternId::new());
     assert!(rawdawg_project::validate(&broken).is_err());
     assert!(p.patterns.iter().any(|x| x.id == other_id));
+}
+
+#[test]
+fn timed_live_events_land_on_their_stream_frame_or_are_counted_late() {
+    use rawdawg_types::events::{EventSource, TimedEvent};
+    let p = project_with_notes(&[]);
+    let ch = p.channels[0].id;
+    let limits = EngineLimits::DEFAULT;
+    // render `blocks` blocks of 256; `send(b)` gives the commands sent before block b
+    let run = |send: &dyn Fn(usize) -> Vec<EngineCommand>, blocks: usize| -> (Vec<f32>, u64) {
+        let plan = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+        let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+        engine.install_plan(plan);
+        let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            for c in send(b) {
+                handle.send(c).unwrap();
+            }
+            engine.render_block(&mut l, &mut r);
+            out.extend_from_slice(&l);
+        }
+        (out, handle.status.late_events.get())
+    };
+    let note = |at: u64| EngineCommand::LiveAt { channel: ch, event: TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 1, 69, 0.9), stream_frame: at };
+    // reference: the note at the start of block 4 (stream frame 1024)
+    let (reference, late) = run(&|b| if b == 4 { vec![note(1024)] } else { vec![] }, 40);
+    assert_eq!(late, 0);
+    let onset = reference.iter().position(|s| s.abs() > 1e-6).expect("the note sounds");
+    assert!((1024..1280).contains(&onset), "the note starts in block 4 (the attack rises from silence): {onset}");
+    // the same note for frame 1124 (100 frames into block 4) is the reference shifted by 100
+    let (inside, late) = run(&|b| if b == 4 { vec![note(1124)] } else { vec![] }, 40);
+    assert_eq!(late, 0);
+    assert!(inside[..1124].iter().all(|s| *s == 0.0));
+    let d = (0..8000).map(|k| (inside[1124 + k] - reference[1024 + k]).abs()).fold(0.0f32, f32::max);
+    assert!(d < 1e-6, "sample-accurate inside the block (max diff {d})");
+    // sent two blocks early, for frame 1124 + 512: held, then exactly on its frame
+    let (held, late) = run(&|b| if b == 4 { vec![note(1124 + 512)] } else { vec![] }, 40);
+    assert_eq!(late, 0);
+    let d = (0..8000).map(|k| (held[1636 + k] - reference[1024 + k]).abs()).fold(0.0f32, f32::max);
+    assert!(held[..1636].iter().all(|s| *s == 0.0) && d < 1e-6, "held until its block (max diff {d})");
+    // its frame has passed: played at the block start, counted late
+    let (late_out, late) = run(&|b| if b == 4 { vec![note(500)] } else { vec![] }, 40);
+    assert_eq!(late, 1);
+    let d = (0..8000).map(|k| (late_out[1024 + k] - reference[1024 + k]).abs()).fold(0.0f32, f32::max);
+    assert!(d < 1e-6, "late = as soon as possible (max diff {d})");
+    // the hold is bounded: beyond its capacity events play at once and count as late
+    let many: Vec<EngineCommand> = (0..rawdawg_audio_engine::engine::MAX_PENDING_LIVE as u64 + 10)
+        .map(|k| EngineCommand::LiveAt { channel: ch, event: TimedEvent::note_off(0, EventSource::MidiDevice(0), 0, 1, 69), stream_frame: 100_000 + k })
+        .collect();
+    let many = std::cell::RefCell::new(Some(many));
+    let (_, late) = run(&|b| if b == 1 { many.borrow_mut().take().unwrap() } else { vec![] }, 3);
+    assert_eq!(late, 10);
 }

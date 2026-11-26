@@ -39,6 +39,14 @@ pub enum EngineCommand {
         channel: ChannelId,
         event: TimedEvent,
     },
+    /// A live event placed at a frame of the audio stream (`EngineStatus::block_start_frame`
+    /// clock): sample-accurate inside its block, held when it is due later, played at once and
+    /// counted as late when its frame has passed. Used for timestamped MIDI input.
+    LiveAt {
+        channel: ChannelId,
+        event: TimedEvent,
+        stream_frame: u64,
+    },
     /// Release everything from a source (focus loss, device disconnect) or all.
     Panic {
         source: Option<rawdawg_types::events::EventSource>,

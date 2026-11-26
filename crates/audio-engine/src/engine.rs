@@ -55,6 +55,12 @@ pub struct EngineStatus {
     pub preview_active: AtomicBool,
     /// Frames of streamed audio clips that were not ready (output as silence).
     pub stream_dropouts: Counter,
+    /// Stream frame (frames rendered so far) and process-clock time (µs, `rawdawg_rt::clock`)
+    /// at the start of the last block: timed live input (MIDI) is placed on this clock.
+    pub block_start_frame: AtomicU64,
+    pub block_wall_us: AtomicU64,
+    /// Timed live events whose frame had already passed (played at the next block start).
+    pub late_events: Counter,
     /// Master output (mono sum) for the live scope.
     pub scope: rawdawg_rt::ScopeBuffer,
 }
@@ -89,6 +95,9 @@ impl Default for EngineStatus {
             count_in_frames: AtomicI64::new(0),
             preview_active: AtomicBool::new(false),
             stream_dropouts: Counter::new(),
+            block_start_frame: AtomicU64::new(0),
+            block_wall_us: AtomicU64::new(0),
+            late_events: Counter::new(),
             metronome: AtomicBool::new(false),
             scope: rawdawg_rt::ScopeBuffer::new(4096),
         }
@@ -166,6 +175,10 @@ impl EventStage {
 const MAX_ACTIVE_SCHEDULED: usize = 2048;
 
 /// The real-time engine. Lives on the audio thread (or the offline render loop).
+/// Timed live events an engine holds for later blocks (MIDI arrives a little ahead of when it
+/// plays); beyond this they play at once and count as late.
+pub const MAX_PENDING_LIVE: usize = 256;
+
 pub struct Engine {
     plan: Plan,
     commands: QueueConsumer<EngineCommand>,
@@ -184,6 +197,12 @@ pub struct Engine {
     loop_enabled_override: Option<bool>,
     pending_seek: Option<i64>,
     pending_stop_release: bool,
+    /// Frames rendered so far (the stream clock timed live events are placed on).
+    rendered: u64,
+    /// Length of the block being rendered.
+    block_frames: usize,
+    /// Timed live events due in a later block (bounded; capacity reserved in `new`).
+    pending_live: Vec<(rawdawg_types::ChannelId, TimedEvent, u64)>,
     sample_rate: SampleRate,
     max_frames: usize,
     metronome_enabled: bool,
@@ -235,6 +254,8 @@ const MAX_SPANS: usize = 8;
 impl Engine {
     /// Create an engine with an empty plan. Non-RT.
     pub fn new(rate: SampleRate, max_frames: usize, limits: &EngineLimits) -> (Engine, EngineHandle) {
+        // the clock timed live input is placed on, fixed before the audio thread reads it
+        rawdawg_rt::clock::init();
         let (cmd_p, cmd_c) = ControlQueue::create::<EngineCommand>(limits.max_control_messages_per_queue as usize);
         let (plan_p, plan_c) = Handoff::create::<Plan>(4);
         let (rec_p, rec_c) = ControlQueue::create::<RecordedEvent>(limits.max_control_messages_per_queue as usize);
@@ -255,6 +276,9 @@ impl Engine {
             loop_enabled_override: None,
             pending_seek: None,
             pending_stop_release: false,
+            rendered: 0,
+            block_frames: 0,
+            pending_live: Vec::with_capacity(MAX_PENDING_LIVE),
             sample_rate: rate,
             max_frames,
             metronome_enabled: false,
@@ -331,6 +355,22 @@ impl Engine {
         self.plan.tempo.frame_to_tick_floor(self.position, self.sample_rate).0
     }
 
+    /// Deliver a live event to a channel's instrument at `offset` frames into this block (and
+    /// echo it to the recorder with the project frame it lands on).
+    fn place_live(&mut self, channel: rawdawg_types::ChannelId, event: TimedEvent, offset: u32) {
+        let Some(ci) = self.plan.channel_index(channel) else {
+            self.status.dropped_events.incr();
+            return;
+        };
+        let mut ev = event;
+        ev.frame = offset.min(self.block_frames.saturating_sub(1) as u32);
+        if !self.stage.push(ci, ev) {
+            self.status.dropped_events.incr();
+        } else if self.recording && self.playing && self.record.push(RecordedEvent { frame: self.position + i64::from(ev.frame), event: ev }).is_err() {
+            self.status.record_overflows.incr();
+        }
+    }
+
     fn handle_command(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::Play => {
@@ -390,17 +430,20 @@ impl Engine {
                     }
                 }
             }
-            EngineCommand::Live { channel, event } => {
-                if let Some(ci) = self.plan.channel_index(channel) {
-                    let mut ev = event;
-                    ev.frame = 0;
-                    if !self.stage.push(ci, ev) {
-                        self.status.dropped_events.incr();
-                    } else if self.recording && self.playing && self.record.push(RecordedEvent { frame: self.position, event: ev }).is_err() {
-                        self.status.record_overflows.incr();
-                    }
+            EngineCommand::Live { channel, event } => self.place_live(channel, event, 0),
+            EngineCommand::LiveAt { channel, event, stream_frame } => {
+                let start = self.rendered;
+                if stream_frame < start {
+                    // already past: as soon as possible, and counted
+                    self.status.late_events.incr();
+                    self.place_live(channel, event, 0);
+                } else if stream_frame < start + self.block_frames as u64 {
+                    self.place_live(channel, event, (stream_frame - start) as u32);
+                } else if self.pending_live.len() < MAX_PENDING_LIVE {
+                    self.pending_live.push((channel, event, stream_frame));
                 } else {
-                    self.status.dropped_events.incr();
+                    self.status.late_events.incr();
+                    self.place_live(channel, event, 0);
                 }
             }
             EngineCommand::Panic { source } => {
@@ -908,8 +951,22 @@ impl Engine {
         if refused > self.status.refused_swaps.get() {
             self.status.refused_swaps.add(refused - self.status.refused_swaps.get());
         }
-        // 2. commands
+        // 2. commands (timed live events due in this block first)
         self.stage.clear();
+        self.block_frames = frames;
+        self.status.block_wall_us.store(rawdawg_rt::clock::now_us(), Ordering::Relaxed);
+        self.status.block_start_frame.store(self.rendered, Ordering::Release);
+        let block_end = self.rendered + frames as u64;
+        let mut i = 0;
+        while i < self.pending_live.len() {
+            if self.pending_live[i].2 < block_end {
+                let (channel, event, at) = self.pending_live.swap_remove(i);
+                let offset = at.saturating_sub(self.rendered) as u32;
+                self.place_live(channel, event, offset);
+            } else {
+                i += 1;
+            }
+        }
         while let Some(cmd) = self.commands.pop() {
             self.handle_command(cmd);
         }
@@ -1169,6 +1226,7 @@ impl Engine {
         self.status.position_tick.store(self.current_tick(), Ordering::Relaxed);
         self.status.blocks.incr();
         self.status.frames.fetch_add(frames as u64, Ordering::Relaxed);
+        self.rendered += frames as u64;
         let ns = t0.elapsed().as_nanos() as u64;
         self.status.last_block_ns.store(ns, Ordering::Relaxed);
         self.status.max_block_ns.fetch_max(ns, Ordering::Relaxed);
