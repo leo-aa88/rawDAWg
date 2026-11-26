@@ -49,7 +49,7 @@ egui = "0.37.0"
 # Plugin editors: native child windows without a windowing framework (an in-process plugin
 # cannot own a winit event loop inside a host that already runs one)
 x11rb = "0.14.0"
-windows-sys = "0.59.0"
+windows-sys = "0.61.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Plugin ABI
 clack-plugin = "0.2.0"
