@@ -423,6 +423,20 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Screenshot through XWayland (`docs/verification/screenshots/m8-insert-handles.png`, `--ui-preset mixer` on `fixtures/demo-song.rawdawg`) shows the grip. It also showed a **pre-existing status bar defect**: a long status message and the full project path ran under each other and the version label. The message now takes at most 45% of the row with an ellipsis (full text on hover), the right side shows the project folder name (full path on hover), and labels truncate on narrow windows. Test `a_long_status_message_or_project_path_never_overlaps_the_rest_of_the_status_bar` checks the widget bounds from the accessibility tree (fails with the old label).
 - Not done: GUI-01 manual pass on a real desktop on both OSs (this is a WSLg screenshot, not GUI-01 evidence).
 
+## CI made to run (2026-11-26)
+
+The workflow had never run a step: `actions/checkout` and `Swatinem/rust-cache` were pinned to commit SHAs that do not exist (written by an earlier session without checking). With the owner's approval to push to `main`, five runs took it to green:
+
+- Pins replaced by verified release commits (checkout v7.0.1, rust-cache v2.9.3, upload-artifact v7.0.2, cargo-deny-action v2.1.1, all checked with `gh api`).
+- Windows compile errors (VST3 binding enum constants are `i32` on MSVC, `u32` elsewhere): casts, and `clippy::unnecessary_cast` allowed in the VST3 modules with the reason. The workspace now also type-checks and passes clippy for `x86_64-pc-windows-msvc` locally.
+- `cargo fmt --check` failed on Windows checkouts (CRLF vs `newline_style = "Unix"`): `.gitattributes` keeps LF.
+- `cargo test` needed `cargo xtask fixtures` first (git-ignored signals, SoundFont, sampler demo assets): generator moved to the `rawdawg-fixtures` crate; `ensure_signals()` recreates missing files byte-identically, used by the two tests that need them. Stale committed `recovery/project.previous.json` files refreshed.
+- Ubuntu runner disk full in the plugin suite: no dev/test debug info in CI, unused preinstalled SDKs removed on the runner.
+- Plugin scan test and E2E-07 faked the user VST3 folder through `HOME` only; now per OS (`%LOCALAPPDATA%\Programs\Common\VST3`, isolated `%COMMONPROGRAMFILES%`).
+- MSI: WiX `WIX0094` (a non-advertised ProgId needs an installed icon file id); plugins now go to the 64-bit Common Files folder (they were in the 32-bit one); a green run had uploaded no MSI because a multi-line PowerShell step reports only its last command, so each package command is its own step and a check fails the job when a package or checksum is missing. `SHA256SUMS` now accumulates entries across package commands.
+- The repository URL in `Cargo.toml`, the plugin metadata, the deb `Homepage` and the installer named a different GitHub account; corrected to `github.com/leo-aa88/rawDAWg`.
+- Evidence: run 45746770914 green (Ubuntu 24.04 14 min, Windows 2022 21 min, audit 1 min); artifacts downloaded and checked: MSI (valid OLE database), portable zip with `rawdawg.exe` (PE header) and both plugin formats, deb with lintian 0 errors; all checksums verify.
+
 ## M1 additions (2026-11-25)
 
 - `crates/midi`: midir input manager (ports, enable/disable, hotplug rescan, disconnect → release), bounded queue from the device thread, byte-stream parser with running status/SysEx skipping, per-device FIFO note identity, poly pressure routing. Tests: 6 (parser, registry, graceful no-backend).
@@ -456,8 +470,8 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 | Gate | Status | How to close |
 |---|---|---|
-| Windows build/test (PLAT-01, QUAL-03) | NOT RUN | Run CI workflow on `windows-2022` or build locally with MSVC: `cargo test --workspace --locked`. |
-| Ubuntu 24.04 build/test | NOT RUN (22.04 used) | CI job `Ubuntu 24.04`; also verify `pipewire` feature builds there. |
+| Windows build/test (PLAT-01, QUAL-03) | PASS in CI | GitHub Actions `windows-2022` (run 45746770914): fmt, clippy, all tests, release build, headless + plugin suites, MSI + portable. Windows 11 desktop use is GUI-01/HW-01. |
+| Ubuntu 24.04 build/test | PASS in CI | GitHub Actions `ubuntu-24.04` (same run), deb with lintian 0 errors. The `pipewire` feature is not built in CI. |
 | HW-01 real audio devices (PLAT-02) | BLOCKED | On real hardware: `rawdawg --list-audio-devices`, `rawdawg --audio-smoke --device <id> --buffer 256`; record device, backend, rate, buffer, xruns, duration in `docs/verification/hardware.md`. Repeat for WASAPI (Windows) and ALSA/PipeWire/JACK (Ubuntu). Recording: `rawdawg --capture-smoke --device <id>` and a loopback take (record the metronome, read the offset) on each OS. |
 | MIDI-01 physical MIDI keyboard (IO-01) | BLOCKED | No MIDI backend/ports here (no ALSA sequencer). On real hardware: Settings > MIDI, enable the device, play; verify note on/off, velocity, sustain, bend, disconnect release. |
 | GUI-01 manual GUI (PLAT-03, QUAL-04) | BLOCKED | Launch `rawdawg` on a display at 1024×720 / 1440×900 / 1920×1080, 100/150/200 %; confirm dark-only surfaces, typing keyboard plays within 10 s, screenshots to `docs/verification/screenshots/`. |
@@ -465,7 +479,7 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 | PL-04 VST3 validator | BLOCKED (M7) | Needs SDK validator build and `.vst3` bundle layout. |
 | PL-05 independent hosts | BLOCKED (M7) | Load exported CLAP/VST3 in an independent host per OS; document versions/paths. |
 | ASIO build (PLAT-02) | NOT RUN | Requires user-supplied Steinberg ASIO SDK and license review; `--features asio` is wired but unverified. |
-| Packaging (PLAT-04) | NOT RUN | M8. |
+| Packaging (PLAT-04) | PARTIAL | deb, MSI and portable zip built and uploaded by CI; install/uninstall on clean Ubuntu 24.04 and Windows 11 machines NOT RUN; signing is an owner decision. |
 | Reference-workload benchmark (QUAL-04, TESTING §4) | PARTIAL | M1 subset measured above; full workload (samplers, EQ/comp per track, send reverbs, limiter, ≥5 min) at M8 on reference hardware. |
 
 ## Known issues / risks
@@ -483,5 +497,5 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 
 M8 in progress (slice 1: deb/MSI/portable packaging, SBOM and license report, project marker association, preset `--open`, E2E-08 headless subset, lintian clean; slice 2: reference benchmarks in `docs/verification/benchmarks.md`; slice 3: parser fuzzing with five fixed findings and a passing 30-minute soak in `docs/verification/robustness.md`; slice 4: dependency audit, user guide quickstart, real-time convolution at 30 s; slice 5: grammar-based expression fuzzing, audio-thread clamp panic fixed; slice 6: plugin-formatted readouts for hosted plugins, stepped CLAP export parameters fixed; slice 7: large plugin states in `plugin-state/` files, failed restores keep a stand-in; slice 8: insert drag-reorder). Next, in order:
 1. Investigate the max-block spikes on bare metal (Ubuntu 24.04, real-time-priority thread) before optimising anything.
-2. CI: the workflow runs on GitHub only when the owner pushes (not done by the agent).
+2. CI is green on `main` (with the owner's approval the agent now pushes to `main`); keep it green. Next platform gates: install/uninstall the CI deb and MSI on clean machines.
 3. M7 follow-ups: plugin editors (export `gui`/`IPlugView`, host embedding on X11/XWayland); validators/independent hosts when available. Carried leftovers: pattern-mode automation, CC capture into automation, loopback calibration helper, loop-aware stream prefetch, Compare view for recovery, sample-exact plan swaps.

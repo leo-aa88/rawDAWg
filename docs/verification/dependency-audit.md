@@ -32,6 +32,12 @@ Notes:
   licenses are not used by any current dependency (BSL-1.0, CDLA-Permissive-2.0, Unicode-DFS-2016);
   cargo-deny warns about them and they are harmless.
 
+## CI (2026-11-26)
+
+The "Dependency audit" job (`EmbarkStudios/cargo-deny-action` v2.1.1, cargo-deny 0.20.2,
+`--all-features`, current advisory database fetched by the action) passes since run
+45731123590; the workflow had not run before that (see PROGRESS.md, "CI made to run").
+
 ## License distribution
 
 From `cargo deny --offline list -l license`. A crate under a choice of licenses counts once per
