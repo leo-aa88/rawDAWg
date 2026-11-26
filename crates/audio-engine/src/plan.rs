@@ -280,6 +280,13 @@ pub fn make_instrument(inst: &rawdawg_project::Instance, channel_name: &str, ass
             synth.set_table_inbox(inbox);
             Ok((Box::new(synth), Some(sender)))
         }
+        rawdawg_types::ids::native_types::MORPH => {
+            let mut rack = rawdawg_synthesizer::morph_rack::MorphRack::default();
+            if let Some(bytes) = state_bytes(inst, channel_name)? {
+                rack.load_state(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e))?;
+            }
+            Ok((Box::new(rack), None))
+        }
         rawdawg_types::ids::native_types::SAMPLER => {
             let patch = match state_bytes(inst, channel_name)? {
                 Some(bytes) => rawdawg_sampler::SamplerPatch::from_json(&bytes).map_err(|e| CompileError::InstrumentState(channel_name.to_owned(), e))?,

@@ -445,7 +445,13 @@ fn morph_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
         }
         let refs: [&Patch; 4] = std::array::from_fn(|i| corners[i].as_ref().expect("checked"));
         if !morph::compatible(&refs) {
-            ui.label(egui::RichText::new("These corners have different structures (layer kinds or counts). Morphing needs compatible sounds; parallel crossfade of mixed structures is not available yet.").color(theme::WARNING));
+            ui.label(
+                egui::RichText::new("These corners have different structures (layer kinds or counts), so they cannot be blended into one sound. A morph rack plays all four and crossfades them instead.")
+                    .color(theme::TEXT_SECONDARY),
+            );
+            if ui.button("Crossfade them in a morph rack").on_hover_text("Replaces this channel's instrument with a morph rack holding the four corners (undoable); X and Y can be automated").clicked() {
+                make_morph_rack(app, instance, refs);
+            }
             return;
         }
         let size = egui::vec2(220.0, 220.0);
@@ -484,6 +490,13 @@ fn morph_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
             {
                 use_sound(app, instance, &m);
             }
+            if ui
+                .button("Morph rack")
+                .on_hover_text("Keep all four corners in the channel as a morph rack: it crossfades them, and its X and Y can be automated or MIDI-learned (undoable)")
+                .clicked()
+            {
+                make_morph_rack(app, instance, refs);
+            }
             if ui.button("Clear corners").clicked() {
                 app.synth_panel.evolve.morph_corners = [None, None, None, None];
                 app.synth_panel.evolve.morph_recording.clear();
@@ -497,6 +510,28 @@ fn morph_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
             }
         });
     });
+}
+
+/// Replace the synth on `instance`'s channel with a morph rack holding the four corners at the
+/// pad's current position (one undo step). Refused with a message when the corners together
+/// exceed one synth's oscillator budget.
+pub(crate) fn make_morph_rack(app: &mut App, instance: InstanceId, corners: [&Patch; 4]) {
+    use rawdawg_synthesizer::morph_rack::MorphRackState;
+    let Some(channel_id) = app.project.channels.iter().find(|c| c.instrument.id == instance).map(|c| c.id) else { return };
+    let (x, y) = app.synth_panel.evolve.morph_xy;
+    let state = MorphRackState::new(corners.map(Clone::clone), x, y);
+    if let Err(e) = state.validate() {
+        app.status_line = format!("No morph rack: {e}");
+        return;
+    }
+    // a live preview ends here; the rack starts from the saved sound's corners
+    if app.synth_panel.evolve.preview_backup.is_some() {
+        cancel_preview(app);
+    }
+    let value = serde_json::to_value(&state).unwrap_or(serde_json::Value::Null);
+    let rack = rawdawg_project::Instance::native(rawdawg_types::ids::native_types::MORPH, value);
+    app.apply(rawdawg_project::Command::SetInstrument { channel_id, instance: rack });
+    app.status_line = "Morph rack: drag the pad or automate X and Y (Undo goes back to the synth)".into();
 }
 
 /// Apply a compatible morph result live: parameters as events, waveforms via tables.

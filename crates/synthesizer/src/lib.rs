@@ -12,6 +12,7 @@ pub mod generators;
 pub mod graph;
 pub mod modulation;
 pub mod morph;
+pub mod morph_rack;
 pub mod mutate;
 pub mod params;
 pub mod patch;

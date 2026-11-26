@@ -187,6 +187,8 @@ pub mod native_types {
     pub const SYNTH: &str = "native.synth";
     pub const SAMPLER: &str = "native.sampler";
     pub const SF2: &str = "native.sf2";
+    /// Four corner sounds crossfaded by an automatable XY position.
+    pub const MORPH: &str = "native.morph";
     pub const FX_PREFIX: &str = "native.fx.";
 }
 

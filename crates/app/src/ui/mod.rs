@@ -1381,6 +1381,7 @@ impl App {
                     rawdawg_types::ids::native_types::SYNTH => "synth",
                     rawdawg_types::ids::native_types::SAMPLER => "sample",
                     rawdawg_types::ids::native_types::SF2 => "soundfont",
+                    rawdawg_types::ids::native_types::MORPH => "morph",
                     other => other,
                 };
                 ui.label(egui::RichText::new(kind).color(theme::TEXT_SECONDARY));

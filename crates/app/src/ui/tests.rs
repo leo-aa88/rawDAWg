@@ -1334,3 +1334,79 @@ fn evolve_previews_are_level_matched_for_listening_only() {
     assert_eq!(super::evolve::match_gain_db(0.0, 0.5), 0.0, "silence is never boosted");
     assert_eq!(super::evolve::match_gain_db(0.1, 0.1), 0.0);
 }
+
+#[test]
+fn incompatible_corners_become_a_morph_rack_whose_pad_and_xy_automation_work() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    use rawdawg_synthesizer::morph_rack::{MorphRackState, PARAM_X};
+    use rawdawg_synthesizer::patch::{Generator, Layer, Patch, PluckSettings};
+    let mut h = Harness::new(None);
+    let ch = h.app.project.channels[0].clone();
+    let instance = ch.instrument.id;
+    let pid = h.app.project.selected_pattern.unwrap();
+    let note = rawdawg_project::Note {
+        id: rawdawg_types::NoteId::new(),
+        tick: rawdawg_types::units::Tick(0),
+        duration_ticks: rawdawg_types::units::Tick(960),
+        pitch: 57,
+        velocity: 0.8,
+        channel: 0,
+    };
+    h.app.apply(rawdawg_project::Command::AddNotes { pattern_id: pid, channel_id: ch.id, notes: vec![note] });
+    let a = h.app.synth_mirrors[&instance].patch().clone();
+    let b = Patch {
+        layers: vec![
+            Layer::basic(rawdawg_dsp::oscillator::BasicWave::Saw),
+            Layer { generator: Generator::Pluck(PluckSettings::default()), ..Layer::basic(rawdawg_dsp::oscillator::BasicWave::Saw) },
+        ],
+        ..a.clone()
+    };
+    assert!(!rawdawg_synthesizer::morph::compatible(&[&a, &b, &a, &b]));
+    // too heavy: refused with a message, nothing changes
+    let mut heavy = b.clone();
+    heavy.max_voices = 64;
+    for l in &mut heavy.layers {
+        l.unison = 8;
+    }
+    let mut heavier = heavy.clone();
+    heavier.layers[0].coarse_semitones = 7;
+    let depth = h.app.history.undo_len();
+    super::evolve::make_morph_rack(&mut h.app, instance, [&heavy, &heavier, &a, &b]);
+    assert!(h.app.status_line.contains("oscillator voices"), "{}", h.app.status_line);
+    assert_eq!(h.app.history.undo_len(), depth);
+    // the morph rack replaces the synth in one undo step
+    h.app.synth_panel.evolve.morph_xy = (0.5, 0.5);
+    super::evolve::make_morph_rack(&mut h.app, instance, [&a, &b, &a, &b]);
+    let rack = h.app.project.channels[0].instrument.clone();
+    assert_eq!(rack.type_id.as_str(), rawdawg_types::ids::native_types::MORPH);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // its panel: drag the pad to the top-right corner (B): one gesture, one undo step
+    h.app.selected_channel = Some(ch.id);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let pad = h.rect(super::instrument_panel::morph_rack_pad_id(rack.id));
+    // past the edge: the position clamps to the corner itself
+    h.drag(pad.center(), pad.right_top() + egui::vec2(30.0, -30.0), egui::PointerButton::Primary);
+    let state: MorphRackState = serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap();
+    assert_eq!((state.x, state.y), (1.0, 0.0), "pad moved to B");
+    assert_eq!(h.app.history.undo_len(), depth + 2, "the drag is one undo step");
+    // what the engine plays at B is corner B itself
+    let render = |p: &rawdawg_project::Project| render_project(p, &OfflineOptions { tail_seconds: 0.0, ..OfflineOptions::default() }).expect("render").0;
+    let mut as_b = h.app.project.clone();
+    as_b.channels[0].instrument = rawdawg_project::Instance::native(rawdawg_types::ids::native_types::SYNTH, serde_json::to_value(&b).unwrap());
+    let (got, want) = (render(&h.app.project), render(&as_b));
+    let diff = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    // the pad glides over 20 ms from the centre, so compare after the start
+    let tail_diff = got[4800..].iter().zip(&want[4800..]).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    assert!(rawdawg_dsp::math::rms(&want) > 0.01 && tail_diff < 1e-5, "rack at B = corner B ({tail_diff}, whole {diff})");
+    // X takes automation like any parameter
+    super::automation::create_clip_for(&mut h.app, rack.id, PARAM_X);
+    assert!(h.app.project.automation.iter().any(|c| c.target.instance_id == rack.id && c.target.param_id == PARAM_X), "an X curve exists");
+    // undo twice: pad back, then the synth again
+    for _ in 0..3 {
+        h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    }
+    assert_eq!(h.app.project.channels[0].instrument.type_id.as_str(), rawdawg_types::ids::native_types::SYNTH);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}

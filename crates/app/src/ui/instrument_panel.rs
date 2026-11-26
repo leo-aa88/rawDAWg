@@ -36,6 +36,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     let title = match type_id.as_str() {
         rawdawg_types::ids::native_types::SAMPLER => rawdawg_sampler::SAMPLER_DISPLAY_NAME,
         rawdawg_types::ids::native_types::SF2 => rawdawg_sampler::SF2_DISPLAY_NAME,
+        rawdawg_types::ids::native_types::MORPH => rawdawg_synthesizer::morph_rack::DISPLAY_NAME,
         _ if channel.instrument.format != rawdawg_project::PluginFormat::Native && !channel.instrument.display_name.is_empty() => channel.instrument.display_name.as_str(),
         _ => "Instrument",
     };
@@ -91,6 +92,24 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     }
     let descriptors: Vec<rawdawg_types::ParamDescriptor> = app.other_mirrors[&instance_id].descriptors().iter().filter(|d| !d.flags.hidden).copied().collect();
     let mut edits: Vec<(ParamId, f32, bool, bool)> = Vec::new();
+    let mut as_synth: Option<rawdawg_synthesizer::Patch> = None;
+    if let Some(rack) = app.other_mirrors.get_mut(&instance_id).and_then(|m| m.as_any_mut().downcast_mut::<rawdawg_synthesizer::morph_rack::MorphRack>()) {
+        let state = rack.state().clone();
+        let renderers = rack.renderers();
+        morph_rack_pad(ui, instance_id, &state, &mut edits, app.instrument_panel.gesture.is_none());
+        ui.label(
+            egui::RichText::new(format!("{renderers} distinct sound(s) play in parallel on every note; X and Y take automation and MIDI learn (right-click them below)"))
+                .small()
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.horizontal(|ui| {
+            for (i, name) in ["A", "B", "C", "D"].iter().enumerate() {
+                if ui.button(format!("Corner {name} as a synth")).on_hover_text("Replace the rack with this corner's sound as an ordinary synth (undoable)").clicked() {
+                    as_synth = Some(state.corners[i].clone());
+                }
+            }
+        });
+    }
     if let Some((b, p)) = sf2_change {
         let bd = descriptors.iter().find(|d| d.id.0 == rawdawg_sampler::sf2_player::P_BANK).unwrap();
         let pd = descriptors.iter().find(|d| d.id.0 == rawdawg_sampler::sf2_player::P_PRESET).unwrap();
@@ -115,6 +134,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                     }
                     if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
                         app.remove_midi_mapping(instance_id, d.id.0);
+                        ui.close();
+                    }
+                    if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
+                        super::automation::create_clip_for(app, instance_id, d.id.0);
                         ui.close();
                     }
                 })
@@ -151,8 +174,54 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
             finish_gesture(app, instance_id, &type_id);
         }
     }
+    if let Some(patch) = as_synth {
+        let value = serde_json::to_value(&patch).unwrap_or(serde_json::Value::Null);
+        app.apply(Command::SetInstrument { channel_id: channel.id, instance: rawdawg_project::Instance::native(rawdawg_types::ids::native_types::SYNTH, value) });
+        return;
+    }
     ui.separator();
     super::keyboard::show(app, ui);
+}
+
+/// The rack's XY pad: a drag moves X and Y together, as one gesture (one undo step).
+fn morph_rack_pad(ui: &mut egui::Ui, instance_id: InstanceId, state: &rawdawg_synthesizer::morph_rack::MorphRackState, edits: &mut Vec<(ParamId, f32, bool, bool)>, idle: bool) {
+    use rawdawg_synthesizer::morph_rack::{PARAM_X, PARAM_Y};
+    let (_, rect) = ui.allocate_space(egui::vec2(200.0, 200.0));
+    let resp = ui.interact(rect, morph_rack_pad_id(instance_id), egui::Sense::click_and_drag());
+    let resp = resp.on_hover_text("Drag to crossfade the four corners (A top-left, B top-right, C bottom-left, D bottom-right)");
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, theme::BACKGROUND);
+    for (corner, (pos, anchor)) in ["A", "B", "C", "D"].iter().zip([
+        (rect.left_top(), egui::Align2::LEFT_TOP),
+        (rect.right_top(), egui::Align2::RIGHT_TOP),
+        (rect.left_bottom(), egui::Align2::LEFT_BOTTOM),
+        (rect.right_bottom(), egui::Align2::RIGHT_BOTTOM),
+    ]) {
+        painter.text(
+            pos + egui::vec2(if anchor.x() == egui::Align::Min { 4.0 } else { -4.0 }, if anchor.y() == egui::Align::Min { 2.0 } else { -2.0 }),
+            anchor,
+            *corner,
+            egui::FontId::proportional(12.0),
+            theme::TEXT_SECONDARY,
+        );
+    }
+    let dot = egui::pos2(rect.min.x + state.x * rect.width(), rect.min.y + state.y * rect.height());
+    painter.circle_filled(dot, 6.0, theme::ACCENT);
+    if (resp.dragged() || resp.clicked() || resp.drag_stopped())
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+        let y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+        let started = resp.drag_started() || resp.clicked() || idle;
+        let stopped = resp.clicked() || resp.drag_stopped();
+        edits.push((ParamId(PARAM_X), x, started, false));
+        edits.push((ParamId(PARAM_Y), y, false, stopped));
+    }
+}
+
+/// The widget id of a morph rack's pad (tests drive it with pointer events).
+pub(crate) fn morph_rack_pad_id(instance_id: InstanceId) -> egui::Id {
+    egui::Id::unique(("morph-rack-pad", instance_id))
 }
 
 fn finish_gesture(app: &mut App, instance_id: InstanceId, type_id: &str) {
