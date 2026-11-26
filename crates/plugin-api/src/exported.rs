@@ -8,7 +8,7 @@ pub const SYNTH_CLAP_ID: &str = "rawdawg.synth";
 pub const FX_CLAP_ID_PREFIX: &str = "rawdawg.fx.";
 pub const NATIVE_FX_PREFIX: &str = "native.fx.";
 pub const VENDOR: &str = "rawDAWg";
-pub const URL: &str = "https://github.com/leonardo-aa/rawDAWg";
+pub const URL: &str = "https://github.com/leo-aa88/rawDAWg";
 
 /// Stable VST3 class-id slots per plugin slug. **Append only, never renumber**: a slot
 /// becomes the plugin's processor/controller class ids (`vst3_class_ids`) and must stay

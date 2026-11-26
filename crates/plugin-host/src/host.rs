@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const HOST_NAME: &str = "rawDAWg";
 pub const HOST_VENDOR: &str = "rawDAWg";
-pub const HOST_URL: &str = "https://github.com/leonardo-aa/rawDAWg";
+pub const HOST_URL: &str = "https://github.com/leo-aa88/rawDAWg";
 
 pub fn host_info() -> HostInfo {
     HostInfo::new(HOST_NAME, HOST_VENDOR, HOST_URL, rawdawg_types::VERSION).expect("static host info is valid")

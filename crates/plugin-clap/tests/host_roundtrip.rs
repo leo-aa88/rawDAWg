@@ -27,7 +27,7 @@ impl HostHandlers for Host {
 }
 
 fn host_info() -> HostInfo {
-    HostInfo::new("rawDAWg test host", "rawDAWg", "https://github.com/leonardo-aa/rawDAWg", "0.1.0").unwrap()
+    HostInfo::new("rawDAWg test host", "rawDAWg", "https://github.com/leo-aa88/rawDAWg", "0.1.0").unwrap()
 }
 
 fn built_cdylib_path() -> std::path::PathBuf {

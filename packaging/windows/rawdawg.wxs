@@ -9,7 +9,7 @@
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="rawdawg.ico" SourceFile="$(var.Payload)\rawdawg.ico" />
     <Property Id="ARPPRODUCTICON" Value="rawdawg.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/leonardo-aa/rawDAWg" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/leo-aa88/rawDAWg" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="rawDAWg">
@@ -17,7 +17,8 @@
         <Directory Id="DemosFolder" Name="demos" />
       </Directory>
     </StandardDirectory>
-    <StandardDirectory Id="CommonFilesFolder">
+    <!-- 64-bit common files (C:\Program Files\Common Files): where 64-bit hosts look for CLAP and VST3 -->
+    <StandardDirectory Id="CommonFiles64Folder">
       <Directory Id="ClapFolder" Name="CLAP" />
       <Directory Id="Vst3Folder" Name="VST3">
         <Directory Id="Vst3Bundle" Name="rawDAWg.vst3">

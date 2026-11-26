@@ -14,7 +14,7 @@ use std::process::Command;
 pub const DISPLAY_NAME: &str = "rawDAWg";
 pub const TAGLINE: &str = "Less thinking. More noise.";
 pub const PACKAGE: &str = "rawdawg";
-pub const HOMEPAGE: &str = "https://github.com/leonardo-aa/rawDAWg";
+pub const HOMEPAGE: &str = "https://github.com/leo-aa88/rawDAWg";
 /// Maintainer field: the display brand until the owner records a legal publisher identity.
 pub const MAINTAINER: &str = "rawDAWg <noreply@rawdawg.invalid>";
 pub const MIME_PROJECT: &str = "application/x-rawdawg-project";
@@ -514,7 +514,7 @@ pub fn man_page(binary: &Path) -> anyhow::Result<String> {
         roff.push_str(&l);
         roff.push('\n');
     }
-    roff.push_str(".fi\n.SH FILES\n.TP\n.I ~/.config/rawdawg/\nPreferences, plug-in catalog and recovery data.\n.TP\n.I /usr/share/doc/rawdawg/USER_GUIDE.md\nThe user guide.\n.SH SEE ALSO\nThe user guide and https://github.com/leonardo-aa/rawDAWg\n");
+    roff.push_str(".fi\n.SH FILES\n.TP\n.I ~/.config/rawdawg/\nPreferences, plug-in catalog and recovery data.\n.TP\n.I /usr/share/doc/rawdawg/USER_GUIDE.md\nThe user guide.\n.SH SEE ALSO\nThe user guide and https://github.com/leo-aa88/rawDAWg\n");
     Ok(roff)
 }
 
