@@ -81,7 +81,9 @@ jobs:
         run: cargo xtask package --format deb
       - name: Install WiX
         if: runner.os == 'Windows'
-        run: dotnet tool install --global wix --version 5.0.2
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
       - name: Package (msi + portable)
         if: runner.os == 'Windows'
         run: |

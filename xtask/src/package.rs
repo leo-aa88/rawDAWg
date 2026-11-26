@@ -310,9 +310,18 @@ fn dir_size(path: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+/// Add or replace the entries for `files` in `dir/SHA256SUMS`, keeping the other packages'
+/// entries (the MSI and the portable zip are built by separate commands into one folder).
 fn checksums(dir: &Path, files: &[PathBuf]) -> anyhow::Result<PathBuf> {
     use std::io::Read;
-    let mut text = String::new();
+    let path = dir.join("SHA256SUMS");
+    let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+    let mut text: String = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.split_once("  ").is_some_and(|(_, name)| !names.iter().any(|n| n == name) && dir.join(name).is_file()))
+        .map(|l| format!("{l}\n"))
+        .collect();
     for f in files {
         let mut h = Sha256::new();
         let mut file = std::fs::File::open(f)?;
@@ -326,7 +335,6 @@ fn checksums(dir: &Path, files: &[PathBuf]) -> anyhow::Result<PathBuf> {
         }
         text.push_str(&format!("{}  {}\n", h.hex(), f.file_name().unwrap().to_string_lossy()));
     }
-    let path = dir.join("SHA256SUMS");
     std::fs::write(&path, text)?;
     Ok(path)
 }
@@ -731,6 +739,33 @@ impl Sha256 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn checksums_from_separate_package_runs_accumulate() {
+        let dir = std::env::temp_dir().join(format!("rawdawg-sums-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (msi, zip) = (dir.join("a.msi"), dir.join("a.zip"));
+        std::fs::write(&msi, b"msi").unwrap();
+        std::fs::write(&zip, b"zip").unwrap();
+        checksums(&dir, std::slice::from_ref(&msi)).unwrap();
+        let path = checksums(&dir, std::slice::from_ref(&zip)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(text.contains("  a.msi\n") && text.contains("  a.zip\n"));
+        // rebuilding a package replaces its entry; entries of deleted files are dropped
+        std::fs::write(&zip, b"zip2").unwrap();
+        std::fs::remove_file(&msi).unwrap();
+        let text = std::fs::read_to_string(checksums(&dir, std::slice::from_ref(&zip)).unwrap()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.starts_with(&format!("{}  a.zip", {
+            let mut h = Sha256::new();
+            h.update(b"zip2");
+            h.hex()
+        })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
