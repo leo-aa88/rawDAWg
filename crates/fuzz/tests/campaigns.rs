@@ -28,6 +28,8 @@ fn every_saved_regression_input_passes() {
 
 #[test]
 fn every_target_survives_a_short_seeded_campaign() {
+    // seeds include generated signals and the SoundFont (git-ignored): create them if missing
+    rawdawg_fixtures::ensure_signals(&rawdawg_fixtures::fixtures_dir()).expect("generate fixtures");
     let out = std::env::temp_dir().join(format!("rawdawg-fuzz-smoke-{}", std::process::id()));
     let mut failures = Vec::new();
     for t in rawdawg_fuzz::targets::all() {

@@ -18,3 +18,6 @@ rawdawg-audio-engine = { path = "../audio-engine" }
 rawdawg-plugin-api = { path = "../plugin-api" }
 serde_json = { workspace = true }
 zip = { workspace = true }
+
+[dev-dependencies]
+rawdawg-fixtures = { path = "../fixtures" }

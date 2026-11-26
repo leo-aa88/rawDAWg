@@ -1,0 +1,15 @@
+# Text files are checked out with LF on every OS (rustfmt.toml sets newline_style = "Unix";
+# Windows runners and editors would otherwise convert to CRLF and fail `cargo fmt --check`).
+* text=auto eol=lf
+
+# Binary fixtures and media are never converted.
+*.png binary
+*.ico binary
+*.wav binary
+*.flac binary
+*.mp3 binary
+*.sf2 binary
+*.mid binary
+*.bin binary
+*.zip binary
+*.rawdawgpreset binary

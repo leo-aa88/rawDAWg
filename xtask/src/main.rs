@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::Instant;
 
 mod bench;
-mod fixtures;
+use rawdawg_fixtures as fixtures;
 mod package;
 mod soak;
 mod verify;

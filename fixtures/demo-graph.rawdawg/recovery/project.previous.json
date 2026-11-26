@@ -10880,5 +10880,6 @@
   "automation": [],
   "midi_mappings": [],
   "loop": null,
-  "selected_pattern": "00000000-0000-0000-0000-00009a770001"
+  "selected_pattern": "00000000-0000-0000-0000-00009a770001",
+  "revision": 0
 }

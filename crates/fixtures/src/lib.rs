@@ -1,4 +1,9 @@
-//! Deterministic fixtures: demo project, sine/impulse/sweep/noise WAVs, chord project.
+//! Deterministic fixtures: demo projects, sine/impulse/sweep/noise WAVs, a SoundFont, a MIDI
+//! file and a FLAC file (`cargo xtask fixtures` writes them all into `fixtures/`).
+//!
+//! The demo projects are committed; the binary signals, the SoundFont and the sampler demo's
+//! imported assets are generated (git-ignored). Tests that read those call [`ensure_signals`],
+//! so `cargo test` works on a fresh checkout without running `cargo xtask fixtures` first.
 
 use anyhow::Context;
 use rawdawg_project::{ControllerEvent, ControllerKind, Lane, Note, Pattern, Project};
@@ -401,6 +406,67 @@ pub fn sampler_demo_project(dir: &Path) -> anyhow::Result<Project> {
     Ok(p)
 }
 
+/// The repository's `fixtures/` directory.
+pub fn fixtures_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+/// Write the generated (git-ignored) fixtures that are missing in `dir`: the four test
+/// signals, `fixture.sf2`, and the assets the committed sampler demo refers to. Existing files
+/// and the committed demo projects are left as they are. Safe to call from parallel tests.
+pub fn ensure_signals(dir: &Path) -> anyhow::Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let rate = 48_000u32;
+    let n = rate as usize * 2;
+    let missing = |name: &str| !dir.join(name).is_file();
+    if missing("sine_440_48k.wav") {
+        write_wav_atomic(&dir.join("sine_440_48k.wav"), (0..n).map(|i| (std::f64::consts::TAU * 440.0 * i as f64 / rate as f64).sin() as f32 * 0.5), rate)?;
+    }
+    if missing("impulse_48k.wav") {
+        write_wav_atomic(&dir.join("impulse_48k.wav"), (0..rate as usize).map(|i| if i == 0 { 1.0 } else { 0.0 }), rate)?;
+    }
+    if missing("sweep_20_20k_48k.wav") {
+        write_wav_atomic(&dir.join("sweep_20_20k_48k.wav"), sweep(n, rate), rate)?;
+    }
+    if missing("noise_48k.wav") {
+        let mut rng = rawdawg_dsp::rng::DeterministicRng::new(0xF1D7, 1);
+        write_wav_atomic(&dir.join("noise_48k.wav"), (0..n).map(|_| rng.bipolar_f32() * 0.5), rate)?;
+    }
+    if missing("fixture.sf2") {
+        let tmp = dir.join(format!("fixture.sf2.partial-{}", std::process::id()));
+        std::fs::write(&tmp, fixture_sf2())?;
+        std::fs::rename(&tmp, dir.join("fixture.sf2"))?;
+    }
+    // the committed sampler demo names its assets by content hash: importing the same
+    // deterministic files recreates exactly those (import_asset skips existing ones)
+    let sampler_dir = dir.join("demo-sampler.rawdawg");
+    if sampler_dir.join(rawdawg_project::persist::PROJECT_FILE).is_file() {
+        for f in ["sine_440_48k.wav", "fixture.sf2"] {
+            rawdawg_project::assets::import_asset(&sampler_dir, &dir.join(f)).with_context(|| format!("importing {f} into the sampler demo"))?;
+        }
+    }
+    Ok(())
+}
+
+fn sweep(n: usize, rate: u32) -> impl Iterator<Item = f32> {
+    (0..n).map(move |i| {
+        let t = i as f64 / f64::from(rate);
+        let f0 = 20.0f64;
+        let f1 = 20_000.0f64;
+        let k = (f1 / f0).ln() / 2.0;
+        (std::f64::consts::TAU * f0 * ((k * t).exp() - 1.0) / k).sin() as f32 * 0.5
+    })
+}
+
+/// Write to a temporary name, then rename: a reader never sees a half-written file.
+fn write_wav_atomic(path: &Path, samples: impl Iterator<Item = f32>, rate: u32) -> anyhow::Result<()> {
+    let tmp = path.with_extension(format!("partial-{}", std::process::id()));
+    write_wav(&tmp, samples, rate)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 pub fn generate(dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let demo = dir.join("demo.rawdawg");
@@ -409,17 +475,7 @@ pub fn generate(dir: &Path) -> anyhow::Result<()> {
     let n = rate as usize * 2;
     write_wav(&dir.join("sine_440_48k.wav"), (0..n).map(|i| (std::f64::consts::TAU * 440.0 * i as f64 / rate as f64).sin() as f32 * 0.5), rate)?;
     write_wav(&dir.join("impulse_48k.wav"), (0..rate as usize).map(|i| if i == 0 { 1.0 } else { 0.0 }), rate)?;
-    write_wav(
-        &dir.join("sweep_20_20k_48k.wav"),
-        (0..n).map(|i| {
-            let t = i as f64 / rate as f64;
-            let f0 = 20.0f64;
-            let f1 = 20_000.0f64;
-            let k = (f1 / f0).ln() / 2.0;
-            (std::f64::consts::TAU * f0 * ((k * t).exp() - 1.0) / k).sin() as f32 * 0.5
-        }),
-        rate,
-    )?;
+    write_wav(&dir.join("sweep_20_20k_48k.wav"), sweep(n, rate), rate)?;
     let mut rng = rawdawg_dsp::rng::DeterministicRng::new(0xF1D7, 1);
     write_wav(&dir.join("noise_48k.wav"), (0..n).map(|_| rng.bipolar_f32() * 0.5), rate)?;
     let sampler_dir = dir.join("demo-sampler.rawdawg");
@@ -440,4 +496,35 @@ pub fn generate(dir: &Path) -> anyhow::Result<()> {
     )?;
     println!("fixtures written to {}", dir.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_signals_are_regenerated_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("rawdawg-fixtures-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        generate(&dir).unwrap();
+        let names = ["sine_440_48k.wav", "impulse_48k.wav", "sweep_20_20k_48k.wav", "noise_48k.wav", "fixture.sf2"];
+        let original: Vec<Vec<u8>> = names.iter().map(|n| std::fs::read(dir.join(n)).unwrap()).collect();
+        let assets = dir.join("demo-sampler.rawdawg/assets");
+        let manifest = std::fs::read(dir.join("demo-sampler.rawdawg/project.json")).unwrap();
+        for n in names {
+            std::fs::remove_file(dir.join(n)).unwrap();
+        }
+        std::fs::remove_dir_all(&assets).unwrap();
+        ensure_signals(&dir).unwrap();
+        for (n, bytes) in names.iter().zip(&original) {
+            assert_eq!(&std::fs::read(dir.join(n)).unwrap(), bytes, "{n}");
+        }
+        assert_eq!(std::fs::read(dir.join("demo-sampler.rawdawg/project.json")).unwrap(), manifest, "the committed manifest is not rewritten");
+        let p = rawdawg_project::load_project_dir(&dir.join("demo-sampler.rawdawg")).unwrap();
+        for a in &p.assets {
+            assert!(rawdawg_project::assets::asset_path(&dir.join("demo-sampler.rawdawg"), a).is_some_and(|f| f.is_file()), "{} restored", a.path);
+        }
+        ensure_signals(&dir).unwrap(); // nothing missing: nothing to do
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -3544,6 +3544,7 @@ dependencies = [
  "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-fixtures",
  "rawdawg-midi",
  "rawdawg-plugin-host",
  "rawdawg-project",
@@ -3619,12 +3620,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawdawg-fixtures"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hound",
+ "rawdawg-audio-engine",
+ "rawdawg-dsp",
+ "rawdawg-effects",
+ "rawdawg-project",
+ "rawdawg-sampler",
+ "rawdawg-synthesizer",
+ "rawdawg-types",
+ "serde_json",
+]
+
+[[package]]
 name = "rawdawg-fuzz"
 version = "0.1.0"
 dependencies = [
  "rawdawg-audio-engine",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-fixtures",
  "rawdawg-plugin-api",
  "rawdawg-project",
  "rawdawg-sampler",
@@ -5557,6 +5575,7 @@ dependencies = [
  "rawdawg-audio-io",
  "rawdawg-dsp",
  "rawdawg-effects",
+ "rawdawg-fixtures",
  "rawdawg-fuzz",
  "rawdawg-plugin-api",
  "rawdawg-plugin-host",

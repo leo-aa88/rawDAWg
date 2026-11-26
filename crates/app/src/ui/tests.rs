@@ -19,6 +19,12 @@ impl Harness {
         Self::with_preset(project_dir, None)
     }
 
+    /// The committed sampler demo, with its generated (git-ignored) assets created if missing.
+    fn sampler_demo() -> Self {
+        rawdawg_fixtures::ensure_signals(&rawdawg_fixtures::fixtures_dir()).expect("generate fixtures");
+        Self::new(Some("../../fixtures/demo-sampler.rawdawg"))
+    }
+
     fn with_preset(project_dir: Option<&str>, ui_preset: Option<&str>) -> Self {
         let ctx = egui::Context::default();
         let opts = GuiOptions {
@@ -403,7 +409,7 @@ fn midi_learn_maps_a_cc_to_an_effect_parameter_and_lfo_clips_modulate_it() {
 #[test]
 fn armed_sample_places_an_audio_clip_and_edge_drags_trim_its_source_frames() {
     use rawdawg_project::{ClipContent, Command, Track};
-    let mut h = Harness::new(Some("../../fixtures/demo-sampler.rawdawg"));
+    let mut h = Harness::sampler_demo();
     let asset = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).cloned().expect("the sampler demo has a WAV asset");
     // import records no frame count; the playlist measures the decoded sample instead
     let frames = {
@@ -595,7 +601,7 @@ fn browser_search_filters_and_favorites_sort_first_and_effects_add_to_the_select
     assert!(super::browser_matches("", &["anything"]));
     assert!(super::browser_matches("rev", &["Reverb", "Reverb family"]));
     assert!(!super::browser_matches("delay", &["Reverb"]));
-    let mut h = Harness::new(Some("../../fixtures/demo-sampler.rawdawg"));
+    let mut h = Harness::sampler_demo();
     let asset = h.app.project.assets.iter().find(|a| a.kind == rawdawg_project::AssetKind::Audio).map(|a| a.id.to_string()).unwrap();
     h.app.toggle_favorite(&asset);
     assert!(h.app.prefs.favorites.contains(&asset));

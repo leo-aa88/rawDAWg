@@ -43,4 +43,5 @@ pipewire = ["rawdawg-audio-io/pipewire"]
 asio = ["rawdawg-audio-io/asio"]
 
 [dev-dependencies]
+rawdawg-fixtures = { path = "../fixtures" }
 hound = { workspace = true }

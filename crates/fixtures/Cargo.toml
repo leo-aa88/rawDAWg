@@ -1,0 +1,20 @@
+[package]
+name = "rawdawg-fixtures"
+description = "rawDAWg deterministic test fixtures (demo projects, test signals, SoundFont), shared by xtask and tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawdawg-types = { path = "../types" }
+rawdawg-dsp = { path = "../dsp" }
+rawdawg-synthesizer = { path = "../synthesizer" }
+rawdawg-effects = { path = "../effects" }
+rawdawg-sampler = { path = "../sampler" }
+rawdawg-project = { path = "../project" }
+rawdawg-audio-engine = { path = "../audio-engine" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+hound = { workspace = true }
