@@ -423,6 +423,13 @@ Commits 88cc71d…3c2a26d. 202 automated tests pass (`cargo test --workspace`), 
 - Screenshot through XWayland (`docs/verification/screenshots/m8-insert-handles.png`, `--ui-preset mixer` on `fixtures/demo-song.rawdawg`) shows the grip. It also showed a **pre-existing status bar defect**: a long status message and the full project path ran under each other and the version label. The message now takes at most 45% of the row with an ellipsis (full text on hover), the right side shows the project folder name (full path on hover), and labels truncate on narrow windows. Test `a_long_status_message_or_project_path_never_overlaps_the_rest_of_the_status_bar` checks the widget bounds from the accessibility tree (fails with the old label).
 - Not done: GUI-01 manual pass on a real desktop on both OSs (this is a WSLg screenshot, not GUI-01 evidence).
 
+## M8 slice 17 — pattern automation and MIDI controller capture (CORE-08; ADR 0007)
+
+- `AutomationCurve.pattern_id` (optional, omitted when absent): a pattern curve plays with its pattern, looping in pattern mode and inside every clip of the pattern in song mode (source offset, looping), never through automation clips. The schedule's curve emission is one helper (`emit_curve`) for automation clips, pattern mode and pattern clips. Validation refuses a missing pattern; `RemovePattern` removes the pattern's curves and its inverse restores them; Make unique copies them with new ids.
+- **Defects fixed:** (1) looped curves did not restart: a repetition never re-sent the curve's start value; now every repetition does. (2) Touch/Write capture overflowed on its first point (`t − i64::MIN`): every capture panicked in debug builds; it had no test.
+- App: **Automate in this pattern** next to Create automation clip (synth, effect and instrument panels); the Automation editor marks pattern curves `[Pattern]` and says where they play. Capture finds where an armed curve plays under the playhead (automation clip, the pattern in pattern mode, or the pattern's clip in song mode). Mapped MIDI controllers feed the same capture; `commit_quiet_midi_changes` ends a touch when the controller rests. Capture takes the transport state as an argument (`capture_at`, `poll_capture_at`); a `#[cfg(test)]` override supplies it in tests.
+- Tests: engine pattern automation (pattern-mode schedule, two real-time loop passes quiet → loud, song clip at bar 3 entering half way with loop restarts, Off curves silent; mutation: no restart fails it), pattern removal + undo + validation; UI test (creation, capture in pattern and song mode, outside-clip message, CC capture and rest, Make unique). Mutations: no CC capture, no pattern-mode anchor each fail it.
+
 ## M8 slice 16 — morph rack: crossfading incompatible corners, automatable X/Y (SYN-05)
 
 - `native.morph` instrument (`MorphRack`): up to four distinct corner patches play every note in parallel; the output is the per-sample bilinear mix by a smoothed (20 ms) X/Y. X (id 1) and Y (id 2) are ordinary parameters (automation clips, Touch/Write capture, MIDI learn, live Param events); the rack keeps them away from its corner synths (a filtered event buffer reserved in `prepare`, no allocation). Identical corners share a renderer; a renderer with zero weight, no sounding voice and no event in the block skips rendering, so voices stay in sync whenever a corner's weight returns. Admission: the distinct corners together must fit one synth's oscillator budget (voices × unison ≤ 1024); otherwise validation and `prepare` refuse with a message. `migrate_from` keeps notes sounding across recompiles when the corners are unchanged.
@@ -526,6 +533,8 @@ The workflow had never run a step: `actions/checkout` and `Swatinem/rust-cache` 
 - 0003 mipmapped wavetables replace PolyBLEP (31 dB measured < 35 dB gate).
 - 0004 hosted plugins: one instance split between the UI mirror and the realtime plan.
 - 0005 large opaque plugin state in content-addressed `plugin-state/` files; unreadable or unrestorable states keep a stand-in.
+- 0006 plugin editors: software-rendered egui in native child windows (X11, Win32), ticked by the host.
+- 0007 pattern automation (`pattern_id` on curves, plays with the pattern in both modes) and the `native.morph` morph rack instrument.
 
 ## Open gates (not passed; do not mark as done)
 

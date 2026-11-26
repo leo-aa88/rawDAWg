@@ -1410,3 +1410,97 @@ fn incompatible_corners_become_a_morph_rack_whose_pad_and_xy_automation_work() {
     assert_eq!(h.app.project.channels[0].instrument.type_id.as_str(), rawdawg_types::ids::native_types::SYNTH);
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }
+
+#[test]
+fn pattern_automation_is_created_captured_in_both_modes_and_learns_from_midi_controllers() {
+    use rawdawg_project::{AutomationMode, Clip, ClipContent, Command, MidiMapping, Track};
+    use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
+    use rawdawg_types::{ClipId, MappingId, TrackId};
+    let mut h = Harness::new(None);
+    let instance = h.app.project.channels[0].instrument.id;
+    let param = rawdawg_synthesizer::params::MASTER_GAIN;
+    let pid = h.app.project.selected_pattern.unwrap();
+    let plen = h.app.project.pattern(pid).unwrap().length_ticks.0;
+    super::automation::create_pattern_curve_for(&mut h.app, instance, param);
+    let curve = h.app.project.automation.last().unwrap().clone();
+    assert_eq!(curve.pattern_id, Some(pid), "the curve belongs to the selected pattern");
+    assert_eq!(curve.points.iter().map(|p| p.tick.0).collect::<Vec<_>>(), vec![0, plen], "it spans the pattern");
+    assert!(h.app.project.clips.is_empty(), "no automation clip is needed");
+    assert_eq!(h.app.editor_view, EditorView::Automation);
+    let curve_now = |h: &Harness| h.app.project.automation.iter().find(|c| c.id == curve.id).unwrap().clone();
+    h.app.apply(Command::UpdateAutomationCurve { curve: rawdawg_project::AutomationCurve { mode: AutomationMode::Touch, ..curve.clone() } });
+
+    // pattern mode, playing: a touch gesture writes into the pattern's own timeline
+    h.app.transport_mode = TransportMode::Pattern;
+    h.app.automation.test_transport = Some((true, plen / 4));
+    super::automation::capture_edit(&mut h.app, instance, param, 0.9, true, false);
+    h.app.automation.test_transport = Some((true, plen / 2));
+    super::automation::capture_edit(&mut h.app, instance, param, 0.4, false, true);
+    let c = curve_now(&h);
+    let written: Vec<(i64, f32)> = c.points.iter().map(|p| (p.tick.0, p.value)).filter(|(t, _)| *t > 0 && *t < plen).collect();
+    assert_eq!(written, vec![(plen / 4, 0.9), (plen / 2, 0.4)], "written at pattern-relative ticks");
+
+    // song mode: the pattern's clip at bar 3 decides where the pattern is
+    h.app.transport_mode = TransportMode::Song;
+    let tid = TrackId::new();
+    h.app.apply(Command::AddTrack { track: Track { id: tid, name: "T".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None });
+    let clip = Clip {
+        id: ClipId::new(),
+        track_id: tid,
+        start_tick: rawdawg_types::units::Tick(plen * 2),
+        length_ticks: rawdawg_types::units::Tick(plen),
+        muted: false,
+        content: ClipContent::Pattern { pattern_id: pid, source_offset_ticks: rawdawg_types::units::Tick::ZERO, looped: false },
+    };
+    h.app.apply(Command::AddClip { clip: clip.clone() });
+    h.app.automation.test_transport = Some((true, plen * 2 + plen * 3 / 4));
+    super::automation::capture_edit(&mut h.app, instance, param, 0.1, true, true);
+    assert!(curve_now(&h).points.iter().any(|p| p.tick.0 == plen * 3 / 4 && p.value == 0.1), "song tick → pattern tick inside the clip");
+    // outside any clip of the pattern: nothing is written, and the reason is shown
+    let before = curve_now(&h).points.len();
+    h.app.automation.test_transport = Some((true, plen * 5));
+    super::automation::capture_edit(&mut h.app, instance, param, 0.7, true, true);
+    assert_eq!(curve_now(&h).points.len(), before);
+    assert!(h.app.status_line.contains("not playing"), "{}", h.app.status_line);
+
+    // a MIDI-learned controller writes into the armed curve, and resting ends the touch
+    h.app.transport_mode = TransportMode::Pattern;
+    let mapping = MidiMapping {
+        id: MappingId::new(),
+        device: None,
+        channel: None,
+        cc: 20,
+        target: rawdawg_project::AutomationTarget { instance_id: instance, param_id: param },
+        min: 0.0,
+        max: 1.0,
+        invert: false,
+    };
+    h.app.apply(Command::SetMidiMappings { mappings: vec![mapping] });
+    let cc = |v: f32| TimedEvent::new(0, EventSource::MidiDevice(0), 0, EventKind::Control { cc: 20, value: v });
+    h.app.automation.test_transport = Some((true, plen / 8));
+    assert!(h.app.handle_midi_control(&cc(0.25)));
+    h.app.automation.test_transport = Some((true, plen / 8 + rawdawg_types::units::PPQ));
+    assert!(h.app.handle_midi_control(&cc(0.75)));
+    // the controller rests (the quiet period has passed)
+    h.app.midi_dirty.insert(instance, std::time::Instant::now() - std::time::Duration::from_secs(10));
+    h.app.commit_quiet_midi_changes();
+    let pts: Vec<(i64, f32)> = curve_now(&h).points.iter().map(|p| (p.tick.0, p.value)).collect();
+    assert!(pts.contains(&(plen / 8, 0.25)) && pts.contains(&(plen / 8 + rawdawg_types::units::PPQ, 0.75)), "CC moves recorded: {pts:?}");
+
+    // Make unique copies the pattern's automation with new ids
+    h.app.playlist.selection.insert(clip.id);
+    let mut cmds = Vec::new();
+    super::playlist::make_unique(&mut h.app, &mut cmds);
+    for c in cmds {
+        h.app.apply(c);
+    }
+    let new_pid = match &h.app.project.clips.iter().find(|c| c.id == clip.id).unwrap().content {
+        ClipContent::Pattern { pattern_id, .. } => *pattern_id,
+        _ => unreachable!(),
+    };
+    assert_ne!(new_pid, pid);
+    let copy = h.app.project.automation.iter().find(|c| c.pattern_id == Some(new_pid)).expect("the clone has the curve");
+    assert_ne!(copy.id, curve.id);
+    assert_eq!(copy.points.iter().map(|p| (p.tick, p.value)).collect::<Vec<_>>(), curve_now(&h).points.iter().map(|p| (p.tick, p.value)).collect::<Vec<_>>());
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}

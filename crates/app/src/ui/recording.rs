@@ -416,6 +416,8 @@ impl App {
             }
             self.send(EngineCommand::Param { instance: m.target.instance_id, id, value: v });
             self.midi_dirty.insert(m.target.instance_id, Instant::now());
+            // an armed Touch/Write curve records the controller like a mouse gesture
+            super::automation::capture_edit(self, m.target.instance_id, m.target.param_id, v, false, false);
         }
         true
     }
@@ -426,6 +428,8 @@ impl App {
         let due: Vec<InstanceId> = self.midi_dirty.iter().filter(|(_, t)| now.duration_since(**t) >= MIDI_COMMIT_QUIET).map(|(id, _)| *id).collect();
         for id in due {
             self.midi_dirty.remove(&id);
+            // the controller rested: a touch capture ends here
+            super::automation::release_touch(self, id);
             let (type_id, bytes) = if let Some(s) = self.synth_mirrors.get(&id) {
                 (rawdawg_synthesizer::TYPE_ID.to_owned(), s.save_state())
             } else if let Some(o) = self.other_mirrors.get(&id) {

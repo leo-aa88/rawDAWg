@@ -469,6 +469,10 @@ impl Command {
                 }
                 let pattern = p.patterns.remove(idx);
                 let mut cmds = vec![Command::AddPattern { pattern }];
+                // its pattern automation goes with it (and comes back on undo)
+                let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut p.automation).into_iter().partition(|c| c.pattern_id == Some(id));
+                p.automation = kept;
+                cmds.extend(gone.into_iter().map(|curve| Command::AddAutomationCurve { curve }));
                 if p.selected_pattern == Some(id) {
                     let new_sel = p.patterns.first().map(|x| x.id);
                     p.selected_pattern = new_sel;

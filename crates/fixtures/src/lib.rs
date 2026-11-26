@@ -139,6 +139,7 @@ pub fn demo_song_project(dir: &Path) -> anyhow::Result<Project> {
         ],
         mode: AutomationMode::Read,
         disabled: false,
+        pattern_id: None,
     });
     let t3 = rawdawg_types::TrackId::from_u128(0x7A00_0003);
     p.tracks.push(Track { id: t3, name: "Automation".into(), color: Some([0xE6, 0xC9, 0x6E]), mute: false, solo: false, height: None, mixer_id: None });

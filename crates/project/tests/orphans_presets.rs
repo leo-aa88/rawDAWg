@@ -19,6 +19,7 @@ fn removing_an_instance_orphans_its_curves_drops_its_mappings_and_undo_restores_
         points: vec![AutomationPoint { id: PointId::new(), tick: Tick(0), value: 0.3, interpolation: Interpolation::Linear }],
         mode: AutomationMode::Read,
         disabled: false,
+        pattern_id: None,
     };
     h.apply(&mut p, Command::AddAutomationCurve { curve: curve.clone() }).unwrap();
     let mapping =
@@ -36,6 +37,7 @@ fn removing_an_instance_orphans_its_curves_drops_its_mappings_and_undo_restores_
         points: vec![],
         mode: AutomationMode::Read,
         disabled: false,
+        pattern_id: None,
     };
     h.apply(&mut p, Command::AddAutomationCurve { curve: fx_curve.clone() }).unwrap();
     // remove the channel: the curve is kept but disabled, the mapping is gone, the project stays valid

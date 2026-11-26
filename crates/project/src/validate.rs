@@ -288,6 +288,11 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
         if !c.disabled && !instance_ids.contains(&c.target.instance_id) {
             return Err(ValidationError::MissingReference { what: format!("automation curve {}", c.name), target: c.target.instance_id.to_string() });
         }
+        if let Some(pid) = c.pattern_id
+            && !p.patterns.iter().any(|x| x.id == pid)
+        {
+            return Err(ValidationError::MissingReference { what: format!("pattern automation {}", c.name), target: pid.to_string() });
+        }
     }
     let mut clip_ids = HashSet::new();
     for c in &p.clips {

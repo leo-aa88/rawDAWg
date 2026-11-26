@@ -1137,7 +1137,7 @@ fn split_selected(app: &mut App, cmds: &mut Vec<Command>) {
 }
 
 /// Clone the pattern of every selected clip and point the clip at the clone.
-fn make_unique(app: &mut App, cmds: &mut Vec<Command>) {
+pub(crate) fn make_unique(app: &mut App, cmds: &mut Vec<Command>) {
     let sel: Vec<Clip> = app.project.clips.iter().filter(|c| app.playlist.selection.contains(&c.id)).cloned().collect();
     let mut batch = Vec::new();
     let mut n = app.project.patterns.len();
@@ -1149,6 +1149,13 @@ fn make_unique(app: &mut App, cmds: &mut Vec<Command>) {
             let clone = clone_pattern(p, n);
             let new_id = clone.id;
             batch.push(Command::AddPattern { pattern: clone });
+            // the pattern's own automation comes along (new ids), so the copy sounds the same
+            for curve in app.project.automation.iter().filter(|c| c.pattern_id == Some(*pattern_id)) {
+                let points = curve.points.iter().map(|pt| rawdawg_project::AutomationPoint { id: rawdawg_types::PointId::new(), ..*pt }).collect();
+                batch.push(Command::AddAutomationCurve {
+                    curve: rawdawg_project::AutomationCurve { id: rawdawg_types::CurveId::new(), pattern_id: Some(new_id), points, ..curve.clone() },
+                });
+            }
             batch.push(Command::UpdateClip {
                 clip: Clip { content: ClipContent::Pattern { pattern_id: new_id, source_offset_ticks: *source_offset_ticks, looped: *looped }, ..c.clone() },
             });

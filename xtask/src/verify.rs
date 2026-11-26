@@ -730,6 +730,7 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
                 ],
                 mode: AutomationMode::Read,
                 disabled: false,
+                pattern_id: None,
             };
             let curve_id = curve.id;
             history.apply(&mut project, Command::Batch { commands: vec![

@@ -234,6 +234,14 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
                         super::automation::create_clip_for(app, instance_id, d.id.0);
                         ui.close();
                     }
+                    if ui
+                        .button("Automate in this pattern")
+                        .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
+                        .clicked()
+                    {
+                        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+                        ui.close();
+                    }
                     ui.menu_button("Modulate with an LFO clip", |ui| {
                         for (shape, label) in super::automation::LFO_SHAPES.iter().enumerate() {
                             for (cycles, rate) in [(0.25, "slow, 1 per 4 bars"), (1.0, "1 per bar"), (4.0, "1 per beat")] {

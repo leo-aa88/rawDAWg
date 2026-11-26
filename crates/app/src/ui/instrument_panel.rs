@@ -140,6 +140,14 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
                         super::automation::create_clip_for(app, instance_id, d.id.0);
                         ui.close();
                     }
+                    if ui
+                        .button("Automate in this pattern")
+                        .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
+                        .clicked()
+                    {
+                        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+                        ui.close();
+                    }
                 })
                 .map(|r| r.response)
                 .unwrap_or(resp);

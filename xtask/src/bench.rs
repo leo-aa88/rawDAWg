@@ -165,6 +165,7 @@ pub fn reference_project(root: &Path, dir: &Path, bars: i64) -> anyhow::Result<P
                 .collect(),
             mode: AutomationMode::Read,
             disabled: false,
+            pattern_id: None,
         };
         let cid = curve.id;
         p.automation.push(curve);

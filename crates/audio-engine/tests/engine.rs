@@ -525,6 +525,7 @@ fn automation_song(points: Vec<(i64, f32, rawdawg_project::Interpolation)>, mode
         points: points.into_iter().map(|(t, v, i)| AutomationPoint { id: PointId::new(), tick: Tick(t), value: v, interpolation: i }).collect(),
         mode,
         disabled: false,
+        pattern_id: None,
     };
     p.automation.push(curve);
     p.clips.push(Clip {
@@ -1383,4 +1384,103 @@ fn recompiling_unchanged_processors_is_sample_exact_through_tails_latency_and_th
     let swapped = render_with_swap(&p, Some((&edited, 150)), 400);
     let diff = reference.iter().zip(&swapped).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert_eq!(diff, 0.0, "an unrelated edit changed the output (max diff {diff})");
+}
+
+/// A one-bar pattern holding a note for the whole bar, with a pattern curve on the synth's
+/// master gain: quiet for the first half, loud for the second.
+fn pattern_automation_project() -> (Project, rawdawg_types::CurveId) {
+    use rawdawg_project::{AutomationCurve, AutomationPoint, AutomationTarget, Interpolation};
+    use rawdawg_types::{CurveId, PointId};
+    let mut p = project_with_notes(&[(0, 3840, 60)]);
+    p.patterns[0].length_ticks = Tick(3840);
+    let id = CurveId::new();
+    let point = |t: i64, v: f32| AutomationPoint { id: PointId::new(), tick: Tick(t), value: v, interpolation: Interpolation::Step };
+    p.automation.push(AutomationCurve {
+        id,
+        name: "gain".into(),
+        target: AutomationTarget { instance_id: p.channels[0].instrument.id, param_id: rawdawg_synthesizer::params::MASTER_GAIN },
+        points: vec![point(0, 0.2), point(1920, 1.0)],
+        mode: rawdawg_project::AutomationMode::Read,
+        disabled: false,
+        pattern_id: Some(p.patterns[0].id),
+    });
+    rawdawg_project::validate(&p).unwrap();
+    (p, id)
+}
+
+#[test]
+fn pattern_automation_loops_with_the_pattern_and_follows_its_clips_in_song_mode() {
+    use rawdawg_audio_engine::schedule::Schedule;
+    use rawdawg_project::{Clip, ClipContent, Track};
+    use rawdawg_types::{ClipId, TrackId};
+    let (mut p, _) = pattern_automation_project();
+    let rate = SampleRate(48_000);
+    let tempo = p.tempo_map().unwrap();
+    // pattern mode: the curve starts each pass at its start value
+    let s = Schedule::for_pattern(&p, p.patterns[0].id, &tempo, rate);
+    let events: Vec<(i64, f32)> = s.params.iter().map(|q| (q.frame, q.value)).collect();
+    assert_eq!(events, vec![(0, 0.2), (48_000, 1.0)], "value at the pattern start, then the step at beat 3");
+    // the real-time engine loops the pattern (offline export plays one pass)
+    let limits = EngineLimits::DEFAULT;
+    let plan = compile(&p, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+    let (mut engine, mut handle) = Engine::new(rate, 256, &limits);
+    engine.install_plan(plan);
+    handle.send(EngineCommand::Play).unwrap();
+    let mut l = Vec::new();
+    let (mut bl, mut br) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+    for _ in 0..(2 * 96_000 / 256) {
+        bl.fill(0.0);
+        br.fill(0.0);
+        engine.render_block(&mut bl, &mut br);
+        l.extend_from_slice(&bl);
+    }
+    // two passes: each one quiet then loud (the loop restarts the curve)
+    for pass in 0..2 {
+        let base = pass * 96_000;
+        let (quiet, loud) = (rms(&l[base + 10_000..base + 44_000]), rms(&l[base + 58_000..base + 92_000]));
+        assert!(loud > quiet * 2.0, "pass {pass}: quiet {quiet} then loud {loud}");
+    }
+    // song mode: no automation clip needed; the curve plays inside a clip of the pattern,
+    // entering at the clip's offset and starting again at every loop of the pattern
+    let tid = TrackId::new();
+    p.tracks.push(Track { id: tid, name: "T".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
+    let pid = p.patterns[0].id;
+    p.clips.push(Clip {
+        id: ClipId::new(),
+        track_id: tid,
+        start_tick: Tick(7680),
+        length_ticks: Tick(7680),
+        muted: false,
+        content: ClipContent::Pattern { pattern_id: pid, source_offset_ticks: Tick(1920), looped: true },
+    });
+    let s = Schedule::for_song(&p, &tempo, rate);
+    let events: Vec<(i64, f32)> = s.params.iter().map(|q| (q.frame, q.value)).collect();
+    // clip at bar 3 (frame 192000), entering half way: loud; the pattern restarts at frame
+    // 240000 (quiet), its step comes at 288000 (loud), it restarts at 336000 (quiet)
+    assert_eq!(events, vec![(192_000, 1.0), (240_000, 0.2), (288_000, 1.0), (336_000, 0.2)]);
+    // an Off pattern curve plays nowhere
+    p.automation[0].mode = rawdawg_project::AutomationMode::Off;
+    assert!(Schedule::for_song(&p, &tempo, rate).params.is_empty());
+    assert!(Schedule::for_pattern(&p, pid, &tempo, rate).params.is_empty());
+}
+
+#[test]
+fn removing_a_pattern_takes_its_automation_along_and_undo_brings_it_back() {
+    let (mut p, curve) = pattern_automation_project();
+    let other = rawdawg_project::Pattern { id: rawdawg_types::PatternId::new(), name: "Pattern 2".into(), lanes: Vec::new(), ..p.patterns[0].clone() };
+    let other_id = other.id;
+    let mut h = rawdawg_project::History::new();
+    h.apply(&mut p, rawdawg_project::Command::AddPattern { pattern: other }).unwrap();
+    let pid = p.patterns[0].id;
+    h.apply(&mut p, rawdawg_project::Command::RemovePattern { id: pid }).unwrap();
+    assert!(p.automation.iter().all(|c| c.id != curve), "the pattern's curve went with it");
+    rawdawg_project::validate(&p).unwrap();
+    h.undo(&mut p).unwrap();
+    assert!(p.automation.iter().any(|c| c.id == curve && c.pattern_id == Some(pid)));
+    rawdawg_project::validate(&p).unwrap();
+    // a curve pointing at a missing pattern is refused
+    let mut broken = p.clone();
+    broken.automation[0].pattern_id = Some(rawdawg_types::PatternId::new());
+    assert!(rawdawg_project::validate(&broken).is_err());
+    assert!(p.patterns.iter().any(|x| x.id == other_id));
 }

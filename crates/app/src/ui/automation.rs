@@ -20,14 +20,19 @@ pub(crate) struct AutomationState {
     px_per_tick: f32,
     selected: Option<PointId>,
     drag: Option<(PointId, Vec<AutomationPoint>)>,
-    /// Gesture capture while the song plays (touch/write): curve, points captured so far.
+    /// Gesture capture while the transport plays (touch/write): curve, points captured so far.
     capture: Option<Capture>,
+    /// Deterministic tests only: the transport state (playing, tick) instead of the engine's.
+    #[cfg(test)]
+    pub test_transport: Option<(bool, i64)>,
 }
 
 struct Capture {
     curve: CurveId,
-    clip_start: i64,
-    source_offset: i64,
+    /// The playhead tick where curve tick 0 plays (clip start minus its source offset).
+    anchor: i64,
+    /// Pattern curves repeat every pattern length.
+    period: Option<i64>,
     first_tick: i64,
     last_tick: i64,
     points: Vec<(i64, f32)>,
@@ -38,7 +43,16 @@ struct Capture {
 
 impl Default for AutomationState {
     fn default() -> Self {
-        Self { curve: None, scroll_tick: 0.0, px_per_tick: 80.0 / PPQ as f32, selected: None, drag: None, capture: None }
+        Self {
+            curve: None,
+            scroll_tick: 0.0,
+            px_per_tick: 80.0 / PPQ as f32,
+            selected: None,
+            drag: None,
+            capture: None,
+            #[cfg(test)]
+            test_transport: None,
+        }
     }
 }
 
@@ -85,6 +99,29 @@ pub(crate) fn create_clip_for(app: &mut App, instance_id: InstanceId, param_id: 
         AutomationPoint { id: PointId::new(), tick: Tick(len), value: current, interpolation: Interpolation::Linear },
     ];
     place_curve(app, target, points, len);
+}
+
+/// Create a curve for `target` that belongs to the selected pattern: it spans the pattern and
+/// plays whenever the pattern plays (pattern mode, and the pattern's clips in song mode).
+pub(crate) fn create_pattern_curve_for(app: &mut App, instance_id: InstanceId, param_id: u32) {
+    let Some(pattern) = app.project.selected_pattern.and_then(|id| app.project.pattern(id)).cloned() else {
+        app.status_line = "Select a pattern first".into();
+        return;
+    };
+    let target = AutomationTarget { instance_id, param_id };
+    let current = current_value(app, &target);
+    let len = pattern.length_ticks.0.max(1);
+    let points = vec![
+        AutomationPoint { id: PointId::new(), tick: Tick::ZERO, value: current, interpolation: Interpolation::Linear },
+        AutomationPoint { id: PointId::new(), tick: Tick(len), value: current, interpolation: Interpolation::Linear },
+    ];
+    let name = format!("{} · {}", pattern.name, target_label(app, &target));
+    let curve = AutomationCurve { id: CurveId::new(), name, target, points, mode: AutomationMode::Read, disabled: false, pattern_id: Some(pattern.id) };
+    let cid = curve.id;
+    app.apply(Command::AddAutomationCurve { curve });
+    app.automation.curve = Some(cid);
+    app.editor_view = EditorView::Automation;
+    app.status_line = format!("Pattern automation: plays whenever {} plays", pattern.name);
 }
 
 /// LFO shapes for generated modulation curves.
@@ -134,7 +171,7 @@ fn bar_ticks(app: &App) -> i64 {
 fn place_curve(app: &mut App, target: AutomationTarget, points: Vec<AutomationPoint>, len: i64) {
     let bar = bar_ticks(app);
     let at = app.playhead_tick().map(|t| t.div_euclid(bar) * bar).unwrap_or(0).max(0);
-    let curve = AutomationCurve { id: CurveId::new(), name: target_label(app, &target), target, points, mode: AutomationMode::Read, disabled: false };
+    let curve = AutomationCurve { id: CurveId::new(), name: target_label(app, &target), target, points, mode: AutomationMode::Read, disabled: false, pattern_id: None };
     let cid = curve.id;
     let mut batch = vec![Command::AddAutomationCurve { curve }];
     let track_id = match automation_track(app) {
@@ -166,47 +203,45 @@ fn place_curve(app: &mut App, target: AutomationTarget, points: Vec<AutomationPo
     }
 }
 
-/// Touch/write capture hook called from parameter edits (normalized value, gesture start/stop).
+/// Touch/write capture hook called from parameter edits and mapped MIDI controllers
+/// (normalized value, gesture start/stop).
 pub(crate) fn capture_edit(app: &mut App, instance_id: InstanceId, param_id: u32, value: f32, started: bool, stopped: bool) {
-    let playing = app.is_playing() && app.transport_mode == TransportMode::Song;
-    let Some(tick) = app.playhead_tick() else { return };
-    let Some(curve) = app
+    let Some((playing, tick)) = transport(app) else { return };
+    capture_at(app, playing, tick, instance_id, param_id, value, started, stopped);
+}
+
+/// Whether the transport plays, and the playhead tick (`None` without a running engine).
+fn transport(app: &App) -> Option<(bool, i64)> {
+    #[cfg(test)]
+    if let Some(t) = app.automation.test_transport {
+        return Some(t);
+    }
+    Some((app.is_playing(), app.playhead_tick()?))
+}
+
+/// [`capture_edit`] at a given transport state (the engine's playhead in the app).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_at(app: &mut App, playing: bool, tick: i64, instance_id: InstanceId, param_id: u32, value: f32, started: bool, stopped: bool) {
+    let armed: Vec<AutomationCurve> = app
         .project
         .automation
         .iter()
-        .find(|c| c.target.instance_id == instance_id && c.target.param_id == param_id && matches!(c.mode, AutomationMode::Touch | AutomationMode::Write))
+        .filter(|c| !c.disabled && c.target.instance_id == instance_id && c.target.param_id == param_id && matches!(c.mode, AutomationMode::Touch | AutomationMode::Write))
         .cloned()
-    else {
-        return;
-    };
-    if !playing {
+        .collect();
+    if armed.is_empty() || !playing {
         return;
     }
-    // the clip of this curve under the playhead decides the curve-relative tick
-    let Some(clip) = app
-        .project
-        .clips
-        .iter()
-        .find(|c| matches!(&c.content, ClipContent::Automation { curve_id, .. } if *curve_id == curve.id) && c.start_tick.0 <= tick && c.end_tick().0 > tick)
-        .cloned()
-    else {
-        app.status_line = "No automation clip for this parameter under the playhead".into();
+    // the armed curve that is playing under the playhead decides the curve-relative tick
+    let Some((curve, anchor, period)) = armed.into_iter().find_map(|c| curve_anchor(app, &c, tick).map(|(a, p)| (c, a, p))) else {
+        app.status_line = "Nothing plays this parameter's automation under the playhead (no automation clip, or its pattern is not playing)".into();
         return;
     };
-    let ClipContent::Automation { source_offset_ticks, .. } = clip.content else { return };
-    let rel = tick - clip.start_tick.0 + source_offset_ticks.0;
+    let rel = relative_tick(tick, anchor, period);
     let st = &mut app.automation;
     if started || st.capture.as_ref().is_none_or(|c| c.curve != curve.id) {
-        st.capture = Some(Capture {
-            curve: curve.id,
-            clip_start: clip.start_tick.0,
-            source_offset: source_offset_ticks.0,
-            first_tick: rel,
-            last_tick: rel,
-            points: Vec::new(),
-            latch: curve.mode == AutomationMode::Write,
-            last_value: value,
-        });
+        st.capture =
+            Some(Capture { curve: curve.id, anchor, period, first_tick: rel, last_tick: rel, points: Vec::new(), latch: curve.mode == AutomationMode::Write, last_value: value });
     }
     if let Some(c) = st.capture.as_mut() {
         c.points.push((rel, value));
@@ -218,16 +253,68 @@ pub(crate) fn capture_edit(app: &mut App, instance_id: InstanceId, param_id: u32
     }
 }
 
+/// Where `curve` is playing at the playhead `tick`: the tick its tick 0 plays at, and its
+/// repetition period. Song curves play through their automation clips (song mode); pattern
+/// curves play with their pattern (pattern mode, and the pattern's clips in song mode).
+fn curve_anchor(app: &App, curve: &AutomationCurve, tick: i64) -> Option<(i64, Option<i64>)> {
+    match (curve.pattern_id, app.transport_mode) {
+        (Some(pid), TransportMode::Pattern) => {
+            let len = app.project.pattern(pid)?.length_ticks.0.max(1);
+            (app.project.selected_pattern == Some(pid)).then_some((0, Some(len)))
+        }
+        (Some(pid), TransportMode::Song) => {
+            let len = app.project.pattern(pid)?.length_ticks.0.max(1);
+            app.project.clips.iter().find_map(|c| match &c.content {
+                ClipContent::Pattern { pattern_id, source_offset_ticks, .. } if *pattern_id == pid && c.start_tick.0 <= tick && c.end_tick().0 > tick => {
+                    Some((c.start_tick.0 - source_offset_ticks.0, Some(len)))
+                }
+                _ => None,
+            })
+        }
+        (None, TransportMode::Song) => app.project.clips.iter().find_map(|c| match &c.content {
+            ClipContent::Automation { curve_id, source_offset_ticks, .. } if *curve_id == curve.id && c.start_tick.0 <= tick && c.end_tick().0 > tick => {
+                Some((c.start_tick.0 - source_offset_ticks.0, None))
+            }
+            _ => None,
+        }),
+        (None, TransportMode::Pattern) => None,
+    }
+}
+
+fn relative_tick(tick: i64, anchor: i64, period: Option<i64>) -> i64 {
+    let rel = tick - anchor;
+    match period {
+        Some(p) => rel.rem_euclid(p.max(1)),
+        None => rel,
+    }
+}
+
+/// A mapped MIDI controller came to rest: a touch capture of that instrument or effect ends
+/// (Write keeps latching until playback stops).
+pub(crate) fn release_touch(app: &mut App, instance_id: InstanceId) {
+    let ends = app.automation.capture.as_ref().is_some_and(|c| !c.latch && app.project.automation.iter().any(|x| x.id == c.curve && x.target.instance_id == instance_id));
+    if ends {
+        finish_capture(app);
+    }
+}
+
 /// Called every frame: extend write-mode latch while playing, finish when playback stops.
 pub(crate) fn poll_capture(app: &mut App) {
-    let playing = app.is_playing() && app.transport_mode == TransportMode::Song;
-    let tick = app.playhead_tick();
+    let (playing, tick) = match transport(app) {
+        Some((playing, tick)) => (playing, Some(tick)),
+        None => (false, None),
+    };
+    poll_capture_at(app, playing, tick);
+}
+
+/// [`poll_capture`] at a given transport state.
+pub(crate) fn poll_capture_at(app: &mut App, playing: bool, tick: Option<i64>) {
     let Some(c) = app.automation.capture.as_mut() else { return };
     if playing
         && c.latch
         && let Some(t) = tick
     {
-        let rel = t - c.clip_start + c.source_offset;
+        let rel = relative_tick(t, c.anchor, c.period);
         if rel > c.last_tick {
             c.points.push((rel, c.last_value));
             c.last_tick = rel;
@@ -250,7 +337,8 @@ fn finish_capture(app: &mut App) {
     let mut last_t = i64::MIN;
     let mut added = 0;
     for (t, v) in &c.points {
-        if *t - last_t >= PPQ / 16 || added == 0 {
+        // the first point always goes in (and `last_t` starts at i64::MIN: no subtraction then)
+        if added == 0 || t.saturating_sub(last_t) >= PPQ / 16 {
             curve.points.push(AutomationPoint { id: PointId::new(), tick: Tick((*t).max(0)), value: v.clamp(0.0, 1.0), interpolation: Interpolation::Linear });
             last_t = *t;
             added += 1;
@@ -335,7 +423,7 @@ pub(crate) fn bake_morph_gesture(app: &mut App, instance: InstanceId, corners: [
                 last_t = *t;
             }
         }
-        let curve = AutomationCurve { id: CurveId::new(), name: format!("morph · {}", d.name), target, points, mode: AutomationMode::Read, disabled: false };
+        let curve = AutomationCurve { id: CurveId::new(), name: format!("morph · {}", d.name), target, points, mode: AutomationMode::Read, disabled: false, pattern_id: None };
         let cid = curve.id;
         batch.push(Command::AddAutomationCurve { curve });
         batch.push(Command::AddClip {
@@ -363,7 +451,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             .project
             .automation
             .iter()
-            .map(|c| (c.id, format!("{}{} ({} pts)", target_label(app, &c.target), if c.disabled { " [orphan]" } else { "" }, c.points.len())))
+            .map(|c| {
+                let pattern = c.pattern_id.and_then(|p| app.project.pattern(p)).map(|p| format!("[{}] ", p.name)).unwrap_or_default();
+                (c.id, format!("{pattern}{}{} ({} pts)", target_label(app, &c.target), if c.disabled { " [orphan]" } else { "" }, c.points.len()))
+            })
             .collect();
         let current = app.automation.curve.and_then(|id| names.iter().find(|(i, _)| *i == id).map(|(_, n)| n.clone())).unwrap_or_else(|| "choose a curve".into());
         egui::ComboBox::from_id_salt("auto-curve").selected_text(current).width(260.0).show_ui(ui, |ui| {
@@ -411,12 +502,17 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         if mode != curve.mode {
             cmds.push(Command::UpdateAutomationCurve { curve: AutomationCurve { mode, ..curve.clone() } });
         }
+        let pattern = curve.pattern_id.and_then(|p| app.project.pattern(p)).map(|p| p.name.clone());
+        let plays = match &pattern {
+            Some(name) => format!("plays with {name} (pattern mode and its clips in Song mode)"),
+            None => "plays in Song mode".to_owned(),
+        };
         ui.label(
             egui::RichText::new(match mode {
-                AutomationMode::Off => "not played",
-                AutomationMode::Read => "plays in Song mode",
-                AutomationMode::Touch => "plays; moving the control while playing writes points until you let go",
-                AutomationMode::Write => "plays; the first touch writes the control's value until playback stops",
+                AutomationMode::Off => "not played".to_owned(),
+                AutomationMode::Read => plays,
+                AutomationMode::Touch => format!("{plays}; moving the control (or a MIDI-learned knob) while playing writes points until you let go"),
+                AutomationMode::Write => format!("{plays}; the first touch writes the control's value until playback stops"),
             })
             .color(theme::TEXT_SECONDARY),
         );

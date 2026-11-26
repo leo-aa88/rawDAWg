@@ -433,6 +433,11 @@ pub struct AutomationCurve {
     /// Orphaned (target missing) curves stay disabled until repaired.
     #[serde(default)]
     pub disabled: bool,
+    /// Pattern automation: ticks are relative to the pattern's start and the curve plays
+    /// whenever the pattern plays (looping in pattern mode, inside each of its clips in song
+    /// mode). `None`: song automation, placed by automation clips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_id: Option<PatternId>,
 }
 
 fn default_mode() -> AutomationMode {
