@@ -427,9 +427,22 @@ impl App {
     }
 
     /// Compile the project and hand the plan to the engine (off the audio thread).
-    pub(crate) fn recompile(&mut self) {
-        let AudioState::Running(sys) = &mut self.audio else { return };
+    /// The project as the engine plays it: the document plus listening-only adjustments that
+    /// are never saved (an Evolve preview's level match).
+    pub(crate) fn engine_project(&self) -> rawdawg_project::Project {
         let mut project = self.project.clone();
+        let evolve = &self.synth_panel.evolve;
+        if let (Some(trim), Some((instance, _))) = (evolve.preview_trim_db, evolve.preview_backup.as_ref())
+            && let Some(ch) = project.channels.iter_mut().find(|c| c.instrument.id == *instance)
+        {
+            ch.gain_db.0 += f64::from(trim);
+        }
+        project
+    }
+
+    pub(crate) fn recompile(&mut self) {
+        let mut project = self.engine_project();
+        let AudioState::Running(sys) = &mut self.audio else { return };
         project.sample_rate_hz = sys.sample_rate;
         self.plan_revision += 1;
         self.assets.sync(self.project_path.clone(), &self.project);

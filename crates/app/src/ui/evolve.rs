@@ -48,11 +48,16 @@ pub(crate) struct EvolveState {
     pub morph_xy: (f32, f32),
     pub morph_recording: Vec<(f32, f32, f64)>,
     pub morph_last: Option<Patch>,
+    /// Play previews about as loud as the sound before the preview (on by default).
+    pub match_levels: bool,
+    /// Gain the engine applies to the previewed channel while a variation plays (never
+    /// saved, never part of the sound); `None` when nothing is level-matched.
+    pub preview_trim_db: Option<f32>,
 }
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { chaos: 35.0, locks: Locks::default(), seed_counter: 1, show_evolve: true, ..Default::default() }
+        Self { chaos: 35.0, locks: Locks::default(), seed_counter: 1, show_evolve: true, match_levels: true, ..Default::default() }
     }
 }
 
@@ -74,13 +79,52 @@ fn make_candidate(st: &mut EvolveState, patch: Patch) -> Candidate {
     Candidate { patch, features, thumb: thumbnail(&buf) }
 }
 
+/// Largest correction a level-matched preview applies, either way.
+pub(crate) const MAX_PREVIEW_TRIM_DB: f32 = 12.0;
+
+/// The bounded gain that plays a sound with `candidate_rms` about as loud as one with
+/// `reference_rms` (both from the same offline audition); 0 dB when either is silent.
+pub(crate) fn match_gain_db(reference_rms: f32, candidate_rms: f32) -> f32 {
+    if !(reference_rms > 1e-6 && candidate_rms > 1e-6) || !reference_rms.is_finite() || !candidate_rms.is_finite() {
+        return 0.0;
+    }
+    (20.0 * (reference_rms / candidate_rms).log10()).clamp(-MAX_PREVIEW_TRIM_DB, MAX_PREVIEW_TRIM_DB)
+}
+
+/// Loudness of a patch's offline audition (cached by patch hash).
+fn audition_rms(st: &mut EvolveState, patch: &Patch) -> Option<f32> {
+    let aud = audition();
+    let buf = st.cache.entry(patch_hash(patch)).or_insert_with(|| render_patch(patch, &aud).unwrap_or_default());
+    (!buf.is_empty()).then(|| SoundFeatures::of(buf, aud.sample_rate).rms)
+}
+
+/// Work out the preview's level match: the previewed sound against the one before the preview.
+fn refresh_trim(app: &mut App, instance: InstanceId) {
+    let st = &mut app.synth_panel.evolve;
+    st.preview_trim_db = None;
+    if !st.match_levels {
+        return;
+    }
+    let Some((backup_instance, before)) = st.preview_backup.as_ref() else { return };
+    if *backup_instance != instance {
+        return;
+    }
+    let Ok(reference) = Patch::from_json(before) else { return };
+    let Some(current) = app.synth_mirrors.get(&instance).map(|m| m.patch().clone()) else { return };
+    let st = &mut app.synth_panel.evolve;
+    if let (Some(r), Some(c)) = (audition_rms(st, &reference), audition_rms(st, &current)) {
+        st.preview_trim_db = Some(match_gain_db(r, c));
+    }
+}
+
 fn next_seed(st: &mut EvolveState) -> u64 {
     st.seed_counter = st.seed_counter.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     st.seed_counter
 }
 
-/// Load a patch live without committing (restores on cancel).
-fn preview(app: &mut App, instance: InstanceId, patch: &Patch) {
+/// Load a patch live without committing (restores on cancel), level-matched to the sound
+/// before the preview when "Match levels" is on.
+pub(crate) fn preview(app: &mut App, instance: InstanceId, patch: &Patch) {
     if app.synth_panel.evolve.preview_backup.is_none() {
         let before = app.synth_mirrors[&instance].save_state();
         app.synth_panel.evolve.preview_backup = Some((instance, before));
@@ -92,10 +136,12 @@ fn preview(app: &mut App, instance: InstanceId, patch: &Patch) {
     if let Some(ch) = app.project.channels.iter_mut().find(|c| c.instrument.id == instance) {
         ch.instrument.state = value;
     }
+    refresh_trim(app, instance);
     app.recompile();
 }
 
-fn cancel_preview(app: &mut App) {
+pub(crate) fn cancel_preview(app: &mut App) {
+    app.synth_panel.evolve.preview_trim_db = None;
     if let Some((instance, before)) = app.synth_panel.evolve.preview_backup.take() {
         if let Ok(p) = Patch::from_json(&before) {
             let value = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
@@ -110,8 +156,10 @@ fn cancel_preview(app: &mut App) {
     }
 }
 
-/// Commit the previewed patch as one undo entry.
-fn use_sound(app: &mut App, instance: InstanceId, patch: &Patch) {
+/// Commit the previewed patch as one undo entry. The level match ends: the sound plays at its
+/// own level, as it will everywhere else.
+pub(crate) fn use_sound(app: &mut App, instance: InstanceId, patch: &Patch) {
+    app.synth_panel.evolve.preview_trim_db = None;
     if let Some((_, before)) = app.synth_panel.evolve.preview_backup.take() {
         // restore the project to the pre-preview state so the command's inverse is exact
         if let Ok(p) = Patch::from_json(&before)
@@ -322,6 +370,26 @@ fn evolve_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
                 cancel_preview(app);
                 app.synth_panel.evolve.selected = None;
             }
+            let mut matched = app.synth_panel.evolve.match_levels;
+            if ui
+                .checkbox(&mut matched, "Match levels")
+                .on_hover_text(
+                    "Play each variation about as loud as the sound you started from (at most ±12 dB), so louder never just sounds better. The sound itself keeps its own level.",
+                )
+                .changed()
+            {
+                app.synth_panel.evolve.match_levels = matched;
+                if app.synth_panel.evolve.preview_backup.is_some() {
+                    refresh_trim(app, instance);
+                    app.recompile();
+                }
+            }
+            if let Some(t) = app.synth_panel.evolve.preview_trim_db
+                && app.synth_panel.evolve.preview_backup.is_some()
+            {
+                ui.label(egui::RichText::new(format!("preview {t:+.1} dB")).small().color(theme::TEXT_SECONDARY))
+                    .on_hover_text("Level match for listening only: Use sound keeps the variation at its own level");
+            }
             if ui.add_enabled(sel.is_some(), egui::Button::new("★ Favorite")).clicked()
                 && let Some(i) = sel
             {
@@ -433,6 +501,10 @@ fn morph_panel(app: &mut App, ui: &mut egui::Ui, instance: InstanceId) {
 
 /// Apply a compatible morph result live: parameters as events, waveforms via tables.
 fn apply_morph_live(app: &mut App, instance: InstanceId, m: &Patch) {
+    // the morph is heard at its own level: a variation's level match ends here
+    if app.synth_panel.evolve.preview_trim_db.take().is_some() {
+        app.recompile();
+    }
     use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
     let Some(ch) = app.project.channels.iter().find(|c| c.instrument.id == instance).map(|c| c.id) else { return };
     let mut cycles: Vec<(usize, Vec<f32>)> = Vec::new();

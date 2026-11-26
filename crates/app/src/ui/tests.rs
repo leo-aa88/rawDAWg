@@ -1274,3 +1274,63 @@ fn rack_channels_are_duplicated_from_their_menu_and_reordered_by_dragging() {
     assert_eq!(h.app.project.channels[0].name, "Bassline", "renamed from the menu");
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }
+
+#[test]
+fn evolve_previews_are_level_matched_for_listening_only() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    use rawdawg_dsp::math::rms;
+    let mut h = Harness::new(None);
+    let ch = h.app.project.channels[0].clone();
+    let instance = ch.instrument.id;
+    // a note to listen to
+    let pid = h.app.project.selected_pattern.unwrap();
+    let note = rawdawg_project::Note {
+        id: rawdawg_types::NoteId::new(),
+        tick: rawdawg_types::units::Tick(0),
+        duration_ticks: rawdawg_types::units::Tick(960),
+        pitch: 60,
+        velocity: 0.8,
+        channel: 0,
+    };
+    h.app.apply(rawdawg_project::Command::AddNotes { pattern_id: pid, channel_id: ch.id, notes: vec![note] });
+    let loudness = |p: &rawdawg_project::Project| {
+        let opts = OfflineOptions { tail_seconds: 0.0, ..OfflineOptions::default() };
+        let (l, _, _) = render_project(p, &opts).expect("render");
+        20.0 * rms(&l).log10()
+    };
+    let original = loudness(&h.app.engine_project());
+    // a variation 9 dB louder than the sound it came from
+    let mut loud = h.app.synth_mirrors[&instance].patch().clone();
+    loud.master_db += 9.0;
+    super::evolve::preview(&mut h.app, instance, &loud);
+    let trim = h.app.synth_panel.evolve.preview_trim_db.expect("level matched");
+    assert!((trim + 9.0).abs() < 0.3, "the preview is turned down by about 9 dB: {trim}");
+    // listening only: the document keeps the channel's own gain
+    assert_eq!(h.app.project.channels[0].gain_db, ch.gain_db);
+    let heard = loudness(&h.app.engine_project());
+    assert!((heard - original).abs() < 0.5, "the preview plays as loud as the original: {heard:.2} vs {original:.2} dBFS");
+    let unmatched = loudness(&h.app.project);
+    assert!((unmatched - original - 9.0).abs() < 0.5, "without the match it is 9 dB louder: {unmatched:.2}");
+    // bounded: a 40 dB drop is lifted by at most 12 dB
+    let mut quiet = h.app.synth_mirrors[&instance].patch().clone();
+    quiet.master_db -= 40.0;
+    super::evolve::preview(&mut h.app, instance, &quiet);
+    assert_eq!(h.app.synth_panel.evolve.preview_trim_db, Some(super::evolve::MAX_PREVIEW_TRIM_DB), "quiet variations are lifted by 12 dB at most");
+    // switched off: the raw level
+    h.app.synth_panel.evolve.match_levels = false;
+    super::evolve::preview(&mut h.app, instance, &loud);
+    assert_eq!(h.app.synth_panel.evolve.preview_trim_db, None);
+    h.app.synth_panel.evolve.match_levels = true;
+    super::evolve::preview(&mut h.app, instance, &loud);
+    assert!(h.app.synth_panel.evolve.preview_trim_db.is_some());
+    // Cancel ends it, and so does Use sound (the kept sound plays at its own level)
+    super::evolve::cancel_preview(&mut h.app);
+    assert_eq!(h.app.synth_panel.evolve.preview_trim_db, None);
+    assert!((loudness(&h.app.engine_project()) - original).abs() < 0.01, "cancel restores the original");
+    super::evolve::preview(&mut h.app, instance, &loud);
+    super::evolve::use_sound(&mut h.app, instance, &loud);
+    assert_eq!(h.app.synth_panel.evolve.preview_trim_db, None);
+    assert!((loudness(&h.app.engine_project()) - original - 9.0).abs() < 0.5, "the kept sound is the real, louder one");
+    assert_eq!(super::evolve::match_gain_db(0.0, 0.5), 0.0, "silence is never boosted");
+    assert_eq!(super::evolve::match_gain_db(0.1, 0.1), 0.0);
+}
