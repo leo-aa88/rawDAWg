@@ -509,6 +509,11 @@ fn all_generators_process_path_is_allocation_free() {
     let mut events: Vec<TimedEvent> = (0..12u32).map(|i| on(10 + i, 40 + i as u8 * 2, 0.8)).collect();
     events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::Control { cc: 1, value: 0.7 }));
     events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::ChannelPressure { value: 0.5 }));
+    events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::NotePressure { note_id: 11, value: 0.7 }));
+    events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::Control { cc: 74, value: 0.9 }));
+    for (i, x) in rawdawg_types::events::NoteExpression::ALL.into_iter().enumerate() {
+        events.push(TimedEvent::new(0, EventSource::TypingKeyboard, 0, EventKind::NoteExpression { note_id: 12 + i as u32, expression: x, value: 0.6 }));
+    }
     events.push(TimedEvent::new(0, EventSource::Transport, 0, EventKind::Param { id: ParamId(params::gen_param(1, params::G_FM_LEVEL2)), value: 0.8 }));
     events.push(TimedEvent::new(0, EventSource::Transport, 0, EventKind::Param { id: ParamId(params::mod_param(5, params::MOD_ENABLED)), value: 1.0 }));
     let (_, allocs) = measure_rt(|| {

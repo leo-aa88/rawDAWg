@@ -12,6 +12,7 @@ use rawdawg_dsp::oscillator::{BasicOscillator, BasicTables, BasicWave};
 use rawdawg_dsp::rng::DeterministicRng;
 use rawdawg_dsp::smooth::Smoother;
 use rawdawg_dsp::wavetable::{MipTable, TableBuilder};
+use rawdawg_types::events::NoteExpression;
 
 /// Control-rate interval in samples for pitch/filter/modulation updates.
 pub const CONTROL_INTERVAL: usize = 16;
@@ -242,6 +243,49 @@ struct LayerVoice {
     pluck: PluckState,
 }
 
+/// Rate and full depth of the vibrato a note's vibrato expression adds.
+const VIBRATO_HZ: f32 = 5.5;
+const VIBRATO_SEMITONES: f32 = 0.5;
+/// Time a full-scale change of a note's volume, expression or pan takes.
+const EXPRESSION_GLIDE_S: f32 = 0.005;
+/// How far a brightness of 0 or 1 moves the filter cutoff.
+const BRIGHTNESS_OCTAVES: f32 = 2.0;
+
+/// One note's expression, CLAP ranges ([`NoteExpression`]); neutral by default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteExpr {
+    /// Linear gain 0..4 (1 = unchanged).
+    pub volume: f32,
+    /// 0 = left, 0.5 = centre, 1 = right.
+    pub pan: f32,
+    /// Semitones added to the note's pitch.
+    pub tuning: f32,
+    /// Depth of the built-in vibrato, 0..1.
+    pub vibrato: f32,
+    /// Gain 0..1 (like MIDI CC 11).
+    pub expression: f32,
+    /// Filter brightness 0..1 (0.5 neutral); `None` follows the channel's CC 74.
+    pub brightness: Option<f32>,
+    /// Pressure 0..1; `None` follows channel pressure.
+    pub pressure: Option<f32>,
+}
+
+impl Default for NoteExpr {
+    fn default() -> Self {
+        Self { volume: 1.0, pan: 0.5, tuning: 0.0, vibrato: 0.0, expression: 1.0, brightness: None, pressure: None }
+    }
+}
+
+impl NoteExpr {
+    /// Output gains (left, right): volume × expression with an equal-power pan that is unity at
+    /// the centre.
+    fn gains(&self) -> [f32; 2] {
+        let (l, r) = rawdawg_types::units::Pan(f64::from(self.pan * 2.0 - 1.0)).equal_power_gains();
+        let g = self.volume * self.expression * std::f32::consts::SQRT_2;
+        [l * g, r * g]
+    }
+}
+
 /// A voice slot.
 #[derive(Clone, Debug)]
 pub struct Voice {
@@ -262,6 +306,14 @@ pub struct Voice {
     bend_semitones: f32,
     mod_wheel: f32,
     aftertouch: f32,
+    /// MIDI CC 74 ("timbre"/brightness) of the voice's channel, 0..1 (0.5 neutral).
+    timbre: f32,
+    /// This note's own expression (reset at every note-on).
+    expr: NoteExpr,
+    /// Phase (cycles) of the built-in vibrato driven by the note's vibrato expression.
+    vib_phase: f32,
+    /// Output gains (left, right) reached at the end of the last sub-block; ramps follow them.
+    out_gain: [f32; 2],
     random: f32,
     lfo: [LfoState; MAX_LFOS],
     rng: DeterministicRng,
@@ -304,6 +356,10 @@ impl Voice {
             bend_semitones: 0.0,
             mod_wheel: 0.0,
             aftertouch: 0.0,
+            timbre: 0.5,
+            expr: NoteExpr::default(),
+            vib_phase: 0.0,
+            out_gain: [1.0, 1.0],
             random: 0.0,
             lfo: [LfoState::default(); MAX_LFOS],
             rng: DeterministicRng::new(seed, 0x77),
@@ -360,6 +416,7 @@ impl Voice {
         self.released = false;
         self.sustained = false;
         self.velocity = velocity;
+        self.expr = NoteExpr::default();
         let sr = self.sample_rate as f32;
         self.rng = DeterministicRng::new(self.seed ^ u64::from(key.note_id), age);
         self.random = self.rng.bipolar_f32();
@@ -373,6 +430,8 @@ impl Voice {
             self.amp.note_on();
             self.fenv.note_on();
             self.gate_pulse = true;
+            self.vib_phase = 0.0;
+            self.out_gain = self.expr.gains();
             if let Some(g) = &mut self.graph {
                 g.reset();
             }
@@ -440,6 +499,36 @@ impl Voice {
         self.bend_semitones = semitones;
     }
 
+    /// The channel's CC 74 (0..1); the note's own brightness expression takes precedence.
+    pub fn set_timbre(&mut self, value: f32) {
+        self.timbre = value.clamp(0.0, 1.0);
+    }
+
+    /// Polyphonic (per-note) pressure, 0..1: replaces channel pressure as this note's
+    /// aftertouch modulation source.
+    pub fn set_note_pressure(&mut self, value: f32) {
+        self.expr.pressure = Some(value.clamp(0.0, 1.0));
+    }
+
+    /// One per-note expression in its documented range ([`NoteExpression`]).
+    pub fn set_expression(&mut self, expression: NoteExpression, value: f32) {
+        let e = &mut self.expr;
+        match expression {
+            NoteExpression::Volume => e.volume = value.clamp(0.0, 4.0),
+            NoteExpression::Pan => e.pan = value.clamp(0.0, 1.0),
+            NoteExpression::Tuning => e.tuning = value.clamp(-120.0, 120.0),
+            NoteExpression::Vibrato => e.vibrato = value.clamp(0.0, 1.0),
+            NoteExpression::Expression => e.expression = value.clamp(0.0, 1.0),
+            NoteExpression::Brightness => e.brightness = Some(value.clamp(0.0, 1.0)),
+            NoteExpression::Pressure => e.pressure = Some(value.clamp(0.0, 1.0)),
+        }
+    }
+
+    /// This note's expression (tests and diagnostics).
+    pub fn expression(&self) -> NoteExpr {
+        self.expr
+    }
+
     pub fn set_sample_rate(&mut self, sr: f64) {
         self.sample_rate = sr;
         self.amp.set_sample_rate(sr as f32);
@@ -474,11 +563,14 @@ impl Voice {
             velocity: self.velocity,
             key: (f32::from(key.pitch) - 60.0) / 60.0,
             mod_wheel: self.mod_wheel,
-            aftertouch: self.aftertouch,
+            aftertouch: self.expr.pressure.unwrap_or(self.aftertouch),
             random: self.random,
         };
         self.mods = ModOutputs::evaluate(&patch.mod_routes, &inputs);
-        let p = f64::from(self.pitch.current()) + f64::from(self.bend_semitones) + f64::from(self.mods.get(ModTarget::Pitch) * 24.0);
+        // the note's vibrato expression: a 5.5 Hz sine of up to ±0.5 semitone
+        self.vib_phase = (self.vib_phase + VIBRATO_HZ * CONTROL_INTERVAL as f32 / self.sample_rate as f32).fract();
+        let vibrato = (self.vib_phase * std::f32::consts::TAU).sin() * self.expr.vibrato * VIBRATO_SEMITONES;
+        let p = f64::from(self.pitch.current()) + f64::from(self.bend_semitones) + f64::from(self.expr.tuning + vibrato) + f64::from(self.mods.get(ModTarget::Pitch) * 24.0);
         let a4 = f64::from(patch.tuning.a4_hz);
         let pw_mod = f64::from(self.mods.get(ModTarget::PulseWidth) * 0.45);
         for (lv, le) in self.layers.iter_mut().zip(layers.iter()) {
@@ -503,7 +595,9 @@ impl Voice {
             let f = &patch.filter;
             let env = self.fenv.level() * f.env_octaves;
             let key_track = f.key_track * (self.pitch.current() - 60.0) / 12.0;
-            let cutoff = f.cutoff_hz * 2f32.powf(env + key_track + self.mods.get(ModTarget::Cutoff) * 4.0);
+            // brightness (note expression or the channel's CC 74): ±2 octaves around 0.5
+            let bright = (self.expr.brightness.unwrap_or(self.timbre) - 0.5) * BRIGHTNESS_OCTAVES * 2.0;
+            let cutoff = f.cutoff_hz * 2f32.powf(env + key_track + bright + self.mods.get(ModTarget::Cutoff) * 4.0);
             let res = (f.resonance * 2f32.powf(self.mods.get(ModTarget::Resonance) * 2.0)).clamp(0.5, 20.0);
             self.filter_l.set_mode(f.mode);
             self.filter_r.set_mode(f.mode);
@@ -648,7 +742,7 @@ impl Voice {
             let src = Sources {
                 mix_l: &sl,
                 mix_r: &sr_buf,
-                pitch_norm: (self.pitch.current() + self.bend_semitones) / 127.0,
+                pitch_norm: (self.pitch.current() + self.bend_semitones + self.expr.tuning) / 127.0,
                 gate: &gate,
                 velocity: self.velocity,
                 amp_env: self.amp.level(),
@@ -663,16 +757,23 @@ impl Voice {
             sl[..alive].copy_from_slice(&gl[..alive]);
             sr_buf[..alive].copy_from_slice(&gr[..alive]);
         }
+        // the note's volume, expression and pan glide to their new values (no clicks)
+        let [mut gl, mut gr] = self.out_gain;
+        let [to_l, to_r] = self.expr.gains();
+        let step = 1.0 / (EXPRESSION_GLIDE_S * self.sample_rate as f32);
         for i in 0..alive {
             let (mut l, mut r) = (sl[i], sr_buf[i]);
             if use_filter {
                 l = self.filter_l.process(l);
                 r = self.filter_r.process(r);
             }
+            gl += (to_l - gl).clamp(-step, step);
+            gr += (to_r - gr).clamp(-step, step);
             let g = env[i] * vel_gain;
-            out_l[i] += l * g;
-            out_r[i] += r * g;
+            out_l[i] += l * g * gl;
+            out_r[i] += r * g * gr;
         }
+        self.out_gain = [gl, gr];
         if alive < n {
             self.kill();
             return false;

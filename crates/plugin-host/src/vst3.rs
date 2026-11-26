@@ -18,7 +18,7 @@ use crate::catalog::{Format, PluginDescription, ScannedLibrary};
 use crate::hosted::{MAX_PARAM_TEXT_CHARS, ParamTextCache};
 use crate::main_thread::MainThreadCell;
 use rawdawg_dsp::processor::{PrepareError, PrepareSpec, ProcessContext, Processor, Tail, sanitize_display_text};
-use rawdawg_types::events::{EventKind, TimedEvent};
+use rawdawg_types::events::{EventKind, NoteExpression, PITCH_NOTE_ID, TimedEvent};
 use rawdawg_types::params::ParamCategory;
 use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping, ParamUnit};
 use std::cell::{RefCell, UnsafeCell};
@@ -1574,7 +1574,7 @@ impl Vst3Processor {
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
-                    ev.__field0.noteOn = NoteOnEvent { channel: ch, pitch: i16::from(pitch), tuning: 0.0, velocity, length: 0, noteId: (note_id & 0x7FFF_FFFF) as i32 };
+                    ev.__field0.noteOn = NoteOnEvent { channel: ch, pitch: i16::from(pitch), tuning: 0.0, velocity, length: 0, noteId: vst3_note_id(note_id) };
                     list.push(ev);
                 }
                 EventKind::NoteOff { note_id, pitch } if self.layout.event_input => {
@@ -1584,17 +1584,31 @@ impl Vst3Processor {
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
-                    ev.__field0.noteOff = NoteOffEvent { channel: ch, pitch: i16::from(pitch), velocity: 0.0, noteId: (note_id & 0x7FFF_FFFF) as i32, tuning: 0.0 };
+                    ev.__field0.noteOff = NoteOffEvent { channel: ch, pitch: i16::from(pitch), velocity: 0.0, noteId: vst3_note_id(note_id), tuning: 0.0 };
                     list.push(ev);
                 }
-                EventKind::NotePressure { note_id, value } if self.layout.event_input => {
+                EventKind::NotePressure { note_id, value } | EventKind::NoteExpression { note_id, expression: NoteExpression::Pressure, value } if self.layout.event_input => {
                     if list.len() >= MAX_EVENTS {
                         continue;
                     }
+                    // a note without an id is addressed by its pitch
+                    let pitch = if note_id & PITCH_NOTE_ID != 0 { (note_id & 0x7F) as i16 } else { -1 };
                     let mut ev: Event = unsafe { std::mem::zeroed() };
                     ev.sampleOffset = t;
                     ev.r#type = Event_::EventTypes_::kPolyPressureEvent as u16;
-                    ev.__field0.polyPressure = PolyPressureEvent { channel: ch, pitch: -1, pressure: value, noteId: (note_id & 0x7FFF_FFFF) as i32 };
+                    ev.__field0.polyPressure = PolyPressureEvent { channel: ch, pitch, pressure: value.clamp(0.0, 1.0), noteId: vst3_note_id(note_id) };
+                    list.push(ev);
+                }
+                // VST3 addresses note expressions by note id only
+                EventKind::NoteExpression { note_id, expression, value } if self.layout.event_input && note_id & PITCH_NOTE_ID == 0 => {
+                    if list.len() >= MAX_EVENTS {
+                        continue;
+                    }
+                    let Some((type_id, normalized)) = note_expression_to_vst3(expression, value) else { continue };
+                    let mut ev: Event = unsafe { std::mem::zeroed() };
+                    ev.sampleOffset = t;
+                    ev.r#type = Event_::EventTypes_::kNoteExpressionValueEvent as u16;
+                    ev.__field0.noteExpressionValue = NoteExpressionValueEvent { typeId: type_id, noteId: (note_id & 0x7FFF_FFFF) as i32, value: normalized };
                     list.push(ev);
                 }
                 EventKind::Param { id, value } => {
@@ -1764,6 +1778,31 @@ impl Drop for Vst3Processor {
             let _ = self.return_tx.send(Returned(p));
         }
     }
+}
+
+/// A rawDAWg note id as a VST3 note id: −1 (none) for notes known only by their pitch.
+fn vst3_note_id(note_id: u32) -> i32 {
+    if note_id & PITCH_NOTE_ID != 0 { -1 } else { (note_id & 0x7FFF_FFFF) as i32 }
+}
+
+/// rawDAWg's note expression (CLAP ranges) as a VST3 type id and normalized value: volume
+/// `v / 4` (0.25 = 0 dB), tuning `v / 240 + 0.5`, the others unchanged. Pressure has no VST3
+/// note expression (it is sent as polyphonic pressure).
+pub fn note_expression_to_vst3(expression: NoteExpression, value: f32) -> Option<(u32, f64)> {
+    use NoteExpressionTypeIDs_::*;
+    let v = f64::from(value);
+    if !v.is_finite() {
+        return None;
+    }
+    Some(match expression {
+        NoteExpression::Volume => (kVolumeTypeID, (v / 4.0).clamp(0.0, 1.0)),
+        NoteExpression::Pan => (kPanTypeID, v.clamp(0.0, 1.0)),
+        NoteExpression::Tuning => (kTuningTypeID, (v / 240.0 + 0.5).clamp(0.0, 1.0)),
+        NoteExpression::Vibrato => (kVibratoTypeID, v.clamp(0.0, 1.0)),
+        NoteExpression::Expression => (kExpressionTypeID, v.clamp(0.0, 1.0)),
+        NoteExpression::Brightness => (kBrightnessTypeID, v.clamp(0.0, 1.0)),
+        NoteExpression::Pressure => return None,
+    })
 }
 
 #[cfg(test)]

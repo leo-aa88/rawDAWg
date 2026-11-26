@@ -788,6 +788,15 @@ pub struct ClapProcessor {
     values: Vec<f32>,
 }
 
+/// Who a per-note event addresses: the note with that id, or (a pitch id) the note on that key.
+fn expression_target(ch: u16, note_id: u32) -> Pckn {
+    if note_id & rawdawg_types::events::PITCH_NOTE_ID != 0 {
+        Pckn::new(0u16, ch, (note_id & 0x7F) as u16, Match::<u32>::All)
+    } else {
+        Pckn::new(0u16, ch, Match::<u16>::All, note_id & 0x7FFF_FFFF)
+    }
+}
+
 impl ClapProcessor {
     fn push_note_events(&mut self, events: &[TimedEvent]) {
         for e in events {
@@ -829,16 +838,11 @@ impl ClapProcessor {
                     self.events_in.push(&MidiEvent::new(t, 0, [0xD0 | ch as u8, (value * 127.0).round().clamp(0.0, 127.0) as u8, 0]));
                 }
                 EventKind::NotePressure { note_id, value } if self.layout.accepts_clap_notes => {
-                    self.events_in.push(&NoteExpressionEvent::new(
-                        t,
-                        Pckn::new(0u16, ch, Match::<u16>::All, note_id & 0x7FFF_FFFF),
-                        NoteExpressionType::Pressure,
-                        f64::from(value.clamp(0.0, 1.0)),
-                    ));
+                    self.events_in.push(&NoteExpressionEvent::new(t, expression_target(ch, note_id), NoteExpressionType::Pressure, f64::from(value.clamp(0.0, 1.0))));
                 }
                 EventKind::NoteExpression { note_id, expression, value } if self.layout.accepts_clap_notes => {
                     let (kind, v) = match expression {
-                        NoteExpression::Volume => (NoteExpressionType::Volume, f64::from(value.clamp(0.0, 1.0)) * 4.0),
+                        NoteExpression::Volume => (NoteExpressionType::Volume, f64::from(value.clamp(0.0, 4.0))),
                         NoteExpression::Pan => (NoteExpressionType::Pan, f64::from(value.clamp(0.0, 1.0))),
                         NoteExpression::Tuning => (NoteExpressionType::Tuning, f64::from(value.clamp(-120.0, 120.0))),
                         NoteExpression::Vibrato => (NoteExpressionType::Vibrato, f64::from(value.clamp(0.0, 1.0))),
@@ -846,7 +850,7 @@ impl ClapProcessor {
                         NoteExpression::Brightness => (NoteExpressionType::Brightness, f64::from(value.clamp(0.0, 1.0))),
                         NoteExpression::Pressure => (NoteExpressionType::Pressure, f64::from(value.clamp(0.0, 1.0))),
                     };
-                    self.events_in.push(&NoteExpressionEvent::new(t, Pckn::new(0u16, ch, Match::<u16>::All, note_id & 0x7FFF_FFFF), kind, v));
+                    self.events_in.push(&NoteExpressionEvent::new(t, expression_target(ch, note_id), kind, v));
                 }
                 EventKind::Param { id, value } => {
                     if let Some(i) = self.descriptors.iter().position(|d| d.id == id) {

@@ -20,7 +20,7 @@ use rawdawg_dsp::processor::{PrepareSpec, ProcessContext, Processor, TransportVi
 use rawdawg_dsp::{AudioBlock, BusLayout};
 use rawdawg_plugin_api::wrap::{EffectWrapper, parse_state, save_envelope, wrapper_descriptors};
 use rawdawg_plugin_api::{ExportedPlugin, WRAP_BYPASS, WRAP_MIX};
-use rawdawg_types::events::{EventKind, EventSource, TimedEvent, sort_events};
+use rawdawg_types::events::{EventKind, EventSource, NoteExpression, TimedEvent, sort_events};
 use rawdawg_types::{ParamDescriptor, ParamId, ParamMapping, ParamUnit};
 use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
@@ -275,6 +275,15 @@ impl Component {
                         let pitch = n.pitch.clamp(0, 127) as u8;
                         let note_id = if n.noteId < 0 { u32::from(pitch) | 0x8000_0000 } else { n.noteId as u32 };
                         st.events.push(TimedEvent::new(t, EventSource::Host, n.channel.clamp(0, 15) as u8, EventKind::NotePressure { note_id, value: n.pressure.clamp(0.0, 1.0) }));
+                    }
+                    Event_::EventTypes_::kNoteExpressionValueEvent => {
+                        let x = unsafe { e.__field0.noteExpressionValue };
+                        // VST3 addresses note expressions by note id only
+                        if x.noteId >= 0
+                            && let Some((expression, value)) = note_expression_from_vst3(x.typeId, x.value)
+                        {
+                            st.events.push(TimedEvent::new(t, EventSource::Host, 0, EventKind::NoteExpression { note_id: x.noteId as u32, expression, value }));
+                        }
                     }
                     _ => {}
                 }
@@ -700,7 +709,117 @@ impl std::ops::Deref for Controller {
 }
 
 impl Class for Controller {
-    type Interfaces = (IEditController,);
+    type Interfaces = (IEditController, INoteExpressionController);
+}
+
+/// The note expressions the synth understands: (VST3 type id, title, short title, units,
+/// bipolar, default normalized value).
+const NOTE_EXPRESSIONS: [(u32, &str, &str, &str, bool, f64); 6] = [
+    (NoteExpressionTypeIDs_::kVolumeTypeID, "Volume", "Vol", "dB", false, 0.25),
+    (NoteExpressionTypeIDs_::kPanTypeID, "Pan", "Pan", "", true, 0.5),
+    (NoteExpressionTypeIDs_::kTuningTypeID, "Tuning", "Tune", "semitones", true, 0.5),
+    (NoteExpressionTypeIDs_::kVibratoTypeID, "Vibrato", "Vib", "", false, 0.0),
+    (NoteExpressionTypeIDs_::kExpressionTypeID, "Expression", "Expr", "", false, 1.0),
+    (NoteExpressionTypeIDs_::kBrightnessTypeID, "Brightness", "Bright", "", true, 0.5),
+];
+
+/// A VST3 note expression value (normalized) as rawDAWg's expression in CLAP ranges: volume
+/// `4·v` (0.25 = 0 dB), tuning `240·(v − 0.5)` semitones, the others unchanged.
+pub fn note_expression_from_vst3(type_id: u32, normalized: f64) -> Option<(NoteExpression, f32)> {
+    if !normalized.is_finite() {
+        return None;
+    }
+    let v = normalized.clamp(0.0, 1.0);
+    let (expression, value) = match type_id {
+        NoteExpressionTypeIDs_::kVolumeTypeID => (NoteExpression::Volume, v * 4.0),
+        NoteExpressionTypeIDs_::kPanTypeID => (NoteExpression::Pan, v),
+        NoteExpressionTypeIDs_::kTuningTypeID => (NoteExpression::Tuning, (v - 0.5) * 240.0),
+        NoteExpressionTypeIDs_::kVibratoTypeID => (NoteExpression::Vibrato, v),
+        NoteExpressionTypeIDs_::kExpressionTypeID => (NoteExpression::Expression, v),
+        NoteExpressionTypeIDs_::kBrightnessTypeID => (NoteExpression::Brightness, v),
+        _ => return None,
+    };
+    // computed in f64 so values survive the host's normalization exactly
+    Some((expression, value as f32))
+}
+
+/// Readout of a note expression value, as hosts show it.
+fn note_expression_text(type_id: u32, normalized: f64) -> Option<String> {
+    let (expression, v) = note_expression_from_vst3(type_id, normalized)?;
+    Some(match expression {
+        NoteExpression::Volume if v <= 0.0 => "-inf dB".to_owned(),
+        NoteExpression::Volume => format!("{:.1} dB", 20.0 * v.log10()),
+        NoteExpression::Pan if (v - 0.5).abs() < 0.005 => "C".to_owned(),
+        NoteExpression::Pan if v < 0.5 => format!("L{:.0}", (0.5 - v) * 200.0),
+        NoteExpression::Pan => format!("R{:.0}", (v - 0.5) * 200.0),
+        NoteExpression::Tuning => format!("{v:+.2} st"),
+        _ => format!("{:.0} %", v * 100.0),
+    })
+}
+
+impl INoteExpressionControllerTrait for Controller {
+    unsafe fn getNoteExpressionCount(&self, bus_index: i32, _channel: i16) -> i32 {
+        if self.plugin.is_synth() && bus_index == 0 { NOTE_EXPRESSIONS.len() as i32 } else { 0 }
+    }
+    unsafe fn getNoteExpressionInfo(&self, bus_index: i32, _channel: i16, index: i32, info: *mut NoteExpressionTypeInfo) -> tresult {
+        if !self.plugin.is_synth() || bus_index != 0 || info.is_null() {
+            return kInvalidArgument;
+        }
+        let Some(&(type_id, title, short, units, bipolar, default)) = usize::try_from(index).ok().and_then(|i| NOTE_EXPRESSIONS.get(i)) else {
+            return kInvalidArgument;
+        };
+        // SAFETY: the host passes a valid, writable NoteExpressionTypeInfo (checked non-null).
+        let info = unsafe { &mut *info };
+        info.typeId = type_id;
+        copy_wstring(title, &mut info.title);
+        copy_wstring(short, &mut info.shortTitle);
+        copy_wstring(units, &mut info.units);
+        info.unitId = -1;
+        info.valueDesc = NoteExpressionValueDescription { defaultValue: default, minimum: 0.0, maximum: 1.0, stepCount: 0 };
+        info.associatedParameterId = u32::MAX;
+        let flags = NoteExpressionTypeInfo_::NoteExpressionTypeFlags_::kIsAbsolute | if bipolar { NoteExpressionTypeInfo_::NoteExpressionTypeFlags_::kIsBipolar } else { 0 };
+        // the flag enum's integer type differs between the SDK's Windows and Linux headers
+        info.flags = flags as i32;
+        kResultOk
+    }
+    unsafe fn getNoteExpressionStringByValue(&self, _bus_index: i32, _channel: i16, id: u32, value: f64, string: *mut String128) -> tresult {
+        let Some(text) = note_expression_text(id, value) else { return kInvalidArgument };
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: non-null, and the host passes a writable String128.
+        copy_wstring(&text, unsafe { &mut *string });
+        kResultOk
+    }
+    unsafe fn getNoteExpressionValueByString(&self, _bus_index: i32, _channel: i16, id: u32, string: *const TChar, value: *mut f64) -> tresult {
+        if string.is_null() || value.is_null() || note_expression_from_vst3(id, 0.5).is_none() {
+            return kInvalidArgument;
+        }
+        let Some(normalized) = note_expression_parse(id, &read_wstring(string, 128)) else { return kResultFalse };
+        // SAFETY: checked non-null; the host passes a writable f64.
+        unsafe { *value = normalized };
+        kResultOk
+    }
+}
+
+/// Parse a note expression readout ([`note_expression_text`]) back to its normalized value.
+fn note_expression_parse(type_id: u32, text: &str) -> Option<f64> {
+    let t = text.trim();
+    let number = |t: &str| t.trim_end_matches(|c: char| c.is_alphabetic() || c == '%' || c == ' ').trim().parse::<f64>().ok().filter(|n| n.is_finite());
+    let normalized = match type_id {
+        NoteExpressionTypeIDs_::kVolumeTypeID if t.starts_with("-inf") => 0.0,
+        NoteExpressionTypeIDs_::kVolumeTypeID => 10f64.powf(number(t)? / 20.0) / 4.0,
+        NoteExpressionTypeIDs_::kTuningTypeID => number(t)? / 240.0 + 0.5,
+        NoteExpressionTypeIDs_::kPanTypeID => match t.chars().next()? {
+            'C' | 'c' => 0.5,
+            'L' | 'l' => 0.5 - number(&t[1..])? / 200.0,
+            'R' | 'r' => 0.5 + number(&t[1..])? / 200.0,
+            _ => number(t)? / 200.0 + 0.5,
+        },
+        _ if note_expression_from_vst3(type_id, 0.5).is_some() => number(t)? / 100.0,
+        _ => return None,
+    };
+    Some(normalized.clamp(0.0, 1.0))
 }
 
 impl Controller {
@@ -976,4 +1095,70 @@ pub extern "system" fn ModuleExit() -> bool {
 #[unsafe(no_mangle)]
 pub extern "system" fn GetPluginFactory() -> *mut IPluginFactory {
     create_factory()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller(synth: bool) -> Controller {
+        let plugin = exported_plugins().iter().find(|p| p.is_synth() == synth).expect("an exported plugin of that kind");
+        Controller::new(plugin).expect("controller")
+    }
+
+    #[test]
+    fn the_synth_lists_its_note_expressions_and_effects_list_none() {
+        let synth = controller(true);
+        // SAFETY (all calls below): plain Rust calls on our own controller with valid pointers.
+        assert_eq!(unsafe { synth.getNoteExpressionCount(0, 3) }, NOTE_EXPRESSIONS.len() as i32);
+        assert_eq!(unsafe { synth.getNoteExpressionCount(1, 0) }, 0, "only the event bus");
+        assert_eq!(unsafe { controller(false).getNoteExpressionCount(0, 0) }, 0);
+        let mut info: NoteExpressionTypeInfo = unsafe { std::mem::zeroed() };
+        let mut ids = Vec::new();
+        for i in 0..NOTE_EXPRESSIONS.len() as i32 {
+            assert_eq!(unsafe { synth.getNoteExpressionInfo(0, 0, i, &mut info) }, kResultOk);
+            assert_eq!(info.valueDesc.minimum, 0.0);
+            assert_eq!(info.valueDesc.maximum, 1.0);
+            let bipolar = info.flags as u32 & NoteExpressionTypeInfo_::NoteExpressionTypeFlags_::kIsBipolar as u32 != 0;
+            assert_eq!(bipolar, matches!(info.typeId, NoteExpressionTypeIDs_::kPanTypeID | NoteExpressionTypeIDs_::kTuningTypeID | NoteExpressionTypeIDs_::kBrightnessTypeID));
+            assert!(read_wstring(info.title.as_ptr(), 128).len() > 2);
+            // the default is neutral: no change to the note
+            let (expression, neutral) = note_expression_from_vst3(info.typeId, info.valueDesc.defaultValue).unwrap();
+            let expected = match expression {
+                NoteExpression::Volume | NoteExpression::Expression => 1.0,
+                NoteExpression::Pan | NoteExpression::Brightness => 0.5,
+                _ => 0.0,
+            };
+            assert_eq!(neutral, expected, "{expression:?}");
+            ids.push(info.typeId);
+        }
+        assert_eq!(ids.len(), 6);
+        assert_eq!(unsafe { synth.getNoteExpressionInfo(0, 0, 6, &mut info) }, kInvalidArgument);
+        assert_eq!(unsafe { synth.getNoteExpressionInfo(0, 0, -1, &mut info) }, kInvalidArgument);
+    }
+
+    #[test]
+    fn note_expression_values_convert_to_clap_ranges_and_readouts_parse_back() {
+        assert_eq!(note_expression_from_vst3(NoteExpressionTypeIDs_::kVolumeTypeID, 0.25), Some((NoteExpression::Volume, 1.0)));
+        assert_eq!(note_expression_from_vst3(NoteExpressionTypeIDs_::kTuningTypeID, 0.55), Some((NoteExpression::Tuning, 12.0)));
+        assert_eq!(note_expression_from_vst3(NoteExpressionTypeIDs_::kTuningTypeID, 0.0), Some((NoteExpression::Tuning, -120.0)));
+        assert_eq!(note_expression_from_vst3(NoteExpressionTypeIDs_::kTextTypeID, 0.5), None, "text and phonemes are not sounds");
+        assert_eq!(note_expression_from_vst3(NoteExpressionTypeIDs_::kPanTypeID, f64::NAN), None);
+        let synth = controller(true);
+        for &(id, ..) in &NOTE_EXPRESSIONS {
+            for v in [0.0, 0.1, 0.25, 0.5, 0.8, 1.0] {
+                let mut text: String128 = [0; 128];
+                assert_eq!(unsafe { synth.getNoteExpressionStringByValue(0, 0, id, v, &mut text) }, kResultOk);
+                let shown = read_wstring(text.as_ptr(), 128);
+                let mut back = -1.0;
+                let r = unsafe { synth.getNoteExpressionValueByString(0, 0, id, text.as_ptr(), &mut back) };
+                if id == NoteExpressionTypeIDs_::kVolumeTypeID && v == 0.0 {
+                    assert_eq!(shown, "-inf dB");
+                }
+                assert_eq!(r, kResultOk, "{id} {v} {shown:?}");
+                // readouts are rounded for display: tolerance of one display step
+                assert!((back - v).abs() < 0.006, "{id}: {v} → {shown:?} → {back}");
+            }
+        }
+    }
 }

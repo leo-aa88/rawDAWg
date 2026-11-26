@@ -79,15 +79,44 @@ pub enum EventKind {
     },
 }
 
+/// Per-note expressions with CLAP's value ranges.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum NoteExpression {
+    /// Linear gain 0..4 (1 = unchanged).
     Volume,
+    /// 0 = left, 0.5 = centre, 1 = right.
     Pan,
+    /// Semitones, −120..120.
     Tuning,
+    /// Vibrato depth 0..1.
     Vibrato,
+    /// Gain 0..1 (like MIDI CC 11).
     Expression,
+    /// Brightness 0..1 (0.5 neutral; like MIDI CC 74).
     Brightness,
+    /// Pressure 0..1.
     Pressure,
+}
+
+impl NoteExpression {
+    pub const ALL: [NoteExpression; 7] = [
+        NoteExpression::Volume,
+        NoteExpression::Pan,
+        NoteExpression::Tuning,
+        NoteExpression::Vibrato,
+        NoteExpression::Expression,
+        NoteExpression::Brightness,
+        NoteExpression::Pressure,
+    ];
+}
+
+/// Flag on a note id that means "the note at this pitch", for hosts and MIDI streams that send
+/// no note ids; the low 7 bits hold the pitch.
+pub const PITCH_NOTE_ID: u32 = 0x8000_0000;
+
+/// The note id for a note known only by its pitch.
+pub fn pitch_note_id(pitch: u8) -> u32 {
+    u32::from(pitch & 0x7F) | PITCH_NOTE_ID
 }
 
 impl EventKind {

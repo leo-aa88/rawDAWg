@@ -381,11 +381,60 @@ fn from_plain_rt(table: &[(u32, f64, f64)], id: u32, value: f64) -> Option<f32> 
 }
 
 fn note_id_of(raw_note_id: i32, pitch: u8) -> u32 {
-    if raw_note_id < 0 { u32::from(pitch) | 0x8000_0000 } else { raw_note_id as u32 }
+    if raw_note_id < 0 { rawdawg_types::events::pitch_note_id(pitch) } else { raw_note_id as u32 }
+}
+
+/// The start of CLAP's `clap_event_note_expression` (header, then the expression id), as laid
+/// out by the CLAP ABI.
+#[repr(C)]
+struct RawExpressionPrefix {
+    size: u32,
+    time: u32,
+    space_id: u16,
+    event_type: u16,
+    flags: u32,
+    expression_id: i32,
+}
+
+/// `CLAP_NOTE_EXPRESSION_EXPRESSION`.
+const CLAP_NOTE_EXPRESSION_EXPRESSION: i32 = 4;
+
+/// clack 0.2.0's `NoteExpressionType::from_raw` has no case for
+/// `CLAP_NOTE_EXPRESSION_EXPRESSION` (its `expression_type()` returns `None` for it), so that
+/// one type is read from the raw event.
+fn raw_expression(ev: &clack_plugin::events::UnknownEvent) -> Option<rawdawg_types::events::NoteExpression> {
+    let header = ev.as_raw();
+    // SAFETY: `ev` is a live event from the host's input list, which starts with a
+    // `clap_event_header` (`size` first); the prefix is read only when the event says it is at
+    // least that large, and `read_unaligned` makes no alignment assumption.
+    let prefix = unsafe {
+        if (header.cast::<u32>().read_unaligned() as usize) < std::mem::size_of::<RawExpressionPrefix>() {
+            return None;
+        }
+        header.cast::<RawExpressionPrefix>().read_unaligned()
+    };
+    (prefix.expression_id == CLAP_NOTE_EXPRESSION_EXPRESSION).then_some(rawdawg_types::events::NoteExpression::Expression)
+}
+
+/// CLAP note expressions use the ranges rawDAWg's events are documented in.
+fn note_expression_of(t: clack_plugin::events::event_types::NoteExpressionType) -> Option<rawdawg_types::events::NoteExpression> {
+    use clack_plugin::events::event_types::NoteExpressionType as T;
+    use rawdawg_types::events::NoteExpression as E;
+    Some(match t {
+        T::Volume => E::Volume,
+        T::Pan => E::Pan,
+        T::Tuning => E::Tuning,
+        T::Vibrato => E::Vibrato,
+        T::Expression => E::Expression,
+        T::Brightness => E::Brightness,
+        T::Pressure => E::Pressure,
+        _ => return None,
+    })
 }
 
 fn translate_events(input: &InputEvents<'_>, out: &mut Vec<TimedEvent>, frames: u32, discrete: &[(u32, f64, f64)]) {
-    use clack_plugin::events::event_types::{MidiEvent, NoteChokeEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
+    use clack_plugin::events::Match;
+    use clack_plugin::events::event_types::{MidiEvent, NoteChokeEvent, NoteExpressionEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
     out.clear();
     for ev in input.iter() {
         if out.len() >= MAX_EVENTS {
@@ -411,6 +460,22 @@ fn translate_events(input: &InputEvents<'_>, out: &mut Vec<TimedEvent>, frames: 
             let raw = n.as_raw();
             let pitch = raw.key.clamp(0, 127) as u8;
             out.push(TimedEvent::note_off(time, EventSource::Host, raw.channel.clamp(0, 15) as u8, note_id_of(raw.note_id, pitch), pitch));
+        } else if let Some(x) = ev.as_event::<NoteExpressionEvent>() {
+            // a note by its id, or (no id) by its key on its channel; whole-channel wildcards are ignored
+            let channel = match x.channel() {
+                Match::Specific(c) => c.min(15) as u8,
+                Match::All => 0,
+            };
+            let note_id = match (x.note_id(), x.key()) {
+                (Match::Specific(id), _) => id,
+                (Match::All, Match::Specific(key)) if matches!(x.channel(), Match::Specific(_)) => rawdawg_types::events::pitch_note_id(key.min(127) as u8),
+                _ => continue,
+            };
+            if let Some(expression) = x.expression_type().and_then(note_expression_of).or_else(|| raw_expression(ev))
+                && x.value().is_finite()
+            {
+                out.push(TimedEvent::new(time, EventSource::Host, channel, EventKind::NoteExpression { note_id, expression, value: x.value() as f32 }));
+            }
         } else if let Some(p) = ev.as_event::<ParamValueEvent>() {
             if let Some(id) = p.param_id()
                 && let Some(v) = from_plain_rt(discrete, id.get(), p.value())

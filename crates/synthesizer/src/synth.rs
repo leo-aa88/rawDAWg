@@ -14,14 +14,23 @@ use rawdawg_dsp::rng::DeterministicRng;
 use rawdawg_dsp::smooth::Smoother;
 use rawdawg_dsp::wavetable::MipTable;
 use rawdawg_types::ParamId;
-use rawdawg_types::events::{EventKind, TimedEvent};
+use rawdawg_types::events::{EventKind, PITCH_NOTE_ID, TimedEvent};
 
 /// Extra voice slots reserved so stolen voices can fade out instead of clicking.
 pub const SPARE_VOICES: usize = 8;
 const CC_MOD_WHEEL: u8 = 1;
 const CC_SUSTAIN: u8 = 64;
+/// MPE "timbre" / brightness.
+const CC_TIMBRE: u8 = 74;
 const CC_ALL_SOUND_OFF: u8 = 120;
 const CC_ALL_NOTES_OFF: u8 = 123;
+
+/// Does a per-note event for `note_id` (from `source` on `channel`) address the note `key`?
+/// A real id names one note of that source; a pitch id ([`PITCH_NOTE_ID`]) names the note at
+/// that pitch on that channel.
+fn addresses(key: NoteKey, source: u8, channel: u8, note_id: u32) -> bool {
+    key.source == source && if note_id & PITCH_NOTE_ID != 0 { key.channel == channel && u32::from(key.pitch) == note_id & 0x7F } else { key.note_id == note_id }
+}
 
 /// Health counters readable off-thread after `process` (copied, not shared).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +55,8 @@ pub struct Synth {
     bend: [f32; 16],
     mod_wheel: [f32; 16],
     aftertouch: [f32; 16],
+    /// CC 74 per channel (MPE "timbre"), 0..1.
+    timbre: [f32; 16],
     master: Smoother,
     age: u64,
     sample_rate: f64,
@@ -86,6 +97,7 @@ impl Synth {
             bend: [0.0; 16],
             mod_wheel: [0.0; 16],
             aftertouch: [0.0; 16],
+            timbre: [0.5; 16],
             master: Smoother::new(0.0, 0.0, 48_000.0),
             age: 0,
             sample_rate: 48_000.0,
@@ -282,6 +294,7 @@ impl Synth {
         let ch = usize::from(key.channel) % 16;
         let bend = self.bend[ch] * self.patch.tuning.bend_range_semitones;
         let (mw, at) = (self.mod_wheel[ch], self.aftertouch[ch]);
+        let timbre = self.timbre[ch];
         match self.patch.voice_mode {
             VoiceMode::Poly => {
                 let slot = match self.voices.iter().position(|v| v.key == Some(key)) {
@@ -292,6 +305,7 @@ impl Synth {
                 let v = &mut self.voices[slot];
                 v.set_bend(bend);
                 v.set_controllers(mw, at);
+                v.set_timbre(timbre);
                 v.note_on(key, velocity, age, target, self.patch.portamento_s, true, layers);
             }
             VoiceMode::MonoRetrigger | VoiceMode::MonoLegato => {
@@ -302,6 +316,7 @@ impl Synth {
                 let v = &mut self.voices[0];
                 v.set_bend(bend);
                 v.set_controllers(mw, at);
+                v.set_timbre(timbre);
                 v.note_on(key, velocity, age, target, self.patch.portamento_s, !legato, layers);
                 self.mono_active = Some(key);
             }
@@ -386,6 +401,7 @@ impl Synth {
         self.held.clear();
         self.sustain.clear();
         self.bend = [0.0; 16];
+        self.timbre = [0.5; 16];
         self.mono_active = None;
     }
 
@@ -420,6 +436,14 @@ impl Synth {
                         self.release_sustained(source, ev.channel);
                     }
                 }
+                CC_TIMBRE => {
+                    self.timbre[ch] = value;
+                    for v in self.voices.iter_mut() {
+                        if v.key.is_some_and(|k| k.channel == ev.channel) {
+                            v.set_timbre(value);
+                        }
+                    }
+                }
                 CC_ALL_NOTES_OFF => self.all_notes_off(Some(source)),
                 CC_ALL_SOUND_OFF => self.hard_reset(),
                 _ => {}
@@ -449,7 +473,22 @@ impl Synth {
             EventKind::Param { id, value } => {
                 self.apply_param(id, value);
             }
-            EventKind::ParamMod { .. } | EventKind::NotePressure { .. } | EventKind::NoteExpression { .. } => {}
+            EventKind::NotePressure { note_id, value } => {
+                for v in self.voices.iter_mut() {
+                    if v.key.is_some_and(|k| addresses(k, source, ev.channel, note_id)) {
+                        v.set_note_pressure(value);
+                    }
+                }
+            }
+            EventKind::NoteExpression { note_id, expression, value } => {
+                // expression keeps shaping a released note's tail (a pitch glide on release is musical)
+                for v in self.voices.iter_mut() {
+                    if v.key.is_some_and(|k| addresses(k, source, ev.channel, note_id)) {
+                        v.set_expression(expression, value);
+                    }
+                }
+            }
+            EventKind::ParamMod { .. } => {}
         }
     }
 
@@ -748,6 +787,7 @@ impl Processor for Synth {
         std::mem::swap(&mut self.bend, &mut old.bend);
         std::mem::swap(&mut self.mod_wheel, &mut old.mod_wheel);
         std::mem::swap(&mut self.aftertouch, &mut old.aftertouch);
+        std::mem::swap(&mut self.timbre, &mut old.timbre);
         std::mem::swap(&mut self.age, &mut old.age);
         std::mem::swap(&mut self.mono_active, &mut old.mono_active);
         std::mem::swap(&mut self.layers, &mut old.layers);
