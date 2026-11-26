@@ -38,19 +38,21 @@
         </File>
         <!-- Presets open (import) in rawDAWg; projects open through the project.rawdawg marker
              file every saved project folder carries (folders cannot be associated by suffix). -->
-        <ProgId Id="rawDAWg.Preset" Description="rawDAWg preset" Icon="rawdawg.ico">
+        <!-- non-advertised ProgIds take their icon from an installed file (RawdawgIcoFile below);
+             the advertised shortcut uses the Icon element -->
+        <ProgId Id="rawDAWg.Preset" Description="rawDAWg preset" Icon="RawdawgIcoFile">
           <Extension Id="rawdawgpreset" ContentType="application/x-rawdawg-preset">
             <Verb Id="open" Command="Open" TargetFile="rawdawg.exe" Argument="--open &quot;%1&quot;" />
           </Extension>
         </ProgId>
-        <ProgId Id="rawDAWg.Project" Description="rawDAWg project" Icon="rawdawg.ico">
+        <ProgId Id="rawDAWg.Project" Description="rawDAWg project" Icon="RawdawgIcoFile">
           <Extension Id="rawdawg" ContentType="application/x-rawdawg-project">
             <Verb Id="open" Command="Open" TargetFile="rawdawg.exe" Argument="--open &quot;%1&quot;" />
           </Extension>
         </ProgId>
       </Component>
       <Component Id="IconFileComponent" Guid="7A57D4A6-0A03-4B00-9F2C-B0A53E110003">
-        <File Source="$(var.Payload)\rawdawg.ico" />
+        <File Id="RawdawgIcoFile" Source="$(var.Payload)\rawdawg.ico" />
       </Component>
     </ComponentGroup>
     <ComponentGroup Id="Docs" Directory="DocsFolder">

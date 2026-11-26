@@ -79,16 +79,28 @@ jobs:
       - name: Package (deb)
         if: runner.os == 'Linux'
         run: cargo xtask package --format deb
+      # one native command per step: in a multi-line PowerShell step only the last command's exit
+      # code counts, which once hid a failed MSI build behind a successful portable zip
       - name: Install WiX
         if: runner.os == 'Windows'
-        run: |
-          dotnet tool install --global wix --version 5.0.2
-          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
-      - name: Package (msi + portable)
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Put dotnet tools on PATH
         if: runner.os == 'Windows'
+        run: Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.dotnet\tools"
+      - name: Package (msi)
+        if: runner.os == 'Windows'
+        run: cargo xtask package --format msi
+      - name: Package (portable)
+        if: runner.os == 'Windows'
+        run: cargo xtask package --format portable
+      - name: Check that every package was produced
+        shell: bash
         run: |
-          cargo xtask package --format msi
-          cargo xtask package --format portable
+          cd target/package
+          if [ "$RUNNER_OS" = "Linux" ]; then expected="rawdawg-*-x86_64.deb lintian.txt"; else expected="rawdawg-*-x86_64.msi rawdawg-*-x86_64.zip"; fi
+          for pattern in $expected SHA256SUMS; do ls -l $pattern || { echo "missing: $pattern"; exit 1; }; done
+          for pattern in $expected; do case $pattern in *.txt) ;; *) grep -q "  $(basename $(ls $pattern))\$" SHA256SUMS || { echo "no checksum for $pattern"; exit 1; } ;; esac; done
+          cat SHA256SUMS
       - name: Upload Ubuntu package (unsigned)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
