@@ -1023,12 +1023,13 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             std::fs::create_dir_all(&plugins)?;
             std::fs::copy(&module, plugins.join("rawDAWg.clap"))?;
             std::fs::write(plugins.join("broken.clap"), b"not a plugin")?;
-            // the VST3 bundle laid out by PL-01, installed under the temporary HOME's ~/.vst3
+            // the VST3 bundle laid out by PL-01, installed in the per-user VST3 folder of a
+            // temporary home ($HOME/.vst3 on Linux, %LOCALAPPDATA%\Programs\Common\VST3 on Windows)
             let vst3_src = out.join("bundles").join("rawDAWg.vst3");
             if !vst3_src.is_dir() {
                 bail!("PL-01 bundle missing at {}", vst3_src.display());
             }
-            let vst3_root = base.join("home").join(".vst3").join("rawDAWg.vst3");
+            let vst3_root = user_vst3_dir(&base.join("home")).join("rawDAWg.vst3");
             for entry in walkdir(&vst3_src)? {
                 let rel = entry.strip_prefix(&vst3_src)?.to_path_buf();
                 if entry.is_dir() {
@@ -1040,7 +1041,10 @@ fn plugin_checks(root: &Path, out: &Path) -> Vec<Check> {
             }
             let catalog = base.join("plugins.json");
             // 1. scan through the CLI (each module in its own child process)
-            let o = Command::new(&exe).args(["--scan-plugins", "--catalog"]).arg(&catalog).env("CLAP_PATH", &plugins).env("HOME", base.join("home")).output()?;
+            let mut scan = Command::new(&exe);
+            scan.args(["--scan-plugins", "--catalog"]).arg(&catalog).env("CLAP_PATH", &plugins);
+            isolate_plugin_roots(&mut scan, &base)?;
+            let o = scan.output()?;
             if !o.status.success() {
                 bail!("--scan-plugins failed: {}", String::from_utf8_lossy(&o.stderr));
             }
@@ -1250,6 +1254,21 @@ pub fn run(root: &Path, suite: Suite) -> anyhow::Result<()> {
     if failed > 0 {
         bail!("{failed} check(s) FAILED");
     }
+    Ok(())
+}
+
+/// The per-user VST3 folder under a (temporary) home directory, as the scanner finds it.
+fn user_vst3_dir(home: &Path) -> std::path::PathBuf {
+    if cfg!(target_os = "windows") { home.join("Programs").join("Common").join("VST3") } else { home.join(".vst3") }
+}
+
+/// Point a scanner run's user and system plugin folders into `base` so only the plugins the
+/// check installed there are found: `HOME` (Linux), `LOCALAPPDATA` and an empty
+/// `COMMONPROGRAMFILES` (Windows).
+fn isolate_plugin_roots(cmd: &mut Command, base: &Path) -> anyhow::Result<()> {
+    let system = base.join("system");
+    std::fs::create_dir_all(&system)?;
+    cmd.env("HOME", base.join("home")).env("LOCALAPPDATA", base.join("home")).env("COMMONPROGRAMFILES", system);
     Ok(())
 }
 
