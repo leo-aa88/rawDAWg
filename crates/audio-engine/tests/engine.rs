@@ -1263,3 +1263,124 @@ fn third_party_instances_compile_as_stand_ins_and_their_state_is_preserved() {
     assert_eq!(std::fs::read(copy.join(&blob_name)).unwrap(), blob, "opaque state copied by Save As");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Two playing synths: one through latency- and tail-bearing inserts (delay, chorus, a
+/// spectral effect at 50 % wet/dry so its latency-aligned dry line carries audio, a lookahead
+/// limiter), one with no inserts, so its paths into the master and the reverb bus need
+/// latency compensation; both send to a reverb bus; master protection on.
+fn swap_test_project() -> Project {
+    use rawdawg_project::{Instance, Lane, MixerChannel, Send, SendTap};
+    let mut p = project_with_notes(&[(0, 960, 60), (960, 960, 64), (1920, 1920, 67)]);
+    p.mixer.master_protection = true;
+    let master = p.mixer.master_id;
+    let bus = rawdawg_types::MixerChannelId::new();
+    let plain = rawdawg_types::MixerChannelId::new();
+    let strip = |id, name: &str, inserts: Vec<Instance>, sends: Vec<Send>| MixerChannel {
+        id,
+        name: name.into(),
+        color: None,
+        gain_db: rawdawg_types::units::Db(0.0),
+        pan: rawdawg_types::units::Pan::CENTER,
+        mute: false,
+        solo: false,
+        inserts,
+        sends,
+        output_id: Some(master),
+    };
+    let to_bus = || Send { target_id: bus, level_db: rawdawg_types::units::Db(-6.0), tap: SendTap::PostFader, sidechain: false };
+    p.mixer.channels.push(strip(bus, "Verb bus", vec![Instance::native("native.fx.reverb", serde_json::Value::Null)], vec![]));
+    p.mixer.channels.push(strip(plain, "Plain", vec![], vec![to_bus()]));
+    let ch_mixer = p.channels[0].mixer_id;
+    let ch = p.mixer.channels.iter_mut().find(|m| m.id == ch_mixer).unwrap();
+    let mut spectral = Instance::native("native.fx.spectral", serde_json::Value::Null);
+    spectral.mix = 0.5;
+    ch.inserts = vec![
+        Instance::native("native.fx.delay", serde_json::Value::Null),
+        Instance::native("native.fx.chorus", serde_json::Value::Null),
+        spectral,
+        Instance::native("native.fx.limiter", serde_json::Value::Null),
+    ];
+    ch.sends.push(to_bus());
+    // a second synth on the plain strip, playing its own notes
+    let mut second = p.channels[0].clone();
+    second.id = rawdawg_types::ChannelId::new();
+    second.instrument.id = rawdawg_types::InstanceId::new();
+    second.name = "Second".into();
+    second.mixer_id = plain;
+    let notes = [(480, 1440, 48), (2400, 1200, 55)].map(|(t, d, k)| Note { id: NoteId::new(), tick: Tick(t), duration_ticks: Tick(d), pitch: k, velocity: 0.8, channel: 0 });
+    p.patterns[0].lanes.push(Lane { channel_id: second.id, notes: notes.to_vec(), controllers: vec![] });
+    p.channels.push(second);
+    rawdawg_project::validate(&p).unwrap();
+    p
+}
+
+/// Render `blocks` blocks, publishing `swap` (compiled from `project`) before block `at`.
+fn render_with_swap(project: &Project, swap: Option<(&Project, usize)>, blocks: usize) -> Vec<f32> {
+    let limits = EngineLimits::DEFAULT;
+    let (mut engine, mut handle) = Engine::new(SampleRate(48_000), 256, &limits);
+    let first = compile(project, 1, 256, &limits, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap();
+    let live = first.fingerprints.clone();
+    engine.install_plan(first.plan);
+    assert!(handle.send(EngineCommand::Play).is_ok());
+    let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+    let mut out = Vec::with_capacity(blocks * 512);
+    for b in 0..blocks {
+        if let Some((next, at)) = swap
+            && b == at
+        {
+            let second = compile(next, 2, 256, &limits, &live, &rawdawg_audio_engine::NoAssets).unwrap();
+            assert!(handle.publish_plan(second.plan).is_ok());
+        }
+        l.fill(0.0);
+        r.fill(0.0);
+        engine.render_block(&mut l, &mut r);
+        out.extend_from_slice(&l);
+        out.extend_from_slice(&r);
+    }
+    out
+}
+
+#[test]
+fn recompiling_unchanged_processors_is_sample_exact_through_tails_latency_and_the_limiter() {
+    let p = swap_test_project();
+    let plan = compile(&p, 1, 256, &EngineLimits::DEFAULT, &Default::default(), &rawdawg_audio_engine::NoAssets).unwrap().plan;
+    assert!(plan.mixer.iter().flat_map(|m| m.inserts.iter()).any(|i| i.has_mix && i.latency > 0), "a latency-bearing insert mixes with its dry line");
+    assert!(plan.channels.iter().any(|c| c.comp_frames > 0) || plan.mixer.iter().any(|m| m.comp_frames > 0), "a path into the master is latency-compensated");
+    assert!(plan.mixer.iter().flat_map(|m| m.sends.iter()).any(|s| s.comp_frames > 0), "a send into the bus is latency-compensated");
+    let reference = render_with_swap(&p, None, 400);
+    assert!(rms(&reference) > 0.01, "the test project is audible");
+    // the same project recompiled mid-note and mid-tail
+    let swapped = render_with_swap(&p, Some((&p, 150)), 400);
+    let diff = reference.iter().zip(&swapped).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert_eq!(diff, 0.0, "a recompile with unchanged state changed the output (max diff {diff})");
+    // structural edits elsewhere (a new empty bus inserted first, so every mixer index
+    // shifts; a new silent channel; a renamed bus) keep every unchanged processor, delay line,
+    // send and the limiter running
+    let mut edited = p.clone();
+    let master = edited.mixer.master_id;
+    edited.mixer.channels.insert(
+        0,
+        rawdawg_project::MixerChannel {
+            id: rawdawg_types::MixerChannelId::new(),
+            name: "Empty bus".into(),
+            color: None,
+            gain_db: rawdawg_types::units::Db(0.0),
+            pan: rawdawg_types::units::Pan::CENTER,
+            mute: false,
+            solo: false,
+            inserts: vec![rawdawg_project::Instance::native("native.fx.delay", serde_json::Value::Null)],
+            sends: vec![],
+            output_id: Some(master),
+        },
+    );
+    let mut silent = edited.channels[0].clone();
+    silent.id = rawdawg_types::ChannelId::new();
+    silent.instrument.id = rawdawg_types::InstanceId::new();
+    silent.name = "Silent".into();
+    edited.channels.push(silent);
+    edited.mixer.channels.iter_mut().find(|m| m.name == "Verb bus").unwrap().name = "Reverb".into();
+    rawdawg_project::validate(&edited).unwrap();
+    let swapped = render_with_swap(&p, Some((&edited, 150)), 400);
+    let diff = reference.iter().zip(&swapped).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert_eq!(diff, 0.0, "an unrelated edit changed the output (max diff {diff})");
+}

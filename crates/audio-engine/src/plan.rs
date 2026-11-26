@@ -109,6 +109,19 @@ pub struct SendNode {
     pub comp: [DelayLine; 2],
 }
 
+/// Sends per mixer node whose state carries over a recompile (more keep working, fresh).
+const MAX_SENDS_MATCHED: usize = 32;
+
+/// Continue a running processor in the new plan (see [`Plan::migrate_from`]).
+fn carry_processor(new: &mut Box<dyn Processor>, old: &mut Box<dyn Processor>) {
+    if !new.carries_live_state() && Processor::type_id(new.as_ref()) == Processor::type_id(old.as_ref()) {
+        // same type and state, prepared with the same spec: the running instance continues
+        std::mem::swap(new, old);
+    } else {
+        new.migrate_from(old.as_mut());
+    }
+}
+
 /// Everything the RT thread needs; immutable topology, mutable DSP state.
 pub struct Plan {
     pub revision: u64,
@@ -787,27 +800,68 @@ impl Plan {
         self.slot_instances.iter().position(|x| *x == id)
     }
 
-    /// RT-safe, bounded: move live state from `old` into this plan's carried-over channels.
+    /// RT-safe, bounded: move live state from `old` into this plan, so a recompile changes
+    /// only what was edited.
+    ///
+    /// - A processor whose state did not change (`carry_over`) continues running: native
+    ///   processors are swapped in whole (voices, delay lines, reverb tails, envelopes and
+    ///   smoothers continue sample for sample); hosted plugins move their running audio half
+    ///   through `migrate_from`.
+    /// - Latency compensation and dry lines, gain and mix smoothers of channels, mixer nodes,
+    ///   inserts and sends that still exist carry their contents when their lengths match.
+    /// - The master limiter keeps its envelope and lookahead.
+    ///
+    /// Only pointer swaps and smoother snaps; `old` ends up holding the fresh state and is
+    /// retired off the audio thread.
     pub fn migrate_from(&mut self, old: &mut Plan) {
         if old.sample_rate != self.sample_rate || old.max_frames != self.max_frames {
             return;
         }
-        for node in self.channels.iter_mut().filter(|n| n.carry_over) {
-            if let Some(prev) = old.channels.iter_mut().find(|o| o.instance_id == node.instance_id) {
-                node.processor.migrate_from(prev.processor.as_mut());
-                node.gain.snap(prev.gain.current());
+        for node in self.channels.iter_mut() {
+            let Some(prev) = old.channels.iter_mut().find(|o| o.instance_id == node.instance_id) else { continue };
+            if node.carry_over {
+                carry_processor(&mut node.processor, &mut prev.processor);
+            }
+            node.gain.snap(prev.gain.current());
+            if node.comp_frames == prev.comp_frames {
+                std::mem::swap(&mut node.comp, &mut prev.comp);
             }
         }
-        for node in self.mixer.iter_mut() {
-            if let Some(prev) = old.mixer.iter_mut().find(|o| o.id == node.id) {
-                node.gain.snap(prev.gain.current());
-                for ins in node.inserts.iter_mut().filter(|i| i.carry_over) {
-                    if let Some(pi) = prev.inserts.iter_mut().find(|o| o.instance_id == ins.instance_id) {
-                        ins.processor.migrate_from(pi.processor.as_mut());
-                        ins.mix.snap(pi.mix.current());
+        for mi in 0..self.mixer.len() {
+            let id = self.mixer[mi].id;
+            let Some(pi) = old.mixer.iter().position(|o| o.id == id) else { continue };
+            // send targets by id (mixer indices may differ between plans)
+            let targets: [Option<MixerChannelId>; MAX_SENDS_MATCHED] = std::array::from_fn(|k| self.mixer[mi].sends.get(k).map(|s| self.mixer[s.target_index].id));
+            let prev_targets: [Option<MixerChannelId>; MAX_SENDS_MATCHED] = std::array::from_fn(|k| old.mixer[pi].sends.get(k).map(|s| old.mixer[s.target_index].id));
+            let (node, prev) = (&mut self.mixer[mi], &mut old.mixer[pi]);
+            node.gain.snap(prev.gain.current());
+            if node.comp_frames == prev.comp_frames {
+                std::mem::swap(&mut node.comp, &mut prev.comp);
+            }
+            for ins in node.inserts.iter_mut() {
+                let Some(p) = prev.inserts.iter_mut().find(|o| o.instance_id == ins.instance_id) else { continue };
+                if ins.carry_over {
+                    carry_processor(&mut ins.processor, &mut p.processor);
+                }
+                ins.mix.snap(p.mix.current());
+                if ins.latency == p.latency {
+                    std::mem::swap(&mut ins.dry, &mut p.dry);
+                }
+            }
+            let mut used = [false; MAX_SENDS_MATCHED];
+            for (k, send) in node.sends.iter_mut().enumerate().take(MAX_SENDS_MATCHED) {
+                let found = (0..prev.sends.len().min(MAX_SENDS_MATCHED))
+                    .find(|&j| !used[j] && prev_targets[j] == targets[k] && prev.sends[j].sidechain == send.sidechain && prev.sends[j].pre_fader == send.pre_fader);
+                if let Some(j) = found {
+                    used[j] = true;
+                    let p = &mut prev.sends[j];
+                    send.gain.snap(p.gain.current());
+                    if send.comp_frames == p.comp_frames {
+                        std::mem::swap(&mut send.comp, &mut p.comp);
                     }
                 }
             }
         }
+        std::mem::swap(&mut self.master_limiter, &mut old.master_limiter);
     }
 }
