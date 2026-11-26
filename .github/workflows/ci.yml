@@ -72,7 +72,7 @@ jobs:
         run: cargo xtask fixtures
       - name: Headless verification suite
         run: cargo xtask verify --suite headless
-      - name: Plugin verification suite (Ubuntu: under Xvfb for the editor window checks)
+      - name: Plugin verification suite (Ubuntu, under Xvfb for the editor window checks)
         if: runner.os == 'Linux'
         run: xvfb-run -a -s "-screen 0 1280x1024x24" cargo xtask verify --suite plugins
       - name: Plugin verification suite
