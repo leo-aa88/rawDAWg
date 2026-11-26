@@ -3553,6 +3553,7 @@ dependencies = [
  "rawdawg-synthesizer",
  "rawdawg-transport",
  "rawdawg-types",
+ "rawdawg-ui",
  "serde",
  "serde_json",
 ]
@@ -3798,6 +3799,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "rawdawg-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "rawdawg-types",
+ "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]

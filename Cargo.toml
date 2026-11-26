@@ -46,6 +46,10 @@ cpal = "0.18.2"
 # GUI
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "x11", "wayland", "default_fonts", "accesskit"] }
 egui = "0.37.0"
+# Plugin editors: native child windows without a windowing framework (an in-process plugin
+# cannot own a winit event loop inside a host that already runs one)
+x11rb = "0.13.2"
+windows-sys = "0.59.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Plugin ABI
 clack-plugin = "0.2.0"

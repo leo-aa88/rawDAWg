@@ -6,7 +6,6 @@ use super::App;
 use crate::theme;
 use rawdawg_project::Command;
 use rawdawg_types::events::{EventKind, EventSource, TimedEvent};
-use rawdawg_types::params::ParamMapping;
 use rawdawg_types::{InstanceId, ParamId};
 
 #[derive(Default)]
@@ -100,26 +99,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
             let labels = super::effect_panel::step_labels(&*app.other_mirrors[&instance_id], d);
             ui.label(d.name);
             let mut n = current;
-            let resp = match d.mapping {
-                ParamMapping::Toggle => {
-                    let mut b = n >= 0.5;
-                    let r = ui.checkbox(&mut b, "");
-                    n = if b { 1.0 } else { 0.0 };
-                    r
-                }
-                ParamMapping::Discrete { .. } if labels.is_some() => {
-                    let (r, v) = super::effect_panel::step_combo(ui, ("inst-combo", instance_id, d.id.0), d, labels.as_deref().unwrap_or_default(), n);
-                    n = v;
-                    r
-                }
-                ParamMapping::Discrete { steps } => {
-                    let mut idx = d.to_physical(n) as i64;
-                    let r = ui.add(egui::Slider::new(&mut idx, 0..=(steps as i64 - 1)).show_value(true));
-                    n = d.to_normalized(idx as f64);
-                    r
-                }
-                _ => ui.add(egui::Slider::new(&mut n, 0.0..=1.0).show_value(false)),
-            };
+            let (resp, changed) = rawdawg_ui::params::param_control(ui, ("inst-combo", instance_id, d.id.0), d, n, labels.as_deref());
+            n = changed;
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
             let resp = resp

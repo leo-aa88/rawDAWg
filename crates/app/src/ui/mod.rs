@@ -942,9 +942,7 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("raw").strong().size(18.0));
-            ui.label(egui::RichText::new("DAW").strong().size(18.0).color(theme::ACCENT));
-            ui.label(egui::RichText::new("g").strong().size(18.0));
+            rawdawg_ui::params::wordmark(ui, 18.0);
             ui.separator();
             let playing = self.is_playing();
             if ui.add_enabled(!playing, egui::Button::new("Play")).on_hover_text("Space").clicked() {

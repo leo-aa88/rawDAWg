@@ -6,7 +6,6 @@ use super::{App, AudioState, EngineCommand};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_project::Command;
-use rawdawg_types::params::ParamMapping;
 use rawdawg_types::{InstanceId, ParamDescriptor, ParamId};
 
 #[derive(Default)]
@@ -203,40 +202,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
     }
 }
 
-/// Most steps offered as a list of named choices (more get a step slider).
-pub(crate) const MAX_LISTED_STEPS: u32 = 64;
-
-/// Names of a discrete parameter's steps: the descriptor's own labels, otherwise the
-/// processor's text for every step (hosted plugins name their choices). `None` when neither
-/// is available or the steps are too many to list.
+/// Names of a discrete parameter's steps: the descriptor's labels, otherwise the processor's
+/// own text for each step (hosted plugins). Shared widget logic lives in `rawdawg_ui::params`.
 pub(crate) fn step_labels(p: &dyn rawdawg_dsp::processor::Processor, d: &ParamDescriptor) -> Option<Vec<String>> {
-    let ParamMapping::Discrete { steps } = d.mapping else { return None };
-    if let Some(labels) = d.labels.filter(|l| l.len() >= steps as usize) {
-        return Some(labels.iter().take(steps as usize).map(|l| (*l).to_owned()).collect());
-    }
-    if steps > MAX_LISTED_STEPS {
-        return None;
-    }
-    (0..steps).map(|i| p.param_text(d.id, d.to_normalized(f64::from(i)))).collect()
-}
-
-/// A choice list for a discrete parameter; returns the response and the (new) value.
-pub(crate) fn step_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, d: &ParamDescriptor, labels: &[String], n: f32) -> (egui::Response, f32) {
-    let before = (d.to_physical(n).max(0.0) as usize).min(labels.len().saturating_sub(1));
-    let mut idx = before;
-    let mut r = egui::ComboBox::from_id_salt(salt)
-        .selected_text(labels.get(idx).map(String::as_str).unwrap_or(""))
-        .show_ui(ui, |ui| {
-            for (i, l) in labels.iter().enumerate() {
-                ui.selectable_value(&mut idx, i, l);
-            }
-        })
-        .response;
-    if idx != before {
-        r.mark_changed();
-        return (r, d.to_normalized(idx as f64));
-    }
-    (r, n)
+    rawdawg_ui::params::step_labels(d, |n| p.param_text(d.id, n))
 }
 
 fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descriptors: &[ParamDescriptor], edits: &mut Vec<(ParamId, f32, bool, bool)>) {
@@ -246,26 +215,8 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
             let labels = step_labels(&*app.other_mirrors[&instance_id], d);
             ui.label(d.name);
             let mut n = current;
-            let resp = match d.mapping {
-                ParamMapping::Toggle => {
-                    let mut b = n >= 0.5;
-                    let r = ui.checkbox(&mut b, "");
-                    n = if b { 1.0 } else { 0.0 };
-                    r
-                }
-                ParamMapping::Discrete { .. } if labels.is_some() => {
-                    let (r, v) = step_combo(ui, ("fx-combo", instance_id, d.id.0), d, labels.as_deref().unwrap_or_default(), n);
-                    n = v;
-                    r
-                }
-                ParamMapping::Discrete { steps } => {
-                    let mut idx = d.to_physical(n) as i64;
-                    let r = ui.add(egui::Slider::new(&mut idx, 0..=(steps as i64 - 1)).show_value(true));
-                    n = d.to_normalized(idx as f64);
-                    r
-                }
-                _ => ui.add(egui::Slider::new(&mut n, 0.0..=1.0).show_value(false)),
-            };
+            let (resp, changed) = rawdawg_ui::params::param_control(ui, ("fx-combo", instance_id, d.id.0), d, n, labels.as_deref());
+            n = changed;
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
             let resp = resp
