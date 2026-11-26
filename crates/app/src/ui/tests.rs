@@ -53,6 +53,11 @@ impl Harness {
 
     /// Every label and value drawn in one frame, read from egui's accessibility tree.
     fn drawn_texts(&mut self) -> Vec<String> {
+        self.drawn_nodes().into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// Text and on-screen bounds of every labelled widget drawn in one frame.
+    fn drawn_nodes(&mut self) -> Vec<(String, egui::Rect)> {
         self.ctx.enable_accesskit();
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))), ..Default::default() };
         let app = &mut self.app;
@@ -63,7 +68,14 @@ impl Harness {
         });
         out.textures_delta.clear();
         let update = out.platform_output.accesskit_update.expect("accessibility tree");
-        update.nodes.iter().flat_map(|(_, n)| n.label().into_iter().chain(n.value())).map(str::to_owned).collect()
+        update
+            .nodes
+            .iter()
+            .flat_map(|(_, n)| {
+                let r = n.bounds().map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))).unwrap_or(egui::Rect::NOTHING);
+                n.label().into_iter().chain(n.value()).map(move |t| (t.to_owned(), r))
+            })
+            .collect()
     }
 
     fn rect(&self, id: egui::Id) -> egui::Rect {
@@ -92,6 +104,35 @@ impl Harness {
         }
         self.frame(vec![egui::Event::PointerButton { pos: to, button, pressed: false, modifiers: egui::Modifiers::NONE }]);
         self.frame(vec![]);
+    }
+
+    /// Two-finger trackpad scroll at `at` (negative `dy` reveals content further down).
+    fn scroll(&mut self, at: egui::Pos2, dy: f32) {
+        let wheel = |phase| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            phase,
+            source: egui::MouseWheelSource::Trackpad,
+            modifiers: egui::Modifiers::NONE,
+        };
+        self.move_to(at);
+        self.frame(vec![wheel(egui::TouchPhase::Start), wheel(egui::TouchPhase::Move)]);
+        self.frame(vec![wheel(egui::TouchPhase::End)]);
+        self.frame(vec![]);
+    }
+
+    /// Run frames until the widget `id` stops moving (scroll animations finished).
+    fn settle(&mut self, id: egui::Id) {
+        let mut last = self.rect(id);
+        for _ in 0..600 {
+            self.frame(vec![]);
+            let now = self.rect(id);
+            if now == last {
+                return;
+            }
+            last = now;
+        }
+        panic!("{id:?} kept moving");
     }
 
     fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
@@ -1004,4 +1045,83 @@ fn large_hosted_plugin_state_is_saved_beside_the_manifest_and_a_missing_file_kee
     assert!(mirrors.is_empty());
     drop(h);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn insert_drop_slot_is_the_gap_nearest_the_pointer() {
+    use super::mixer::insert_drop_index;
+    let rows: Vec<egui::Rect> = (0..3).map(|i| egui::Rect::from_min_size(egui::pos2(0.0, 20.0 * i as f32), egui::vec2(100.0, 20.0))).collect();
+    assert_eq!(insert_drop_index(&rows, 0, 70.0), Some(2), "below the last row: to the end");
+    assert_eq!(insert_drop_index(&rows, 0, 5.0), None, "its own place");
+    assert_eq!(insert_drop_index(&rows, 0, 25.0), None, "the gap right after itself is its own place");
+    assert_eq!(insert_drop_index(&rows, 0, 35.0), Some(1));
+    assert_eq!(insert_drop_index(&rows, 2, -10.0), Some(0), "above the first row: to the start");
+    assert_eq!(insert_drop_index(&rows, 1, 45.0), None);
+    assert_eq!(insert_drop_index(&rows, 1, 55.0), Some(2));
+    assert_eq!(insert_drop_index(&rows, 5, 55.0), None, "unknown source row");
+}
+
+#[test]
+fn inserts_are_reordered_by_dragging_their_handle_in_one_undo_step() {
+    let mut h = Harness::new(None);
+    let master = h.app.project.mixer.master_id;
+    for fx in rawdawg_effects::CATALOG.iter().filter(|f| f.listed).take(3) {
+        let mut inst = rawdawg_project::Instance::native(fx.type_id, serde_json::Value::Null);
+        inst.display_name = fx.name.to_owned();
+        h.app.apply(Command::AddInsert { mixer_id: master, instance: inst, index: None });
+    }
+    let order = |h: &Harness| h.app.project.mixer_channel(master).unwrap().inserts.iter().map(|i| i.id).collect::<Vec<_>>();
+    h.app.editor_view = EditorView::Mixer;
+    h.app.mixer.selected = Some(master);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // the insert list sits below the strips: scroll the editor down to it, as a user would
+    h.scroll(egui::pos2(W / 2.0, H - 120.0), -600.0);
+    let o = order(&h);
+    h.settle(super::mixer::insert_handle_id(o[0]));
+    assert_eq!(o.len(), 3);
+    let depth = h.app.history.undo_len();
+    // first insert dragged below the last one
+    let first = h.rect(super::mixer::insert_handle_id(o[0]));
+    let last = h.rect(super::mixer::insert_handle_id(o[2]));
+    h.drag(first.center(), egui::pos2(last.center().x, last.bottom() + 6.0), egui::PointerButton::Primary);
+    assert_eq!(order(&h), vec![o[1], o[2], o[0]]);
+    assert_eq!(h.app.history.undo_len(), depth + 1, "one undo step");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(order(&h), o, "undo restores the chain");
+    // last insert dragged above the first one
+    let first = h.rect(super::mixer::insert_handle_id(o[0]));
+    let last = h.rect(super::mixer::insert_handle_id(o[2]));
+    h.drag(last.center(), egui::pos2(first.center().x, first.top() - 4.0), egui::PointerButton::Primary);
+    assert_eq!(order(&h), vec![o[2], o[0], o[1]]);
+    // a drag that ends in its own place changes nothing
+    let depth = h.app.history.undo_len();
+    let middle = h.rect(super::mixer::insert_handle_id(o[0]));
+    h.drag(middle.center(), middle.center() + egui::vec2(30.0, 3.0), egui::PointerButton::Primary);
+    assert_eq!(order(&h), vec![o[2], o[0], o[1]]);
+    assert_eq!(h.app.history.undo_len(), depth);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}
+
+#[test]
+fn a_long_status_message_or_project_path_never_overlaps_the_rest_of_the_status_bar() {
+    let mut h = Harness::new(None);
+    h.app.status_line = format!("Opened /{}", "a-rather-long-folder-name/".repeat(30));
+    h.app.project_path = Some(PathBuf::from(format!("/{}/Song.rawdawg", "deep/".repeat(60))));
+    let nodes = h.drawn_nodes();
+    // only widgets in the status bar (the bottom row); the toolbar has its own "Audio off"
+    let find = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        nodes.iter().find(|(t, r)| r.center().y > H - 40.0 && pred(t)).map(|(_, r)| *r).unwrap_or_else(|| panic!("{what} not drawn in the status bar"))
+    };
+    let status = find(&|t| t.starts_with("Opened /a-rather-long"), "status message");
+    let audio = find(&|t| t.starts_with("Audio off —"), "audio status");
+    let project = find(&|t| t == "Song.rawdawg", "project folder name");
+    let brand = find(&|t| t.contains("Less thinking. More noise."), "version and tagline");
+    assert!(status.right() <= audio.left(), "message {status:?} runs into the audio status {audio:?}");
+    assert!(audio.right() <= project.left(), "audio status {audio:?} / project {project:?}");
+    assert!(project.right() <= brand.left(), "project {project:?} / brand {brand:?}");
+    for (what, r) in [("message", status), ("audio status", audio), ("project", project), ("brand", brand)] {
+        assert!(r.left() >= 0.0 && r.right() <= W + 0.5, "{what} {r:?} leaves the window");
+    }
+    assert!(status.width() > 100.0, "the message keeps a useful width");
 }

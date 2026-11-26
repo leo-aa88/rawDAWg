@@ -1359,7 +1359,12 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(&self.status_line);
+            // the message gets at most part of the row and is cut with an ellipsis (full text on
+            // hover), so a long path never runs under the audio status and the version label
+            let max = (ui.available_width() * 0.45).max(160.0);
+            ui.allocate_ui_with_layout(egui::vec2(max, ui.available_height()), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(&self.status_line).truncate());
+            });
             ui.separator();
             let mut retry = false;
             match &self.audio {
@@ -1402,9 +1407,11 @@ impl App {
                 self.restart_audio(&req);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(format!("{PRODUCT_NAME} {VERSION} — {TAGLINE}")).color(theme::TEXT_SECONDARY));
+                ui.add(egui::Label::new(egui::RichText::new(format!("{PRODUCT_NAME} {VERSION} — {TAGLINE}")).color(theme::TEXT_SECONDARY)).truncate());
                 if let Some(p) = &self.project_path {
-                    ui.label(egui::RichText::new(p.display().to_string()).color(theme::TEXT_SECONDARY));
+                    // the folder name says which project; the whole path is on hover
+                    let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    ui.add(egui::Label::new(egui::RichText::new(name).color(theme::TEXT_SECONDARY)).truncate()).on_hover_text(p.display().to_string());
                 }
                 if self.history.is_dirty() {
                     ui.label(egui::RichText::new("unsaved").color(theme::WARNING));
