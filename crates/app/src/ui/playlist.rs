@@ -510,6 +510,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         if child.toggle_value(&mut armed, "R").on_hover_text("Arm for audio recording: with Rec on and an input device open, Play records the input onto this track").changed() {
             app.record.armed_track = armed.then_some(t.id);
         }
+        if armed && app.input_open() {
+            super::recording::input_meter(app, &mut child, 40.0);
+        }
         if child.small_button("×").on_hover_text("Delete track and its clips (undoable)").clicked() {
             let clips: Vec<Command> = app.project.clips.iter().filter(|c| c.track_id == t.id).map(|c| Command::RemoveClip { id: c.id }).collect();
             let mut all = clips;
@@ -1034,6 +1037,15 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 app.playlist.selection.clear();
                 app.playlist.selection.insert(c.id);
                 split_selected(app, &mut cmds);
+                ui.close();
+            }
+            if matches!(c.content, ClipContent::Audio { .. })
+                && ui
+                    .button("Measure recording latency")
+                    .on_hover_text("For a take of the metronome recorded through a loopback cable: where its clicks land, and the recording offset that puts them on the beat")
+                    .clicked()
+            {
+                app.measure_take_latency(c.id);
                 ui.close();
             }
             if ui.button("Delete").clicked() {

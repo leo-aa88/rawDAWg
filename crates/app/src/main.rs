@@ -2,6 +2,7 @@
 //! and the native dark GUI.
 
 mod audio;
+mod calibrate;
 mod cli;
 mod plugins;
 mod prefs;

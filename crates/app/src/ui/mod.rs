@@ -1085,6 +1085,10 @@ impl App {
             });
             ui.add(egui::DragValue::new(&mut self.prefs.record_offset_ms).range(-100.0..=100.0).speed(0.5).suffix(" ms"))
                 .on_hover_text("Recording offset: positive moves recorded notes earlier (compensates input/buffer latency)");
+            if self.input_open() {
+                ui.label(egui::RichText::new("In").small().color(theme::TEXT_SECONDARY));
+                recording::input_meter(self, ui, 64.0);
+            }
             if let AudioState::Running(sys) = &self.audio {
                 let left = sys.handle.status.count_in_frames.load(std::sync::atomic::Ordering::Relaxed);
                 if left > 0 {
@@ -1675,6 +1679,7 @@ impl App {
         self.poll_midi();
         self.poll_record();
         self.poll_audio_take();
+        self.sample_input_meter();
         self.commit_quiet_midi_changes();
         automation::poll_capture(self);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -1775,6 +1780,7 @@ impl App {
             export::show(self, ui.ctx());
         }
         project_files::show(self, ui.ctx());
+        recording::latency_window(self, ui.ctx());
         if self.show_help {
             let mut open = self.show_help;
             egui::Window::new("User guide").open(&mut open).default_size([640.0, 520.0]).resizable(true).show(ui.ctx(), |ui| {

@@ -23,6 +23,12 @@ pub(crate) struct RecordState {
     pub audio: Option<AudioTake>,
     /// Last take's report (lost frames, placement) for the status line.
     pub last_audio_report: Option<String>,
+    /// Loopback latency measurement of a take (shown in its own window until closed).
+    pub latency_check: Option<(ClipId, Result<crate::calibrate::LoopbackMeasurement, String>)>,
+    /// Input level per channel (peak, falling back), sampled once per frame.
+    pub input_meter: [f32; 2],
+    /// The input reached full scale since the meter was last reset (click to reset).
+    pub input_clipped: bool,
 }
 
 /// An audio take in progress: the disk writer, the target track and the aligned start.
@@ -443,5 +449,171 @@ impl App {
                 self.status_line = format!("MIDI edit rejected: {e}");
             }
         }
+    }
+}
+
+impl App {
+    /// Sample the input level once per frame (the meters in the toolbar, the armed track and
+    /// Settings all read this; the stream's peak registers are reset here only).
+    pub(crate) fn sample_input_meter(&mut self) {
+        let read = match &self.audio {
+            AudioState::Running(s) => s.input.as_ref().map(|i| {
+                let st = &i.stream.status;
+                let v = [st.peak_l.load(), st.peak_r.load()];
+                st.peak_l.store(0.0);
+                st.peak_r.store(0.0);
+                v
+            }),
+            _ => None,
+        };
+        let m = &mut self.record;
+        update_input_meter(&mut m.input_meter, &mut m.input_clipped, read);
+    }
+
+    /// Whether an input device is open (the input meters show).
+    pub(crate) fn input_open(&self) -> bool {
+        matches!(&self.audio, AudioState::Running(s) if s.input.is_some())
+    }
+
+    /// Measure where the metronome clicks of an audio take land (a loopback recording) and show
+    /// the result with an offer to correct the recording offset.
+    pub(crate) fn measure_take_latency(&mut self, clip_id: ClipId) {
+        self.assets.sync(self.project_path.clone(), &self.project);
+        let result = self.take_latency(clip_id);
+        self.record.latency_check = Some((clip_id, result));
+    }
+
+    fn take_latency(&self, clip_id: ClipId) -> Result<crate::calibrate::LoopbackMeasurement, String> {
+        use rawdawg_audio_engine::AssetResolver;
+        let clip = self.project.clips.iter().find(|c| c.id == clip_id).ok_or("the take was removed")?;
+        let ClipContent::Audio { asset_id, source_offset_frames, playback_rate, .. } = &clip.content else {
+            return Err("not an audio clip".into());
+        };
+        let asset = self.assets.sample(asset_id).ok_or("the take is too long to measure here (or its file is missing): record 4 to 8 bars")?;
+        let first = asset.channels.first().ok_or("the take has no audio")?;
+        // one channel: the mix of all of them
+        let n = first.len();
+        let audio: Vec<f32> = (0..n).map(|i| asset.channels.iter().map(|c| c.get(i).copied().unwrap_or(0.0)).sum::<f32>() / asset.channels.len() as f32).collect();
+        let tempo = self.project.tempo_map().map_err(|e| e.to_string())?;
+        let meter = self.project.meter_map().map_err(|e| e.to_string())?;
+        let rate = self.project.sample_rate_hz;
+        let beat = meter.meter_at(clip.start_tick).beat_ticks().0.max(1);
+        // the metronome clicks on multiples of the beat; where each lands in the take's file
+        let start_frame = tempo.tick_to_frame(clip.start_tick, rate);
+        let to_asset = f64::from(asset.sample_rate) / f64::from(rate.0) * playback_rate;
+        let first_beat = (clip.start_tick.0 + beat - 1).div_euclid(beat) * beat;
+        let beats: Vec<i64> = (0..)
+            .map(|k| first_beat + k * beat)
+            .take_while(|t| *t < clip.end_tick().0)
+            .map(|t| ((tempo.tick_to_frame(Tick(t), rate) - start_frame) as f64 * to_asset).round() as i64 + *source_offset_frames as i64)
+            .collect();
+        crate::calibrate::measure_loopback(&audio, asset.sample_rate, &beats)
+    }
+
+    /// Apply a measurement: the clicks landed `late_ms` late, so recordings move that much
+    /// earlier from now on.
+    pub(crate) fn apply_latency_correction(&mut self, late_ms: f64) {
+        let before = self.prefs.record_offset_ms;
+        self.prefs.record_offset_ms = (f64::from(before) + late_ms).clamp(-100.0, 100.0) as f32;
+        self.save_prefs();
+        self.status_line = format!("Recording offset {before:.1} ms → {:.1} ms (new takes are placed with it)", self.prefs.record_offset_ms);
+    }
+}
+
+/// One frame of the input meter: each channel holds its peak and falls back by a fixed factor
+/// per frame; full scale lights the clip light; no input clears it; junk values read as silence.
+pub(crate) fn update_input_meter(meter: &mut [f32; 2], clipped: &mut bool, read: Option<[f32; 2]>) {
+    const FALL: f32 = 0.85;
+    let Some(v) = read else {
+        *meter = [0.0; 2];
+        return;
+    };
+    for (m, x) in meter.iter_mut().zip(v) {
+        let x = if x.is_finite() { x.abs() } else { 0.0 };
+        *m = x.max(*m * FALL);
+        if x >= 0.999 {
+            *clipped = true;
+        }
+    }
+}
+
+/// A compact input level meter (left/right bars); click resets the clip light.
+pub(crate) fn input_meter(app: &mut App, ui: &mut egui::Ui, width: f32) {
+    use crate::theme;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 12.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, theme::BACKGROUND);
+    let clip_w = 6.0;
+    let bars = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - clip_w - 2.0, rect.max.y));
+    for (k, peak) in app.record.input_meter.iter().enumerate() {
+        let db = rawdawg_dsp::math::lin_to_db(*peak).clamp(-60.0, 0.0);
+        let frac = (db + 60.0) / 60.0;
+        let y0 = bars.min.y + k as f32 * bars.height() / 2.0;
+        let bar = egui::Rect::from_min_size(egui::pos2(bars.min.x, y0 + 0.5), egui::vec2(bars.width() * frac, bars.height() / 2.0 - 1.0));
+        let color = if db > -1.0 {
+            theme::ERROR
+        } else if db > -6.0 {
+            theme::WARNING
+        } else {
+            theme::ACCENT
+        };
+        painter.rect_filled(bar, 1.0, color);
+    }
+    let light = egui::Rect::from_min_max(egui::pos2(rect.max.x - clip_w, rect.min.y), rect.max);
+    painter.rect_filled(light, 1.0, if app.record.input_clipped { theme::ERROR } else { theme::RAISED });
+    let [l, r] = app.record.input_meter;
+    let resp = resp.on_hover_text(format!(
+        "Input level L {:.0} dB · R {:.0} dB{} (click to reset the clip light)",
+        rawdawg_dsp::math::lin_to_db(l).max(-90.0),
+        rawdawg_dsp::math::lin_to_db(r).max(-90.0),
+        if app.record.input_clipped { " · clipped" } else { "" }
+    ));
+    if resp.clicked() {
+        app.record.input_clipped = false;
+    }
+}
+
+/// The measurement window: where the clicks landed, and Apply.
+pub(crate) fn latency_window(app: &mut App, ctx: &egui::Context) {
+    use crate::theme;
+    let Some((_, result)) = app.record.latency_check.clone() else { return };
+    let mut open = true;
+    let mut apply = None;
+    egui::Window::new("Recording latency").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+        match &result {
+            Ok(m) => {
+                let when = if m.late_ms.abs() < 0.05 {
+                    "on the beat".to_owned()
+                } else if m.late_ms > 0.0 {
+                    format!("{:.1} ms late", m.late_ms)
+                } else {
+                    format!("{:.1} ms early", -m.late_ms)
+                };
+                ui.label(format!("The clicks land {when} ({} clicks, spread {:.1} ms).", m.clicks, m.spread_ms));
+                if m.spread_ms > crate::calibrate::MAX_RELIABLE_SPREAD_MS {
+                    ui.colored_label(theme::WARNING, "The clicks are irregular: this does not look like a loopback of the metronome. Check the cable, turn the metronome on, and record again.");
+                }
+                let new = (f64::from(app.prefs.record_offset_ms) + m.late_ms).clamp(-100.0, 100.0);
+                ui.label(egui::RichText::new(format!("Recording offset now {:.1} ms; with the correction {new:.1} ms.", app.prefs.record_offset_ms)).color(theme::TEXT_SECONDARY));
+                if ui.button("Apply to new recordings").clicked() {
+                    apply = Some(m.late_ms);
+                }
+            }
+            Err(e) => {
+                ui.colored_label(theme::WARNING, format!("Could not measure: {e}"));
+            }
+        }
+        ui.label(
+            egui::RichText::new("How: turn the metronome on, connect an output to the input with a cable (or hold the microphone to a speaker), arm a track, record a few bars, then measure the take.")
+                .small()
+                .color(theme::TEXT_SECONDARY),
+        );
+    });
+    if let Some(late) = apply {
+        app.apply_latency_correction(late);
+        open = false;
+    }
+    if !open {
+        app.record.latency_check = None;
     }
 }

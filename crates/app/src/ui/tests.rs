@@ -1504,3 +1504,88 @@ fn pattern_automation_is_created_captured_in_both_modes_and_learns_from_midi_con
     assert_eq!(copy.points.iter().map(|p| (p.tick, p.value)).collect::<Vec<_>>(), curve_now(&h).points.iter().map(|p| (p.tick, p.value)).collect::<Vec<_>>());
     assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
 }
+
+#[test]
+fn a_loopback_take_of_the_metronome_measures_the_recording_latency() {
+    use rawdawg_audio_io::capture::{CaptureProducer, InputChannels};
+    use rawdawg_audio_io::capture_writer::CaptureWriter;
+    use rawdawg_project::{ClipContent, Track};
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-loopback-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("L.rawdawg");
+    let mut h = Harness::new(None);
+    rawdawg_project::save_project_dir(&dir, &h.app.project).unwrap();
+    h.app.project_path = Some(dir.clone());
+    let tid = rawdawg_types::TrackId::new();
+    h.app.apply(rawdawg_project::Command::AddTrack {
+        track: Track { id: tid, name: "Loopback".into(), color: None, mute: false, solo: false, height: None, mixer_id: None },
+        index: None,
+    });
+    // a take placed at bar 2 whose metronome clicks arrive 12 ms after their beats
+    let late = 576usize; // 12 ms at 48 kHz
+    let frames = 8 * 24_000;
+    let mut mono = vec![0.0f32; frames];
+    for beat in 0..8 {
+        for k in 0..1200 {
+            let i = beat * 24_000 + late + k;
+            if i < frames {
+                mono[i] = 0.4 * (-(k as f32) / 240.0).exp() * (std::f32::consts::TAU * 1500.0 * k as f32 / 48_000.0 + 0.4).sin();
+            }
+        }
+    }
+    let (mut producer, queues) = CaptureProducer::new(2, InputChannels::Stereo(0, 1));
+    let writer = CaptureWriter::start(&dir, queues.writer, 48_000, 96_000).unwrap();
+    // fed in blocks, as an input stream would (the queue is bounded)
+    for chunk in mono.chunks(4800) {
+        let data: Vec<f32> = chunk.iter().flat_map(|v| [*v, *v]).collect();
+        producer.push_interleaved(&data);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    producer.flush_partial();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let (wav, journal) = (writer.wav_path.clone(), writer.journal_path.clone());
+    let (j, _queue) = writer.stop().unwrap();
+    assert_eq!((j.frames_written, j.lost_frames), (frames as u64, 0), "the whole take was captured");
+    h.app.place_take(&wav, &journal, tid, j.start_project_frame, j.frames_written, j.lost_frames, 48_000);
+    let clip = h.app.project.clips.last().unwrap().clone();
+    // measure: 12 ms late, eight clicks, tight
+    h.app.prefs.record_offset_ms = 3.0;
+    h.app.measure_take_latency(clip.id);
+    let m = h.app.record.latency_check.as_ref().unwrap().1.clone().expect("measured");
+    assert!((m.late_ms - 12.0).abs() < 0.1, "{m:?}");
+    assert_eq!(m.clicks, 8);
+    assert!(m.spread_ms < 0.1);
+    // the window says so, and Apply adds it to the recording offset (a new window's first
+    // frame is an invisible sizing pass)
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t.contains("12.0 ms late")), "{:?}", texts.iter().filter(|t| t.contains("ms")).collect::<Vec<_>>());
+    let apply = h.drawn_nodes().into_iter().find(|(t, _)| t == "Apply to new recordings").map(|(_, r)| r).expect("Apply button");
+    h.click_at(apply.center(), egui::PointerButton::Primary);
+    assert!((h.app.prefs.record_offset_ms - 15.0).abs() < 0.1, "3 ms + 12 ms: {}", h.app.prefs.record_offset_ms);
+    assert!(h.app.record.latency_check.is_none(), "the window closes");
+    // a clip that is not a loopback of the metronome says why
+    let other = h.app.project.clips.iter().find(|c| c.id != clip.id && matches!(c.content, ClipContent::Pattern { .. })).map(|c| c.id);
+    if let Some(id) = other {
+        h.app.measure_take_latency(id);
+        assert!(h.app.record.latency_check.as_ref().unwrap().1.is_err());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_input_meter_holds_peaks_falls_back_and_lights_on_full_scale() {
+    use super::recording::update_input_meter;
+    let (mut m, mut clipped) = ([0.0f32; 2], false);
+    update_input_meter(&mut m, &mut clipped, Some([0.5, 0.1]));
+    assert_eq!(m, [0.5, 0.1]);
+    update_input_meter(&mut m, &mut clipped, Some([0.0, 0.2]));
+    assert!((m[0] - 0.425).abs() < 1e-6 && m[1] == 0.2, "falls back, rises at once: {m:?}");
+    assert!(!clipped);
+    update_input_meter(&mut m, &mut clipped, Some([1.0, f32::NAN]));
+    assert!(clipped, "full scale lights the clip light");
+    assert!((m[1] - 0.17).abs() < 1e-6, "NaN reads as silence");
+    update_input_meter(&mut m, &mut clipped, None);
+    assert_eq!(m, [0.0; 2], "no input, no level");
+}

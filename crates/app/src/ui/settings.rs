@@ -98,14 +98,27 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 {
                     app.save_prefs();
                 }
+                let take = app
+                    .project
+                    .clips
+                    .iter()
+                    .filter(|c| matches!(c.content, rawdawg_project::ClipContent::Audio { .. }))
+                    .find(|c| app.playlist.selection.contains(&c.id))
+                    .map(|c| c.id);
+                if ui
+                    .add_enabled(take.is_some(), egui::Button::new("Measure from the selected take"))
+                    .on_hover_text("Record a few bars of the metronome through a loopback cable, select that take in the playlist, and measure where its clicks land")
+                    .clicked()
+                    && let Some(id) = take
+                {
+                    app.measure_take_latency(id);
+                }
             });
             match &app.audio {
                 super::AudioState::Running(s) => match (&s.input, &s.input_error) {
                     (Some(i), _) => {
                         let st = &i.stream.status;
-                        let (l, r) = (st.peak_l.load(), st.peak_r.load());
-                        st.peak_l.store(0.0);
-                        st.peak_r.store(0.0);
+                        let [l, r] = app.record.input_meter;
                         ui.label(
                             egui::RichText::new(format!(
                                 "Input open: {} ({} ch) at {} Hz — level L {:.0} dB R {:.0} dB, reported latency {:.1} ms, dropped blocks {}",
