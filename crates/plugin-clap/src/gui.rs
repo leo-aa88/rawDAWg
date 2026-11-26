@@ -251,7 +251,7 @@ impl PluginGuiImpl for MainThread<'_> {
             main.descriptors().iter().filter(|d| !d.flags.hidden).chain(wrapper.iter()).copied().collect()
         };
         let port = ClapPort { core: self.shared.core.clone(), descriptors };
-        let ui = PluginEditorUi::new(self.shared.exported.name.clone(), port);
+        let ui = PluginEditorUi::new(self.shared.exported.name.clone(), port).with_visual(rawdawg_plugin_api::visuals::visual_for(&self.shared.exported.clap_id));
         let editor = Editor::open(parent, size, scale, &self.shared.exported.name, Box::new(ui)).map_err(|_| PluginError::Message("cannot open the editor window"))?;
         let editor = Rc::new(RefCell::new(editor));
         let timer = match self.host_timer() {

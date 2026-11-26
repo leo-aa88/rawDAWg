@@ -172,7 +172,8 @@ impl IPlugViewTrait for PlugView {
         let parent = Parent::X11(parent as usize as u32);
         #[cfg(target_os = "windows")]
         let parent = Parent::Win32(parent as isize);
-        let ui = PluginEditorUi::new(self.state.plugin.name.clone(), Vst3Port { state: self.state.clone() });
+        let ui = PluginEditorUi::new(self.state.plugin.name.clone(), Vst3Port { state: self.state.clone() })
+            .with_visual(rawdawg_plugin_api::visuals::visual_for(&self.state.plugin.clap_id));
         let Ok(editor) = Editor::open(parent, self.size.get(), self.scale.get(), &self.state.plugin.name, Box::new(ui)) else { return kResultFalse };
         let editor = Rc::new(RefCell::new(editor));
         #[cfg(target_os = "linux")]

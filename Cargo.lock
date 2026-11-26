@@ -3669,10 +3669,12 @@ dependencies = [
 name = "rawdawg-plugin-api"
 version = "0.1.0"
 dependencies = [
+ "egui",
  "rawdawg-dsp",
  "rawdawg-effects",
  "rawdawg-synthesizer",
  "rawdawg-types",
+ "rawdawg-ui",
  "serde_json",
 ]
 

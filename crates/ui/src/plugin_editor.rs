@@ -29,17 +29,63 @@ pub trait ParamPort {
     fn end_edit(&self, id: ParamId);
 }
 
+/// One step of an edit a [`EditorVisual`] makes: gestures begin, set values and end, as the
+/// host expects them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VisualEdit {
+    Begin(ParamId),
+    Set(ParamId, f32),
+    End(ParamId),
+}
+
+/// A plugin-specific view drawn above the parameter list (an EQ's response curve, a synth's
+/// envelope): it reads values through the port and returns its edits, which the editor sends
+/// to the host (and ends if the window closes mid-gesture).
+pub trait EditorVisual {
+    fn ui(&mut self, ui: &mut egui::Ui, port: &dyn ParamPort) -> Vec<VisualEdit>;
+}
+
 pub struct PluginEditorUi<P: ParamPort> {
     name: String,
     port: P,
     gesture: Option<ParamId>,
     descriptors: Vec<ParamDescriptor>,
+    visual: Option<Box<dyn EditorVisual>>,
+    /// Gestures a visual began and has not ended yet.
+    visual_gestures: Vec<ParamId>,
 }
 
 impl<P: ParamPort> PluginEditorUi<P> {
     pub fn new(name: impl Into<String>, port: P) -> Self {
         let descriptors = port.descriptors();
-        Self { name: name.into(), port, gesture: None, descriptors }
+        Self { name: name.into(), port, gesture: None, descriptors, visual: None, visual_gestures: Vec::new() }
+    }
+
+    /// Show `visual` above the parameter list.
+    pub fn with_visual(mut self, visual: Option<Box<dyn EditorVisual>>) -> Self {
+        self.visual = visual;
+        self
+    }
+
+    fn apply_visual(&mut self, edits: Vec<VisualEdit>) {
+        for e in edits {
+            match e {
+                VisualEdit::Begin(id) => {
+                    self.end_gesture();
+                    if !self.visual_gestures.contains(&id) {
+                        self.port.begin_edit(id);
+                        self.visual_gestures.push(id);
+                    }
+                }
+                VisualEdit::Set(id, v) => self.port.edit(id, v.clamp(0.0, 1.0)),
+                VisualEdit::End(id) => {
+                    if let Some(i) = self.visual_gestures.iter().position(|g| *g == id) {
+                        self.visual_gestures.remove(i);
+                        self.port.end_edit(id);
+                    }
+                }
+            }
+        }
     }
 
     pub fn port(&self) -> &P {
@@ -65,6 +111,12 @@ impl<P: ParamPort> EditorUi for PluginEditorUi<P> {
                 });
             });
             ui.separator();
+            if let Some(mut visual) = self.visual.take() {
+                let edits = visual.ui(ui, &self.port);
+                self.visual = Some(visual);
+                self.apply_visual(edits);
+                ui.separator();
+            }
             let descriptors = self.descriptors.clone();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("plugin-params").num_columns(3).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
@@ -112,6 +164,9 @@ impl<P: ParamPort> Drop for PluginEditorUi<P> {
     fn drop(&mut self) {
         // closing the editor mid-drag still ends the host's gesture
         self.end_gesture();
+        for id in std::mem::take(&mut self.visual_gestures) {
+            self.port.end_edit(id);
+        }
     }
 }
 

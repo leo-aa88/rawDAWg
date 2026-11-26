@@ -10,6 +10,7 @@
 //! No format ABI code lives here; `plugin-clap` and `plugin-vst3` are thin adapters.
 
 pub mod exported;
+pub mod visuals;
 pub mod wrap;
 
 pub use exported::{ExportedPlugin, Kind, exported_plugins};

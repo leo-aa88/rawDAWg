@@ -12,4 +12,6 @@ rawdawg-types = { path = "../types" }
 rawdawg-dsp = { path = "../dsp" }
 rawdawg-synthesizer = { path = "../synthesizer" }
 rawdawg-effects = { path = "../effects" }
+rawdawg-ui = { path = "../ui" }
+egui = { workspace = true }
 serde_json = { workspace = true }
