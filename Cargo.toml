@@ -55,7 +55,7 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 clack-plugin = "0.2.0"
 clack-host = "0.2.0"
 clack-extensions = { version = "0.2.0", features = ["audio-ports", "note-ports", "params", "state", "latency", "tail", "gui", "log", "timer", "posix-fd"] }
-clap-sys = "0.5"
+clap-sys = "0.6"
 vst3 = "0.3.0"
 libloading = "0.9.1"
 libc = "0.2.191"
