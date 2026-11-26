@@ -10,6 +10,8 @@
 //!
 //! Only f32 processing and stereo buses are negotiated; a plugin that refuses
 //! that arrangement stays a stand-in with an explicit reason.
+
+#![allow(clippy::unnecessary_cast, reason = "The VST3 binding's enum constants are `u32` on Linux and `i32` on MSVC: a cast that one platform needs is redundant on the other")]
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
 use crate::catalog::{Format, PluginDescription, ScannedLibrary};
@@ -1415,12 +1417,11 @@ impl Processor for Vst3Processor {
         }
         let t = ctx.transport;
         let mut pc: vst3::Steinberg::Vst::ProcessContext = unsafe { std::mem::zeroed() };
-        pc.state = vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kTempoValid
-            | vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kTimeSigValid
-            | vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
-            | vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kContTimeValid;
+        // the binding's enum constants are `i32` on MSVC and `u32` elsewhere: cast to the field type
+        use vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_ as F;
+        pc.state = (F::kTempoValid | F::kTimeSigValid | F::kProjectTimeMusicValid | F::kContTimeValid) as u32;
         if t.playing {
-            pc.state |= vst3::Steinberg::Vst::ProcessContext_::StatesAndFlags_::kPlaying;
+            pc.state |= F::kPlaying as u32;
         }
         pc.sampleRate = self.sample_rate;
         pc.projectTimeSamples = t.block_start_frame.max(0);

@@ -3,6 +3,7 @@
 //! the COM ABI (sample-accurate parameter queues, sidechain bus, latency, tail,
 //! note events) and round-trip component state into the controller.
 #![allow(non_snake_case)]
+#![allow(clippy::unnecessary_cast, reason = "The VST3 binding's enum constants are `u32` on Linux and `i32` on MSVC: a cast that one platform needs is redundant on the other")]
 
 use rawdawg_dsp::analysis::dominant_frequency;
 use rawdawg_dsp::math::{peak, rms};
@@ -216,7 +217,8 @@ unsafe fn run(
         out_bus.numChannels = 2;
         out_bus.__field0.channelBuffers32 = out_ch.as_mut_ptr();
         let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
-        ctx.state = ProcessContext_::StatesAndFlags_::kPlaying | ProcessContext_::StatesAndFlags_::kTempoValid | ProcessContext_::StatesAndFlags_::kTimeSigValid;
+        // `i32` on MSVC, `u32` elsewhere
+        ctx.state = (ProcessContext_::StatesAndFlags_::kPlaying | ProcessContext_::StatesAndFlags_::kTempoValid | ProcessContext_::StatesAndFlags_::kTimeSigValid) as u32;
         ctx.sampleRate = SR;
         ctx.tempo = 120.0;
         ctx.timeSigNumerator = 4;

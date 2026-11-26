@@ -14,6 +14,7 @@
 //! that `process` only `try_lock`s (never blocks): a block that collides with a
 //! state save passes the input through instead.
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
+#![allow(clippy::unnecessary_cast, reason = "The VST3 binding's enum constants are `u32` on Linux and `i32` on MSVC: a cast that one platform needs is redundant on the other")]
 
 use rawdawg_dsp::processor::{PrepareSpec, ProcessContext, Processor, TransportView};
 use rawdawg_dsp::{AudioBlock, BusLayout};
@@ -303,14 +304,16 @@ impl Component {
         t.block_start_frame = st.steady_frame;
         if let Some(ctx) = unsafe { pd.processContext.as_ref() } {
             let s = ctx.state;
-            t.playing = s & ProcessContext_::StatesAndFlags_::kPlaying != 0;
-            if s & ProcessContext_::StatesAndFlags_::kTempoValid != 0 && ctx.tempo.is_finite() && ctx.tempo > 0.0 {
+            // the binding's enum constants are `i32` on MSVC and `u32` elsewhere
+            use ProcessContext_::StatesAndFlags_ as F;
+            t.playing = s & F::kPlaying as u32 != 0;
+            if s & F::kTempoValid as u32 != 0 && ctx.tempo.is_finite() && ctx.tempo > 0.0 {
                 t.tempo_bpm = ctx.tempo.clamp(1.0, 999.0);
             }
-            if s & ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid != 0 && ctx.projectTimeMusic.is_finite() {
+            if s & F::kProjectTimeMusicValid as u32 != 0 && ctx.projectTimeMusic.is_finite() {
                 t.position_quarters = ctx.projectTimeMusic.max(0.0);
             }
-            if s & ProcessContext_::StatesAndFlags_::kTimeSigValid != 0 && ctx.timeSigNumerator > 0 && ctx.timeSigDenominator > 0 {
+            if s & F::kTimeSigValid as u32 != 0 && ctx.timeSigNumerator > 0 && ctx.timeSigDenominator > 0 {
                 t.meter_numerator = ctx.timeSigNumerator.min(32) as u8;
                 t.meter_denominator = ctx.timeSigDenominator.min(32) as u8;
             }
@@ -664,7 +667,8 @@ impl IAudioProcessorTrait for Component {
 impl IProcessContextRequirementsTrait for Component {
     unsafe fn getProcessContextRequirements(&self) -> u32 {
         use IProcessContextRequirements_::Flags_ as F;
-        F::kNeedTempo | F::kNeedTransportState | F::kNeedProjectTimeMusic | F::kNeedTimeSignature
+        // `i32` on MSVC, `u32` elsewhere
+        (F::kNeedTempo | F::kNeedTransportState | F::kNeedProjectTimeMusic | F::kNeedTimeSignature) as u32
     }
 }
 
