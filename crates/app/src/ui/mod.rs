@@ -428,8 +428,15 @@ impl App {
 
     /// Compile the project and hand the plan to the engine (off the audio thread).
     /// The project as the engine plays it: the document plus listening-only adjustments that
-    /// are never saved (an Evolve preview's level match).
+    /// are never saved (an Evolve preview's level match, or an autosave being compared).
     pub(crate) fn engine_project(&self) -> rawdawg_project::Project {
+        // comparing a recovery candidate: the engine plays the autosave (listening only)
+        if let Some(c) = &self.files.compare
+            && c.listen_autosave
+            && !self.files.recovery.is_empty()
+        {
+            return c.autosave.clone();
+        }
         let mut project = self.project.clone();
         let evolve = &self.synth_panel.evolve;
         if let (Some(trim), Some((instance, _))) = (evolve.preview_trim_db, evolve.preview_backup.as_ref())

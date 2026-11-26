@@ -35,6 +35,18 @@ pub(crate) struct ProjectFilesState {
     pub last_autosave_note: Option<String>,
     /// Relink: asset id → path typed by the user.
     pub relink: Option<(rawdawg_types::AssetId, String)>,
+    /// The recovery offer's Compare view: the chosen autosave, what it changes, and which
+    /// version the engine plays.
+    pub compare: Option<RecoveryCompare>,
+}
+
+pub(crate) struct RecoveryCompare {
+    /// Index into `recovery`.
+    pub candidate: usize,
+    pub autosave: Project,
+    pub changes: Vec<String>,
+    /// The engine plays the autosave instead of the saved project (listening only).
+    pub listen_autosave: bool,
 }
 
 impl App {
@@ -55,6 +67,7 @@ impl App {
         }
         self.open_project(dir.clone());
         self.files.recovery = rawdawg_project::recovery_candidates(&dir);
+        self.files.compare = None;
         self.files.last_autosave = Some(Instant::now());
         self.files.error = None;
         self.files.dialog = None;
@@ -70,14 +83,55 @@ impl App {
         }
     }
 
+    /// Read a recovery candidate (large plugin states inlined from the project's plugin-state/).
+    fn load_candidate(&self, candidate: &RecoveryCandidate) -> Result<Project, String> {
+        let mut p = std::fs::read(&candidate.path).map_err(|e| e.to_string()).and_then(|b| rawdawg_project::persist::parse_project(&b).map_err(|e| e.to_string()))?;
+        if let Some(dir) = &self.project_path {
+            let _ = rawdawg_project::plugin_state::inline(dir, &mut p);
+        }
+        Ok(p)
+    }
+
+    /// Open the Compare view on recovery candidate `index` (what it changes; listen to either).
+    pub(crate) fn compare_recovery(&mut self, index: usize) {
+        let Some(c) = self.files.recovery.get(index).cloned() else { return };
+        let listen_autosave = self.files.compare.as_ref().is_some_and(|x| x.listen_autosave);
+        match self.load_candidate(&c) {
+            Ok(autosave) => {
+                let changes = rawdawg_project::compare::describe_changes(&self.project, &autosave);
+                self.files.compare = Some(RecoveryCompare { candidate: index, autosave, changes, listen_autosave });
+                if listen_autosave {
+                    self.recompile();
+                }
+            }
+            Err(e) => self.status_line = format!("Could not read the autosave: {e}"),
+        }
+    }
+
+    /// Switch which version the engine plays while comparing (the document is not touched).
+    pub(crate) fn listen_to_autosave(&mut self, autosave: bool) {
+        if let Some(c) = self.files.compare.as_mut()
+            && c.listen_autosave != autosave
+        {
+            c.listen_autosave = autosave;
+            self.send(EngineCommand::Panic { source: None });
+            self.recompile();
+        }
+    }
+
+    /// Leave the Compare view; the engine plays the document again.
+    fn end_compare(&mut self) {
+        if self.files.compare.take().is_some_and(|c| c.listen_autosave) {
+            self.send(EngineCommand::Panic { source: None });
+            self.recompile();
+        }
+    }
+
     /// Use a recovery candidate as the working project (dirty; the saved manifest stays until Save).
     pub(crate) fn recover_from(&mut self, candidate: &RecoveryCandidate) {
-        match std::fs::read(&candidate.path).map_err(|e| e.to_string()).and_then(|b| rawdawg_project::persist::parse_project(&b).map_err(|e| e.to_string())) {
-            Ok(mut p) => {
-                if let Some(dir) = &self.project_path {
-                    // large plugin states of the autosave live in the project's plugin-state/
-                    let _ = rawdawg_project::plugin_state::inline(dir, &mut p);
-                }
+        self.end_compare();
+        match self.load_candidate(candidate) {
+            Ok(p) => {
                 self.send(EngineCommand::Panic { source: None });
                 self.project = p;
                 self.history = History::new();
@@ -92,6 +146,7 @@ impl App {
     }
 
     pub(crate) fn discard_recovery(&mut self) {
+        self.end_compare();
         if let Some(dir) = &self.project_path {
             rawdawg_project::persist::clear_autosaves(dir);
         }
@@ -108,6 +163,7 @@ impl App {
         self.project_path = None;
         self.selected_channel = self.project.channels.first().map(|c| c.id);
         self.files.recovery.clear();
+        self.files.compare = None;
         self.rebuild_mirrors();
         self.recompile();
         self.status_line = "New project (unsaved — File › Save As… to choose a folder)".into();
@@ -273,26 +329,87 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     }
     // ---- recovery offer
     if !app.files.recovery.is_empty() {
+        let mut keep_saved = false;
+        let mut recover: Option<RecoveryCandidate> = None;
+        let mut discard = false;
+        let mut compare_index: Option<usize> = None;
+        let mut listen: Option<bool> = None;
         egui::Window::new("Recover unsaved changes?").collapsible(false).resizable(false).show(ctx, |ui| {
-            let c = app.files.recovery[0].clone();
+            let selected = app.files.compare.as_ref().map_or(0, |c| c.candidate);
+            let c = app.files.recovery[selected.min(app.files.recovery.len() - 1)].clone();
             ui.label(format!(
-                "An autosave newer than the saved project was found (revision {} vs {}, {} autosave(s)). Recover it, keep the saved version, or discard the autosaves.",
+                "An autosave newer than the saved project was found (revision {} vs {}, {} autosave(s)). Compare them, recover it, keep the saved version, or discard the autosaves.",
                 c.revision,
                 app.project.revision,
                 app.files.recovery.len()
             ));
+            if app.files.recovery.len() > 1 {
+                let label = |r: &RecoveryCandidate| format!("revision {}, {}", r.revision, ago(r.saved_unix_ms));
+                egui::ComboBox::from_id_salt("recovery-candidate").selected_text(label(&c)).show_ui(ui, |ui| {
+                    for (i, r) in app.files.recovery.iter().enumerate() {
+                        if ui.selectable_label(i == selected, label(r)).clicked() {
+                            compare_index = Some(i);
+                        }
+                    }
+                });
+            }
+            match &app.files.compare {
+                None => {
+                    if ui.button("Compare").on_hover_text("What the autosave changes, and listen to either version before choosing").clicked() {
+                        compare_index = Some(selected);
+                    }
+                }
+                Some(cmp) => {
+                    ui.separator();
+                    if cmp.changes.is_empty() {
+                        ui.label(egui::RichText::new("No musical difference: only bookkeeping changed.").color(theme::TEXT_SECONDARY));
+                    } else {
+                        ui.label(egui::RichText::new("The autosave, compared with the saved project:").strong());
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            for line in &cmp.changes {
+                                ui.label(format!("• {line}"));
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Listen to");
+                        if ui.selectable_label(!cmp.listen_autosave, "Saved").clicked() {
+                            listen = Some(false);
+                        }
+                        if ui.selectable_label(cmp.listen_autosave, "Autosave").clicked() {
+                            listen = Some(true);
+                        }
+                        ui.label(egui::RichText::new("(Play/Stop as usual; nothing is changed until you choose)").small().color(theme::TEXT_SECONDARY));
+                    });
+                    ui.separator();
+                }
+            }
             ui.horizontal(|ui| {
                 if ui.button("Recover").clicked() {
-                    app.recover_from(&c);
+                    recover = Some(c.clone());
                 }
                 if ui.button("Keep saved version (keep autosaves)").clicked() {
-                    app.files.recovery.clear();
+                    keep_saved = true;
                 }
                 if ui.button("Discard autosaves").clicked() {
-                    app.discard_recovery();
+                    discard = true;
                 }
             });
         });
+        if let Some(i) = compare_index {
+            app.compare_recovery(i);
+        }
+        if let Some(l) = listen {
+            app.listen_to_autosave(l);
+        }
+        if let Some(c) = recover {
+            app.recover_from(&c);
+        } else if keep_saved {
+            app.end_compare();
+            app.files.recovery.clear();
+        } else if discard {
+            app.discard_recovery();
+        }
     }
     // ---- read-only banner
     if let Some(r) = app.files.read_only.clone() {
@@ -350,4 +467,16 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         }
     }
     let _ = EditorView::Rack;
+}
+
+/// "3 min ago" for a unix-millisecond time stamp.
+fn ago(unix_ms: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(unix_ms);
+    let s = now.saturating_sub(unix_ms) / 1000;
+    match s {
+        0..=59 => format!("{s} s ago"),
+        60..=3599 => format!("{} min ago", s / 60),
+        3600..=86_399 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86_400),
+    }
 }

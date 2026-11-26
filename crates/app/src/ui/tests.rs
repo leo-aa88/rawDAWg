@@ -1589,3 +1589,61 @@ fn the_input_meter_holds_peaks_falls_back_and_lights_on_full_scale() {
     update_input_meter(&mut m, &mut clipped, None);
     assert_eq!(m, [0.0; 2], "no input, no level");
 }
+
+#[test]
+fn the_recovery_offer_compares_the_autosave_and_plays_either_version_before_choosing() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    use rawdawg_project::{Command, Note};
+    use rawdawg_types::NoteId;
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-compare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join("C.rawdawg");
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    h.app.save_project_as(dir.clone());
+    // unsaved work: a note and a renamed channel, autosaved, then a "crash"
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![Note { id: NoteId::new(), tick: Tick(0), duration_ticks: Tick(960), pitch: 60, velocity: 0.8, channel: 0 }],
+    });
+    h.app.apply(Command::RenameChannel { id: cid, name: "Lead".into() });
+    h.app.autosave_now(&dir);
+    drop(h);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    let click = |h: &mut Harness, label: &str| {
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == label).map(|(_, r)| r).unwrap_or_else(|| panic!("{label:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    click(&mut h, "Compare");
+    let changes = h.app.files.compare.as_ref().expect("comparing").changes.clone();
+    assert!(changes.iter().any(|l| l.contains("0 → 1 notes")), "{changes:?}");
+    assert!(changes.iter().any(|l| l.contains("Lead")), "{changes:?}");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.contains("0 → 1 notes")), "the summary is shown");
+    // listen to the autosave: the engine plays it, the document stays the saved version
+    click(&mut h, "Autosave");
+    let notes = |p: &rawdawg_project::Project| p.patterns[0].lanes.iter().map(|l| l.notes.len()).sum::<usize>();
+    assert_eq!(notes(&h.app.engine_project()), 1, "the engine plays the autosave");
+    assert_eq!(notes(&h.app.project), 0, "nothing is changed until you choose");
+    let loud = |p: &rawdawg_project::Project| {
+        rawdawg_dsp::math::rms(&render_project(p, &OfflineOptions { tail_seconds: 0.0, end_tick: Some(Tick(1920)), ..OfflineOptions::default() }).unwrap().0)
+    };
+    assert!(loud(&h.app.engine_project()) > 0.01, "the autosave's note sounds");
+    click(&mut h, "Saved");
+    assert_eq!(notes(&h.app.engine_project()), 0, "back to the saved version");
+    // recover: the autosave becomes the (unsaved) document and the compare view ends
+    click(&mut h, "Autosave");
+    click(&mut h, "Recover");
+    assert!(h.app.files.compare.is_none() && h.app.files.recovery.is_empty());
+    assert_eq!(notes(&h.app.project), 1);
+    assert_eq!(h.app.project.channels[0].name, "Lead");
+    assert!(h.app.history.is_dirty());
+    let _ = std::fs::remove_dir_all(&root);
+}

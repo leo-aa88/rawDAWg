@@ -3,6 +3,7 @@
 
 pub mod assets;
 pub mod commands;
+pub mod compare;
 pub mod lock;
 pub mod model;
 pub mod persist;
