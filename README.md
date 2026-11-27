@@ -1,5 +1,3 @@
-# rawDAWg
-
 <img width="1774" height="887" alt="Cão Áudio RawDAWg em Alto Contraste" src="https://github.com/user-attachments/assets/a032c7d7-46e2-4b36-9fc7-40c888325eb8" />
 
 [![CI](https://github.com/leo-aa88/rawDAWg/actions/workflows/ci.yml/badge.svg)](https://github.com/leo-aa88/rawDAWg/actions/workflows/ci.yml)
@@ -10,8 +8,6 @@
 [![Platforms: Windows | Ubuntu](https://img.shields.io/badge/platforms-Windows%20%7C%20Ubuntu-lightgrey.svg)](#install)
 [![Plugins: CLAP | VST3](https://img.shields.io/badge/plugins-CLAP%20%7C%20VST3-purple.svg)](#plugins)
 [![Status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](PROGRESS.md)
-
-**Less thinking. More noise.**
 
 rawDAWg is a native experimental digital audio workstation for Windows and Ubuntu. It is built
 for playing with sound rather than reasoning about how to make it: a playable synth on start-up,
