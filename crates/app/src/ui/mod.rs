@@ -7,6 +7,7 @@ mod effect_panel;
 mod evolve;
 mod export;
 mod graph_editor;
+mod held;
 mod instrument_panel;
 mod keyboard;
 mod mixer;
@@ -189,6 +190,10 @@ pub(crate) struct App {
     pub import_path: String,
     pub synth_panel: synth_panel::SynthPanelState,
     pub keyboard: keyboard::KeyboardState,
+    /// Keys being played now (typing keys, MIDI, on-screen piano, piano-roll keys).
+    pub held_notes: held::HeldNotes,
+    /// The part of the editor panel (under the playlist) that is visible this frame.
+    pub editor_clip: egui::Rect,
     pub settings: settings::SettingsState,
     midi_rescan_counter: u32,
     /// Per MIDI device: its clock mapped onto the process clock, and its latency (timestamped
@@ -304,6 +309,8 @@ impl App {
             import_path: String::new(),
             synth_panel: Default::default(),
             keyboard: Default::default(),
+            held_notes: Default::default(),
+            editor_clip: egui::Rect::NOTHING,
             settings: settings::SettingsState::from_request(&req),
             midi_rescan_counter: 0,
             midi_clocks: HashMap::new(),
@@ -534,6 +541,13 @@ impl App {
     }
 
     pub(crate) fn send(&mut self, cmd: EngineCommand) {
+        match &cmd {
+            // a panic lets go of every key the display shows
+            EngineCommand::Panic { source: None } => self.held_notes.clear(),
+            EngineCommand::Panic { source: Some(s) } => self.held_notes.track(&TimedEvent::new(0, *s, 0, rawdawg_types::events::EventKind::AllNotesOff { source: Some(*s) })),
+            EngineCommand::Live { event, .. } | EngineCommand::LiveAt { event, .. } if event.source == EventSource::Mouse => self.held_notes.track(event),
+            _ => {}
+        }
         if let AudioState::Running(sys) = &mut self.audio {
             let _ = sys.handle.send(cmd);
         }
@@ -797,6 +811,9 @@ impl App {
     pub(crate) fn live(&mut self, event: TimedEvent) {
         #[cfg(test)]
         self.live_log.push(event);
+        if event.source != EventSource::Mouse {
+            self.held_notes.track(&event);
+        }
         if let Some(channel) = self.selected_channel {
             self.send(EngineCommand::Live { channel, event });
         }
@@ -822,6 +839,7 @@ impl App {
         let target = rawdawg_audio_engine::timing::place_event(jitter, frame, block_wall, block, sr, wall, rawdawg_rt::clock::now_us());
         #[cfg(test)]
         self.live_log.push(event);
+        self.held_notes.track(&event);
         if let Some(channel) = self.selected_channel {
             self.send(EngineCommand::LiveAt { channel, event, stream_frame: target });
         }
@@ -1172,6 +1190,14 @@ impl App {
                 self.prefs.typing_octave = (self.prefs.typing_octave + 1).min(4);
             }
             ui.add(rawdawg_ui::params::slider(ui, &mut self.prefs.typing_velocity, 0.05..=1.0).text("Vel").fixed_decimals(2));
+            // the keys being played, by name (C4 is middle C), and the chord they form; a fixed
+            // width so the toolbar does not move while playing
+            let text = held::describe(&self.held_notes.pitches());
+            ui.allocate_ui_with_layout(egui::vec2(HELD_LABEL_W, ui.spacing().interact_size.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(HELD_LABEL_W);
+                ui.add(egui::Label::new(egui::RichText::new(text).monospace().color(theme::KEY_HELD)).truncate())
+                    .on_hover_text("The keys you are playing (typing keys, MIDI, on-screen piano; C4 is middle C) and the chord they form");
+            });
         });
         ui.data_mut(|d| d.insert_temp(group, r.response.rect.width()));
     }
@@ -1775,6 +1801,9 @@ impl App {
     }
 }
 
+/// Room for the held keys in the toolbar ("C4 Eb4 G4 Bb4 · Cm7" fits).
+const HELD_LABEL_W: f32 = 210.0;
+
 /// A label cut to at most `max_w` points (egui shows the whole text on hover when it is cut),
 /// so it can never push what follows it out of the row.
 fn bounded_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, max_w: f32) -> egui::Response {
@@ -1936,7 +1965,10 @@ impl App {
                 .resizable(true)
                 .default_size(self.editor_height_hint.unwrap_or(if self.synth_panel.graph.focus_frames > 0 { 560.0 } else { 380.0 }))
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.editor_contents(ui));
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        self.editor_clip = ui.clip_rect();
+                        self.editor_contents(ui)
+                    });
                 });
         }
         if parts & 32 != 0 {

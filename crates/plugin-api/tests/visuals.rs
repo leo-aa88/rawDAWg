@@ -154,21 +154,32 @@ fn the_synth_window_shapes_the_envelope_and_the_filter_and_ends_gestures_on_clos
     use rawdawg_synthesizer::params as sp;
     let port = Port::new("rawdawg.synth");
     let mut d = Driver::new("rawdawg.synth", port.clone());
-    let env = d.rect(envelope_canvas_id()).shrink(10.0);
-    let (a, dec, s, rel) = (port.phys(sp::AMP_ATTACK) as f32, port.phys(sp::AMP_DECAY) as f32, port.phys(sp::AMP_SUSTAIN) as f32, port.phys(sp::AMP_RELEASE) as f32);
-    // the handles where the visual draws them (segment widths ∝ √time)
-    let w = [a.sqrt(), dec.sqrt(), 0.35f32.sqrt(), rel.sqrt()];
-    let total: f32 = w.iter().sum();
-    let x = |k: usize| env.min.x + env.width() * w[..k].iter().sum::<f32>() / total;
-    let sustain_handle = pos2(x(2), env.max.y - env.height() * s);
-    let release_handle = pos2(x(4), env.max.y);
-    // sustain up
+    // the same envelope editor as in rawDAWg: its points are where the shared widget puts them
+    use rawdawg_ui::envelope::{Adsr, AdsrPoint, curve_rect, point_pos};
+    let env = curve_rect(d.rect(envelope_canvas_id()));
+    let adsr = |port: &Port| Adsr {
+        attack_s: port.phys(sp::AMP_ATTACK) as f32,
+        decay_s: port.phys(sp::AMP_DECAY) as f32,
+        sustain: port.phys(sp::AMP_SUSTAIN) as f32,
+        release_s: port.phys(sp::AMP_RELEASE) as f32,
+    };
+    let s = adsr(&port).sustain;
+    // sustain up (the point at the end of the sustain)
+    let sustain_handle = point_pos(env, &adsr(&port), AdsrPoint::Sustain);
     d.drag(sustain_handle, sustain_handle + vec2(0.0, -30.0));
     assert!(port.phys(sp::AMP_SUSTAIN) as f32 > s + 0.05, "sustain {s} → {}", port.phys(sp::AMP_SUSTAIN));
-    // release longer: its handle (the envelope's end) to the right
+    assert!(port.gestures_balanced(), "{:?}", port.0.log.borrow());
+    // release shorter: the envelope's end to the left
     let before = port.phys(sp::AMP_RELEASE);
+    let release_handle = point_pos(env, &adsr(&port), AdsrPoint::Release);
     d.drag(release_handle, release_handle + vec2(-40.0, 0.0));
     assert!(port.phys(sp::AMP_RELEASE) < before, "dragging the end left shortens the release: {before} → {}", port.phys(sp::AMP_RELEASE));
+    // attack longer: its peak to the right
+    let before = port.phys(sp::AMP_ATTACK);
+    let attack_handle = point_pos(env, &adsr(&port), AdsrPoint::Attack);
+    d.drag(attack_handle, attack_handle + vec2(30.0, 0.0));
+    assert!(port.phys(sp::AMP_ATTACK) > before, "attack {before} → {}", port.phys(sp::AMP_ATTACK));
+    assert!(port.gestures_balanced(), "{:?}", port.0.log.borrow());
     // the filter handle: left lowers the cutoff
     let filt = d.rect(filter_canvas_id());
     let fc = port.phys(sp::FILTER_CUTOFF) as f32;

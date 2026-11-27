@@ -285,7 +285,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         });
         ui.separator();
         let sel = app.playlist.selection.len();
-        if ui.add_enabled(sel > 0, egui::Button::new("Split at playhead")).on_hover_text("S").clicked() {
+        if ui.add_enabled(sel > 0, egui::Button::new("Split at playhead")).on_hover_text("S (when typing keys are off)").clicked() {
             split_selected(app, &mut cmds);
         }
         if ui.add_enabled(sel > 0, egui::Button::new("Make unique")).on_hover_text("Clone the pattern of the selected clip(s) so edits no longer affect other clips").clicked() {
@@ -1082,10 +1082,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     // keys
     let text_focused = ui.memory(|m| m.focused().is_some());
     if (ui.rect_contains_pointer(full) || app.key_target == super::KeyTarget::Playlist) && !text_focused {
+        // with typing keys on, S is a note (C#): it must not split clips as well
+        let typing = app.typing_enabled && app.selected_channel.is_some();
         let (del, split, dup, all, esc) = ui.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::S),
+                !typing && i.consume_key(egui::Modifiers::NONE, egui::Key::S),
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D)),
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::A)),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
@@ -1145,6 +1147,10 @@ fn fmt_bar(tick: i64, bar_ticks: i64) -> String {
 fn split_selected(app: &mut App, cmds: &mut Vec<Command>) {
     let Some(at) = app.playhead_tick() else { return };
     let sel: Vec<Clip> = app.project.clips.iter().filter(|c| app.playlist.selection.contains(&c.id)).cloned().collect();
+    if sel.is_empty() {
+        app.status_line = "Select a clip to split (click it), or right-click it and choose Split here".into();
+        return;
+    }
     if !sel.iter().any(|c| at > c.start_tick.0 && at < c.end_tick().0) {
         app.status_line = "Put the playhead inside the clip (click the ruler there) to split it".into();
         return;

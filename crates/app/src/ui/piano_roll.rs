@@ -260,7 +260,7 @@ pub(crate) struct PianoRollState {
     /// First visible tick.
     scroll_tick: f32,
     px_per_tick: f32,
-    row_h: f32,
+    pub(crate) row_h: f32,
     pub selection: HashSet<NoteId>,
     gesture: Option<Gesture>,
     /// Pattern/channel the gesture belongs to.
@@ -583,14 +583,19 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             fill = theme::ACCENT.linear_multiply(if p % 12 == app.piano_roll.scale_root as i32 % 12 { 0.22 } else { 0.1 });
         }
         painter.rect_filled(r, 0.0, fill);
+        // a key being played lights its row and its key
+        let held = app.held_notes.contains(p as u8);
+        if held {
+            painter.rect_filled(r, 0.0, theme::KEY_HELD.linear_multiply(0.2));
+        }
         if p % 12 == 0 {
             painter.line_segment([pos2(grid_rect.min.x, r.max.y), pos2(grid_rect.max.x, r.max.y)], Stroke::new(1.0, theme::BORDER));
         }
         // keyboard: white keys with black keys drawn shorter on top
         let kr = Rect::from_min_max(pos2(keys_rect.min.x, r.min.y), pos2(keys_rect.max.x - 2.0, r.max.y));
-        painter.rect_filled(kr, 0.0, Color32::from_gray(0xD8));
+        painter.rect_filled(kr, 0.0, if held && !black { theme::KEY_HELD } else { Color32::from_gray(0xD8) });
         if black {
-            painter.rect_filled(Rect::from_min_max(kr.min, pos2(kr.min.x + kr.width() * 0.6, kr.max.y)), 0.0, Color32::from_gray(0x18));
+            painter.rect_filled(Rect::from_min_max(kr.min, pos2(kr.min.x + kr.width() * 0.6, kr.max.y)), 0.0, if held { theme::KEY_HELD } else { Color32::from_gray(0x18) });
         } else if matches!(p % 12, 0 | 5) {
             painter.line_segment([pos2(kr.min.x, kr.max.y), pos2(kr.max.x, kr.max.y)], Stroke::new(1.0, Color32::from_gray(0x80)));
         }

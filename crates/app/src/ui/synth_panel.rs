@@ -35,7 +35,15 @@ impl SynthPanelState {
     }
 }
 
-const SIMPLE: &[u32] = &[params::AMP_ATTACK, params::AMP_RELEASE, params::FILTER_CUTOFF, params::FILTER_RESONANCE, params::MASTER_GAIN, params::VOICE_MODE];
+/// The few controls under the wave editor in the simple view (the envelope has its own editor).
+const SIMPLE: &[u32] = &[params::FILTER_CUTOFF, params::FILTER_RESONANCE, params::MASTER_GAIN, params::VOICE_MODE];
+
+/// Most oscillators the Oscillators section stacks.
+pub(crate) const MAX_OSCILLATORS: usize = 3;
+
+/// Panel width from which the oscillators and the envelope sit side by side (the oscillator
+/// table needs about 640 points).
+const TWO_COLUMNS_FROM: f32 = 1340.0;
 
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(channel_id) = app.selected_channel else {
@@ -57,6 +65,19 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     });
     super::presets::show(app, ui, instance_id);
+    let mut basics: Vec<(ParamId, f32, bool, bool)> = Vec::new();
+    if ui.available_width() >= TWO_COLUMNS_FROM {
+        ui.columns(2, |cols| {
+            oscillators(app, &mut cols[0], instance_id, &mut basics);
+            envelope_section(app, &mut cols[1], instance_id, &mut basics);
+        });
+    } else {
+        oscillators(app, ui, instance_id, &mut basics);
+        ui.separator();
+        envelope_section(app, ui, instance_id, &mut basics);
+    }
+    apply_edits(app, instance_id, basics);
+    ui.separator();
     super::waveform::show(app, ui, instance_id);
     super::evolve::randomize_bar(app, ui, instance_id);
     ui.separator();
@@ -146,6 +167,334 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     keyboard::show(app, ui);
 }
 
+fn desc(pid: u32) -> Option<&'static ParamDescriptor> {
+    params::DESCRIPTORS.iter().find(|d| d.id.0 == pid)
+}
+
+/// A slider over a parameter shown in its own units (`to_normalized` maps them), with the
+/// parameter menu and the usual gesture: live while dragging, one undo step on release.
+/// `label` names it for screen readers (and tests).
+#[allow(clippy::too_many_arguments)]
+fn unit_slider(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    instance_id: InstanceId,
+    label: &str,
+    pid: u32,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    to_normalized: impl Fn(f32) -> f32,
+    edits: &mut Vec<(ParamId, f32, bool, bool)>,
+) -> egui::Response {
+    let Some(d) = desc(pid) else { return ui.label("") };
+    let current = app.synth_mirrors[&instance_id].param(d.id).unwrap_or(d.default_normalized);
+    let mut v = value;
+    let resp = ui.add(rawdawg_ui::params::slider(ui, &mut v, range).show_value(false));
+    let resp = rawdawg_ui::params::context_menu(&resp, |ui| param_menu(app, ui, instance_id, d, edits)).map(|r| r.response).unwrap_or(resp);
+    resp.widget_info(|| egui::WidgetInfo::slider(true, f64::from(v), label));
+    let n = to_normalized(v).clamp(0.0, 1.0);
+    if resp.changed() && (n - current).abs() > 1e-7 {
+        let started = resp.drag_started() || !app.synth_panel.gesture.as_ref().is_some_and(|(i, _)| *i == instance_id);
+        edits.push((d.id, n, started, !resp.dragged()));
+    } else if resp.drag_stopped() {
+        edits.push((d.id, current, false, true));
+    }
+    resp
+}
+
+/// The quick starts of the Oscillators section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Template {
+    Sine,
+    Saw,
+    Square,
+    Triangle,
+    SawSquare,
+    SawOctaves,
+    DetunedSaws,
+}
+
+impl Template {
+    pub(crate) const ALL: [Template; 7] = [Template::Sine, Template::Saw, Template::Square, Template::Triangle, Template::SawSquare, Template::SawOctaves, Template::DetunedSaws];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Template::Sine => "Sine",
+            Template::Saw => "Saw",
+            Template::Square => "Square",
+            Template::Triangle => "Triangle",
+            Template::SawSquare => "Saw + Square",
+            Template::SawOctaves => "Saw octaves",
+            Template::DetunedSaws => "Detuned saws + sub",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Template::SawSquare => "A saw and a square together",
+            Template::SawOctaves => "Three saws: as played, one octave up, two octaves up",
+            Template::DetunedSaws => "Two saws 7 cents apart and a sine an octave below",
+            _ => "One oscillator with this wave",
+        }
+    }
+
+    /// A fresh sound (Init's envelope and filter) with these oscillators.
+    pub(crate) fn patch(self) -> rawdawg_synthesizer::Patch {
+        use rawdawg_dsp::oscillator::BasicWave::{Pulse, Saw, Sine, Triangle};
+        let osc = |wave, octave: i32, cents: f32, level: f32| Layer { coarse_semitones: 12 * octave, fine_cents: cents, level_db: 20.0 * level.log10(), ..Layer::basic(wave) };
+        let layers = match self {
+            Template::Sine => vec![osc(Sine, 0, 0.0, 1.0)],
+            Template::Saw => vec![osc(Saw, 0, 0.0, 1.0)],
+            Template::Square => vec![osc(Pulse, 0, 0.0, 1.0)],
+            Template::Triangle => vec![osc(Triangle, 0, 0.0, 1.0)],
+            Template::SawSquare => vec![osc(Saw, 0, 0.0, 0.7), osc(Pulse, 0, 0.0, 0.7)],
+            Template::SawOctaves => vec![osc(Saw, 0, 0.0, 0.6), osc(Saw, 1, 0.0, 0.6), osc(Saw, 2, 0.0, 0.6)],
+            Template::DetunedSaws => vec![osc(Saw, 0, -7.0, 0.7), osc(Saw, 0, 7.0, 0.7), osc(Sine, -1, 0.0, 0.4)],
+        };
+        rawdawg_synthesizer::Patch { name: self.label().to_owned(), layers, ..rawdawg_synthesizer::Patch::default() }
+    }
+}
+
+/// The waves an oscillator row offers, in menu order.
+const WAVES: [rawdawg_dsp::oscillator::BasicWave; 4] =
+    [rawdawg_dsp::oscillator::BasicWave::Sine, rawdawg_dsp::oscillator::BasicWave::Saw, rawdawg_dsp::oscillator::BasicWave::Pulse, rawdawg_dsp::oscillator::BasicWave::Triangle];
+
+fn wave_name(w: rawdawg_dsp::oscillator::BasicWave) -> &'static str {
+    use rawdawg_dsp::oscillator::BasicWave::*;
+    match w {
+        Sine => "Sine",
+        Saw => "Saw",
+        Pulse => "Square",
+        Triangle => "Triangle",
+    }
+}
+
+/// What an oscillator plays, in the words of the Waveform column.
+fn generator_name(g: &Generator) -> &'static str {
+    match g {
+        Generator::Basic { wave, .. } => wave_name(*wave),
+        Generator::Wavetable { .. } => "Custom wave",
+        Generator::Fm(_) => "FM",
+        Generator::Additive(_) => "Additive",
+        Generator::Granular { .. } => "Granular",
+        Generator::Pluck(_) => "Pluck",
+    }
+}
+
+/// Level in percent of full scale for a level in dB (−60 dB and below read 0 %).
+fn level_percent(db: f32) -> f32 {
+    if db <= -60.0 { 0.0 } else { 100.0 * 10f32.powf(db / 20.0) }
+}
+
+fn percent_db(pct: f32) -> f32 {
+    if pct <= 0.1 { -60.0 } else { (20.0 * (pct / 100.0).log10()).max(-60.0) }
+}
+
+/// Oscillators: quick starts, then one row per layer (on, waveform, octave, detune, level).
+fn oscillators(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    let patch = app.synth_mirrors[&instance_id].patch().clone();
+    ui.label(egui::RichText::new("Oscillators").strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Start from").color(theme::TEXT_SECONDARY));
+        for t in Template::ALL {
+            if ui.button(t.label()).on_hover_text(format!("{} (a fresh sound; Undo goes back)", t.tip())).clicked() {
+                commit_patch(app, instance_id, t.patch());
+                app.status_line = format!("Started from {}", t.label());
+            }
+        }
+    });
+    let param = |app: &App, layer: usize, offset: u32| -> Option<(u32, f32, f64)> {
+        let pid = params::layer_param(layer as u32, offset);
+        let d = desc(pid)?;
+        let n = app.synth_mirrors[&instance_id].param(d.id)?;
+        Some((pid, n, d.to_physical(n)))
+    };
+    let mut structural: Option<rawdawg_synthesizer::Patch> = None;
+    egui::Grid::new(("oscillators", instance_id)).num_columns(6).spacing([10.0, 4.0]).show(ui, |ui| {
+        for h in ["Oscillator", "Waveform", "Octave", "Detune", "Level", ""] {
+            ui.label(egui::RichText::new(h).color(theme::TEXT_SECONDARY));
+        }
+        ui.end_row();
+        for (i, layer) in patch.layers.iter().enumerate() {
+            // on/off
+            let enabled = param(app, i, params::L_ENABLED).map_or(layer.enabled, |p| p.2 >= 0.5);
+            let mut on = enabled;
+            if ui.checkbox(&mut on, format!("OSC {}", i + 1)).on_hover_text("Switch this oscillator on or off").changed()
+                && let Some((pid, ..)) = param(app, i, params::L_ENABLED)
+            {
+                edits.push((ParamId(pid), if on { 1.0 } else { 0.0 }, true, true));
+            }
+            // waveform
+            let live_wave = match &layer.generator {
+                Generator::Basic { .. } => param(app, i, params::L_WAVE).map(|p| rawdawg_dsp::oscillator::BasicWave::ALL[(p.2 as usize).min(3)]),
+                _ => None,
+            };
+            let shown = live_wave.map_or_else(|| generator_name(&layer.generator), wave_name);
+            let mut pick = None;
+            egui::ComboBox::from_id_salt(("osc-wave", instance_id, i)).selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                for w in WAVES {
+                    if ui.selectable_label(live_wave == Some(w), wave_name(w)).clicked() {
+                        pick = Some(w);
+                    }
+                }
+            });
+            if let Some(w) = pick {
+                match (&layer.generator, param(app, i, params::L_WAVE)) {
+                    // a basic oscillator switches its wave live (one undo step)
+                    (Generator::Basic { .. }, Some((pid, ..))) => {
+                        let d = desc(pid).expect("wave parameter");
+                        edits.push((ParamId(pid), d.to_normalized(w.index() as f64), true, true));
+                    }
+                    // anything else becomes a basic oscillator with that wave
+                    _ => {
+                        let mut p = patch.clone();
+                        p.layers[i].generator = Generator::Basic { wave: w, pulse_width: 0.5 };
+                        structural = Some(p);
+                    }
+                }
+            }
+            // octave (whole octaves of the coarse tuning; the parameter counts from −48 semitones)
+            let coarse = param(app, i, params::L_COARSE).map_or(layer.coarse_semitones, |p| p.2.round() as i32 - 48);
+            ui.horizontal(|ui| {
+                let mut step = 0;
+                if ui.small_button("−").on_hover_text("One octave down").clicked() {
+                    step = -12;
+                }
+                let rest = coarse - 12 * (coarse / 12);
+                let text = if rest == 0 { format!("{:+}", coarse / 12) } else { format!("{:+} {rest:+}st", coarse / 12) };
+                ui.label(egui::RichText::new(text.replace("+0", "0")).monospace());
+                if ui.small_button("+").on_hover_text("One octave up").clicked() {
+                    step = 12;
+                }
+                if step != 0
+                    && let Some((pid, ..)) = param(app, i, params::L_COARSE)
+                {
+                    let d = desc(pid).expect("coarse parameter");
+                    edits.push((ParamId(pid), d.to_normalized(f64::from((coarse + step).clamp(-48, 48) + 48)), true, true));
+                }
+            });
+            // detune in cents
+            ui.horizontal(|ui| {
+                let cents = param(app, i, params::L_FINE).map_or(layer.fine_cents, |p| p.2 as f32);
+                ui.spacing_mut().slider_width = 90.0;
+                let pid = params::layer_param(i as u32, params::L_FINE);
+                let d = desc(pid);
+                unit_slider(app, ui, instance_id, &format!("OSC {} Detune", i + 1), pid, cents, -100.0..=100.0, |c| d.map_or(0.5, |d| d.to_normalized(f64::from(c))), edits)
+                    .on_hover_text("Fine detune in cents (right-click: reset, automation, MIDI learn)");
+                ui.label(egui::RichText::new(format!("{:+.0} cents", cents)).monospace());
+            });
+            // level in percent
+            ui.horizontal(|ui| {
+                let db = param(app, i, params::L_LEVEL).map_or(layer.level_db, |p| p.2 as f32);
+                let pct = level_percent(db);
+                ui.spacing_mut().slider_width = 90.0;
+                let pid = params::layer_param(i as u32, params::L_LEVEL);
+                let d = desc(pid);
+                unit_slider(
+                    app,
+                    ui,
+                    instance_id,
+                    &format!("OSC {} Level", i + 1),
+                    pid,
+                    pct.min(100.0),
+                    0.0..=100.0,
+                    |p| d.map_or(1.0, |d| d.to_normalized(f64::from(percent_db(p)))),
+                    edits,
+                );
+                ui.label(egui::RichText::new(format!("{pct:.0}%")).monospace());
+            });
+            if patch.layers.len() > 1 && ui.small_button("×").on_hover_text("Remove this oscillator").clicked() {
+                let mut p = patch.clone();
+                p.layers.remove(i);
+                structural = Some(p);
+            } else if patch.layers.len() <= 1 {
+                ui.label("");
+            }
+            ui.end_row();
+        }
+    });
+    if patch.layers.len() < MAX_OSCILLATORS && ui.button("+ Oscillator").on_hover_text("Another oscillator: a copy of the last one, an octave higher (up to three)").clicked() {
+        let mut p = patch.clone();
+        if let Some(last) = p.layers.last().cloned() {
+            p.layers.push(Layer { coarse_semitones: (last.coarse_semitones + 12).min(48), ..last });
+        }
+        structural = Some(p);
+    }
+    if let Some(p) = structural {
+        commit_patch(app, instance_id, p);
+    }
+}
+
+/// The amplitude envelope's editor id (tests drag its points).
+pub(crate) fn envelope_id(instance_id: InstanceId) -> egui::Id {
+    egui::Id::unique(("amp-envelope", instance_id))
+}
+
+const ENVELOPE: [u32; 4] = [params::AMP_ATTACK, params::AMP_DECAY, params::AMP_SUSTAIN, params::AMP_RELEASE];
+
+/// Envelope readouts: times in ms (s from one second), sustain in percent.
+fn envelope_text(pid: u32, physical: f64) -> String {
+    if pid == params::AMP_SUSTAIN {
+        format!("{:.0}%", physical * 100.0)
+    } else if physical < 1.0 {
+        format!("{:.0} ms", physical.max(0.0) * 1000.0)
+    } else {
+        format!("{physical:.2} s")
+    }
+}
+
+/// The amplitude envelope: drag the curve's points, or use the sliders under it; the values
+/// follow either way while dragging, and each drag is one undo step.
+fn envelope_section(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Amplitude envelope").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(egui::RichText::new("ADSR").color(theme::TEXT_SECONDARY)));
+    });
+    let norm = |app: &App, pid: u32| desc(pid).and_then(|d| app.synth_mirrors[&instance_id].param(d.id)).unwrap_or(0.0);
+    let phys = |app: &App, pid: u32| desc(pid).map_or(0.0, |d| d.to_physical(norm(app, pid)) as f32);
+    let v = rawdawg_ui::envelope::Adsr {
+        attack_s: phys(app, params::AMP_ATTACK),
+        decay_s: phys(app, params::AMP_DECAY),
+        sustain: phys(app, params::AMP_SUSTAIN),
+        release_s: phys(app, params::AMP_RELEASE),
+    };
+    if let Some(drag) = rawdawg_ui::envelope::editor(ui, envelope_id(instance_id), &v, 150.0) {
+        use rawdawg_ui::envelope::AdsrPoint;
+        let moves: Vec<(u32, f32)> = match drag.point {
+            AdsrPoint::Attack => vec![(params::AMP_ATTACK, drag.dx)],
+            AdsrPoint::Decay => vec![(params::AMP_DECAY, drag.dx), (params::AMP_SUSTAIN, drag.dy)],
+            AdsrPoint::Sustain => vec![(params::AMP_SUSTAIN, drag.dy)],
+            AdsrPoint::Release => vec![(params::AMP_RELEASE, drag.dx)],
+        };
+        let new: Vec<(ParamId, f32)> = moves.iter().map(|(pid, delta)| (ParamId(*pid), (norm(app, *pid) + delta).clamp(0.0, 1.0))).collect();
+        // every value first, then the ends: the first end commits the whole drag
+        edits.extend(new.iter().map(|(id, n)| (*id, *n, drag.started, false)));
+        if drag.stopped {
+            edits.extend(new.iter().map(|(id, n)| (*id, *n, false, true)));
+        }
+    }
+    for (row, pair) in ENVELOPE.chunks(2).enumerate() {
+        // each row of columns gets its own id, or the two rows' sliders would share theirs
+        ui.push_id(("envelope-row", row), |ui| {
+            ui.columns(2, |cols| {
+                for (ui, &pid) in cols.iter_mut().zip(pair) {
+                    let Some(d) = desc(pid) else { continue };
+                    let n = norm(app, pid);
+                    ui.horizontal(|ui| {
+                        ui.label(d.name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new(envelope_text(pid, d.to_physical(n))).monospace())
+                        });
+                    });
+                    ui.spacing_mut().slider_width = (ui.available_width() - 20.0).max(60.0);
+                    unit_slider(app, ui, instance_id, d.name, pid, n, 0.0..=1.0, |x| x, edits);
+                }
+            })
+        });
+    }
+}
+
 fn generator_core_visible(kind: usize, offset: u32) -> bool {
     match offset {
         params::L_WAVE | params::L_PULSE_WIDTH => kind == 0,
@@ -232,40 +581,7 @@ fn param_grid(
                 }
                 _ => ui.add(rawdawg_ui::params::slider(ui, &mut n, 0.0..=1.0).show_value(false)),
             };
-            let resp = rawdawg_ui::params::context_menu(&resp, |ui| {
-                let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
-                if ui.button(if locked { "Unlock for randomize" } else { "Lock for randomize" }).clicked() {
-                    app.synth_panel.evolve.locks.set_param(d.id.0, !locked);
-                    ui.close();
-                }
-                if ui.button("Reset to default").clicked() {
-                    edits.push((d.id, d.default_normalized, true, true));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("MIDI learn (then move a controller)").clicked() {
-                    app.arm_midi_learn(instance_id, d.id.0);
-                    ui.close();
-                }
-                if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
-                    app.remove_midi_mapping(instance_id, d.id.0);
-                    ui.close();
-                }
-                if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
-                    super::automation::create_clip_for(app, instance_id, d.id.0);
-                    ui.close();
-                }
-                if ui
-                    .button("Automate in this pattern")
-                    .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
-                    .clicked()
-                {
-                    super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
-                    ui.close();
-                }
-            })
-            .map(|r| r.response)
-            .unwrap_or(resp);
+            let resp = rawdawg_ui::params::context_menu(&resp, |ui| param_menu(app, ui, instance_id, d, edits)).map(|r| r.response).unwrap_or(resp);
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
             if labeled.is_some() {
@@ -287,6 +603,36 @@ fn param_grid(
             }
         }
     });
+}
+
+/// The right-click menu of a synth parameter: randomize lock, reset, MIDI learn, automation.
+fn param_menu(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, d: &ParamDescriptor, edits: &mut Vec<(ParamId, f32, bool, bool)>) {
+    let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
+    if ui.button(if locked { "Unlock for randomize" } else { "Lock for randomize" }).clicked() {
+        app.synth_panel.evolve.locks.set_param(d.id.0, !locked);
+        ui.close();
+    }
+    if ui.button("Reset to default").clicked() {
+        edits.push((d.id, d.default_normalized, true, true));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("MIDI learn (then move a controller)").clicked() {
+        app.arm_midi_learn(instance_id, d.id.0);
+        ui.close();
+    }
+    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+        app.remove_midi_mapping(instance_id, d.id.0);
+        ui.close();
+    }
+    if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
+        super::automation::create_clip_for(app, instance_id, d.id.0);
+        ui.close();
+    }
+    if ui.button("Automate in this pattern").on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode").clicked() {
+        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+        ui.close();
+    }
 }
 
 pub(crate) fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(ParamId, f32, bool, bool)>) {

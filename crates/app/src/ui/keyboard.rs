@@ -49,11 +49,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         let idx = ((x / white_w) as usize).min(whites.len() - 1);
         Some(whites[idx])
     };
-    let held_pitch = app.keyboard.held.map(|h| h.1);
+    // every key being played lights up (typing keys, MIDI, the mouse here or in the piano roll)
+    let lit = |p: u8| app.keyboard.held.is_some_and(|h| h.1 == p) || app.held_notes.contains(p);
     for (i, w) in whites.iter().enumerate() {
         let x = rect.min.x + i as f32 * white_w;
         let r = egui::Rect::from_min_max(egui::pos2(x, rect.min.y), egui::pos2(x + white_w - 1.0, rect.max.y));
-        let fill = if held_pitch == Some(*w) { theme::ACCENT } else { theme::TEXT };
+        let fill = if lit(*w) { theme::KEY_HELD } else { theme::TEXT };
         painter.rect_filled(r, 2.0, fill);
         if w % 12 == 0 {
             painter.text(
@@ -70,7 +71,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         if next <= 127 && is_black(next) && whites.get(i + 1).is_some() {
             let bx = rect.min.x + (i as f32 + 1.0) * white_w;
             let r = egui::Rect::from_center_size(egui::pos2(bx, rect.min.y + height * 0.3), egui::vec2(white_w * 0.6, height * 0.6));
-            let fill = if held_pitch == Some(next) { theme::ACCENT } else { theme::BACKGROUND };
+            let fill = if lit(next) { theme::KEY_HELD } else { theme::BACKGROUND };
             painter.rect_filled(r, 2.0, fill);
         }
     }

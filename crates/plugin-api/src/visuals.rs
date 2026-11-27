@@ -217,31 +217,13 @@ impl EditorVisual for EqVisual {
     }
 }
 
-/// What a synth drag moves.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SynthDrag {
-    Attack,
-    DecaySustain,
-    Release,
-    Filter,
-}
-
-/// The synth: the amp envelope with draggable attack, decay/sustain and release points, and the
-/// filter's response with a handle for cutoff (left/right) and resonance (up/down).
+/// The synth: the amp envelope (the app's own editor: drag its attack, decay, sustain and
+/// release points) and the filter's response with a handle for cutoff (left/right) and
+/// resonance (up/down).
 #[derive(Default)]
 pub struct SynthVisual {
-    drag: Option<(SynthDrag, f32, f32)>,
-}
-
-/// Envelope segment widths: proportional to the square root of their times, so both a 1 ms
-/// attack and a 5 s release stay visible.
-fn env_points(rect: egui::Rect, a: f32, d: f32, s: f32, r: f32) -> [egui::Pos2; 5] {
-    let hold = 0.35f32;
-    let w = [a.max(0.0).sqrt(), d.max(0.0).sqrt(), hold.sqrt(), r.max(0.0).sqrt()];
-    let total: f32 = w.iter().sum::<f32>().max(1e-6);
-    let x = |k: usize| rect.min.x + rect.width() * w[..k].iter().sum::<f32>() / total;
-    let y = |level: f32| rect.max.y - rect.height() * level.clamp(0.0, 1.0);
-    [egui::pos2(x(0), y(0.0)), egui::pos2(x(1), y(1.0)), egui::pos2(x(2), y(s)), egui::pos2(x(3), y(s)), egui::pos2(x(4), y(0.0))]
+    /// Filter handle drag: the last pointer position.
+    drag: Option<(f32, f32)>,
 }
 
 /// Magnitude (dB) of the synth's state-variable filter at `f` (mode 0 low-pass, 1 high-pass,
@@ -266,24 +248,44 @@ impl EditorVisual for SynthVisual {
         let (a, d, s, r) = (v(sp::AMP_ATTACK), v(sp::AMP_DECAY), v(sp::AMP_SUSTAIN), v(sp::AMP_RELEASE));
         let (fc, q, mode, filter_on) = (v(sp::FILTER_CUTOFF), v(sp::FILTER_RESONANCE), v(sp::FILTER_MODE) as usize, v(sp::FILTER_ENABLED) >= 0.5);
         let width = ui.available_width().max(300.0);
-        let (env_rect, filt_rect) = ui
+        let half = width * 0.5 - 6.0;
+        let (env_drag, filt_rect) = ui
             .horizontal(|ui| {
-                let (_, env) = ui.allocate_space(egui::vec2(width * 0.5 - 6.0, 150.0));
-                let (_, filt) = ui.allocate_space(egui::vec2(width * 0.5 - 6.0, 150.0));
-                (env, filt)
+                let adsr = rawdawg_ui::envelope::Adsr { attack_s: a, decay_s: d, sustain: s, release_s: r };
+                let drag = ui
+                    .allocate_ui(egui::vec2(half, 150.0), |ui| {
+                        ui.set_width(half);
+                        rawdawg_ui::envelope::editor(ui, envelope_canvas_id(), &adsr, 150.0)
+                    })
+                    .inner;
+                let (_, filt) = ui.allocate_space(egui::vec2(half, 150.0));
+                (drag, filt)
             })
             .inner;
-        // amp envelope
-        let env_resp = ui.interact(env_rect, envelope_canvas_id(), egui::Sense::drag());
-        let painter = ui.painter_at(env_rect);
-        painter.rect_filled(env_rect, 4.0, theme::BACKGROUND);
-        let inner = env_rect.shrink(10.0);
-        let pts = env_points(inner, a, d, s, r);
-        painter.add(egui::Shape::line(pts.to_vec(), egui::Stroke::new(2.0, theme::ACCENT)));
-        for p in [pts[1], pts[2], pts[4]] {
-            painter.circle(p, 5.0, theme::WARNING, egui::Stroke::new(1.0, theme::BACKGROUND));
+        // amp envelope: the dragged point's parameters follow the pointer (one gesture each)
+        if let Some(drag) = env_drag {
+            use rawdawg_ui::envelope::AdsrPoint;
+            let moves: &[(u32, f32)] = &match drag.point {
+                AdsrPoint::Attack => [(sp::AMP_ATTACK, drag.dx), (0, 0.0)],
+                AdsrPoint::Decay => [(sp::AMP_DECAY, drag.dx), (sp::AMP_SUSTAIN, drag.dy)],
+                AdsrPoint::Sustain => [(sp::AMP_SUSTAIN, drag.dy), (0, 0.0)],
+                AdsrPoint::Release => [(sp::AMP_RELEASE, drag.dx), (0, 0.0)],
+            };
+            for &(pid, delta) in moves.iter().filter(|(pid, _)| *pid != 0) {
+                let Some(dsc) = descriptor(port, pid) else { continue };
+                if drag.started {
+                    out.push(VisualEdit::Begin(dsc.id));
+                }
+                if delta != 0.0
+                    && let Some(n) = port.value(dsc.id)
+                {
+                    out.push(VisualEdit::Set(dsc.id, (n + delta).clamp(0.0, 1.0)));
+                }
+                if drag.stopped {
+                    out.push(VisualEdit::End(dsc.id));
+                }
+            }
         }
-        painter.text(env_rect.left_top() + egui::vec2(6.0, 4.0), egui::Align2::LEFT_TOP, "Amp envelope", egui::FontId::proportional(11.0), theme::TEXT_SECONDARY);
         // filter
         let filt_resp = ui.interact(filt_rect, filter_canvas_id(), egui::Sense::drag());
         let painter = ui.painter_at(filt_rect);
@@ -304,64 +306,29 @@ impl EditorVisual for SynthVisual {
             egui::FontId::proportional(11.0),
             theme::TEXT_SECONDARY,
         );
-        // gestures: the nearest handle (within 14 px) moves; normalized values follow the pointer
-        let id = |p: u32| descriptor(port, p).map(|d| d.id);
-        let ids_of = |which: SynthDrag| -> Vec<ParamId> {
-            match which {
-                SynthDrag::Attack => vec![id(sp::AMP_ATTACK)],
-                SynthDrag::DecaySustain => vec![id(sp::AMP_DECAY), id(sp::AMP_SUSTAIN)],
-                SynthDrag::Release => vec![id(sp::AMP_RELEASE)],
-                SynthDrag::Filter => vec![id(sp::FILTER_CUTOFF), id(sp::FILTER_RESONANCE)],
-            }
-            .into_iter()
-            .flatten()
-            .collect()
-        };
-        for (resp, candidates) in
-            [(&env_resp, vec![(SynthDrag::Attack, pts[1]), (SynthDrag::DecaySustain, pts[2]), (SynthDrag::Release, pts[4])]), (&filt_resp, vec![(SynthDrag::Filter, handle)])]
+        // the filter handle (within 14 px): cutoff follows the pointer, resonance moves with it
+        let ids: Vec<ParamId> = [sp::FILTER_CUTOFF, sp::FILTER_RESONANCE].into_iter().filter_map(|p| descriptor(port, p).map(|d| d.id)).collect();
+        if filt_resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin()).or(filt_resp.interact_pointer_pos())
+            && (handle - p).length() < 14.0
         {
-            if resp.drag_started()
-                && let Some(p) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
-                && let Some((which, _)) = candidates.iter().filter(|(_, h)| (*h - p).length() < 14.0).min_by(|x, y| (x.1 - p).length().total_cmp(&(y.1 - p).length()))
+            self.drag = Some((p.x, p.y));
+            out.extend(ids.iter().copied().map(VisualEdit::Begin));
+        }
+        if let Some((_, y0)) = self.drag
+            && filt_resp.dragged()
+            && let Some(p) = filt_resp.interact_pointer_pos()
+        {
+            set(port, sp::FILTER_CUTOFF, f64::from(x_to_freq(filt_rect, p.x)), &mut out);
+            if let Some(dsc) = descriptor(port, sp::FILTER_RESONANCE)
+                && let Some(n) = port.value(dsc.id)
             {
-                self.drag = Some((*which, p.x, p.y));
-                out.extend(ids_of(*which).into_iter().map(VisualEdit::Begin));
+                out.push(VisualEdit::Set(dsc.id, (n + (y0 - p.y) / filt_rect.height()).clamp(0.0, 1.0)));
             }
-            if let Some((which, x0, y0)) = self.drag
-                && candidates.iter().any(|(w, _)| *w == which)
-                && resp.dragged()
-                && let Some(p) = resp.interact_pointer_pos()
-            {
-                let rect = resp.rect;
-                let (dx, dy) = ((p.x - x0) / rect.width(), (y0 - p.y) / rect.height());
-                let nudge = |pid: u32, delta: f32, out: &mut Vec<VisualEdit>| {
-                    if let Some(d) = descriptor(port, pid)
-                        && let Some(n) = port.value(d.id)
-                    {
-                        out.push(VisualEdit::Set(d.id, (n + delta).clamp(0.0, 1.0)));
-                    }
-                };
-                match which {
-                    SynthDrag::Attack => nudge(sp::AMP_ATTACK, dx, &mut out),
-                    SynthDrag::DecaySustain => {
-                        nudge(sp::AMP_DECAY, dx, &mut out);
-                        nudge(sp::AMP_SUSTAIN, dy, &mut out);
-                    }
-                    SynthDrag::Release => nudge(sp::AMP_RELEASE, dx, &mut out),
-                    SynthDrag::Filter => {
-                        set(port, sp::FILTER_CUTOFF, f64::from(x_to_freq(filt_rect, p.x)), &mut out);
-                        nudge(sp::FILTER_RESONANCE, dy, &mut out);
-                    }
-                }
-                self.drag = Some((which, p.x, p.y));
-            }
-            if resp.drag_stopped()
-                && let Some((which, ..)) = self.drag
-                && candidates.iter().any(|(w, _)| *w == which)
-            {
-                self.drag = None;
-                out.extend(ids_of(which).into_iter().map(VisualEdit::End));
-            }
+            self.drag = Some((p.x, p.y));
+        }
+        if filt_resp.drag_stopped() && self.drag.take().is_some() {
+            out.extend(ids.into_iter().map(VisualEdit::End));
         }
         out
     }

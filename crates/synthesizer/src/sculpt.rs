@@ -276,6 +276,118 @@ pub fn smooth_harmonics(cycle: &[f32], harmonic: usize, width: usize, strength: 
     synthesize(&h)
 }
 
+/// The most harmonics the harmonic editor builds a wave from.
+pub const MAX_HARMONICS: usize = 64;
+
+/// Phase of a sine-shaped harmonic in [`analyze`]'s convention.
+const SINE_PHASE: f32 = -std::f32::consts::FRAC_PI_2;
+
+/// Peak of a cycle built by [`build_harmonics`].
+pub const HARMONIC_PEAK: f32 = 1.0;
+
+/// A cycle made of exactly harmonics 1..=`levels.len()` at those levels (0..1, relative to each
+/// other) with the given phases (a sine's where none is given), scaled to a peak of
+/// [`HARMONIC_PEAK`]. All levels at zero give silence.
+pub fn build_harmonics(levels: &[f32], phases: &[f32]) -> Vec<f32> {
+    let n = levels.len().min(MAX_HARMONICS).min(CYCLE_LEN / 2 - 1);
+    let mut h = Harmonics { magnitude: vec![0.0; CYCLE_LEN / 2 + 1], phase: vec![0.0; CYCLE_LEN / 2 + 1] };
+    for k in 1..=n {
+        h.magnitude[k] = levels[k - 1].clamp(0.0, 1.0);
+        h.phase[k] = phases.get(k - 1).copied().filter(|p| p.is_finite()).unwrap_or(SINE_PHASE);
+    }
+    let mut cycle = synthesize(&h);
+    let peak = cycle.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if peak > 1e-6 {
+        let g = HARMONIC_PEAK / peak;
+        cycle.iter_mut().for_each(|v| *v *= g);
+    } else {
+        cycle.iter_mut().for_each(|v| *v = 0.0);
+    }
+    cycle
+}
+
+/// The levels of harmonics 1..=`n` of `cycle` relative to the strongest of them (which reads
+/// 1.0), with their phases: what [`build_harmonics`] needs to rebuild the same sound.
+pub fn harmonic_levels(cycle: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
+    let h = analyze(cycle);
+    let n = n.min(h.magnitude.len().saturating_sub(1));
+    let strongest = h.magnitude[1..=n].iter().fold(0.0f32, |m, v| m.max(*v));
+    let levels = h.magnitude[1..=n].iter().map(|m| if strongest > 1e-9 { (m / strongest).clamp(0.0, 1.0) } else { 0.0 }).collect();
+    (levels, h.phase[1..=n].to_vec())
+}
+
+/// How much of `cycle`'s energy lies above harmonic `n` (0 = none, 1 = all of it).
+pub fn energy_above(cycle: &[f32], n: usize) -> f32 {
+    let h = analyze(cycle);
+    let total: f32 = h.magnitude.iter().skip(1).map(|m| m * m).sum();
+    let above: f32 = h.magnitude.iter().skip(n + 1).map(|m| m * m).sum();
+    if total > 1e-12 { above / total } else { 0.0 }
+}
+
+/// The classic waves as harmonic levels and phases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarmonicShape {
+    Sine,
+    Saw,
+    Square,
+    Triangle,
+}
+
+impl HarmonicShape {
+    pub const ALL: [HarmonicShape; 4] = [HarmonicShape::Sine, HarmonicShape::Saw, HarmonicShape::Square, HarmonicShape::Triangle];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HarmonicShape::Sine => "Sine",
+            HarmonicShape::Saw => "Saw",
+            HarmonicShape::Square => "Square",
+            HarmonicShape::Triangle => "Triangle",
+        }
+    }
+
+    /// Levels and phases of harmonics 1..=`n`: sine only the first; saw every harmonic at 1/k;
+    /// square the odd ones at 1/k; triangle the odd ones at 1/k² with alternating sign.
+    pub fn harmonics(self, n: usize) -> (Vec<f32>, Vec<f32>) {
+        let n = n.clamp(1, MAX_HARMONICS);
+        let flip = SINE_PHASE + std::f32::consts::PI;
+        (1..=n)
+            .map(|k| {
+                let kf = k as f32;
+                match self {
+                    HarmonicShape::Sine => (if k == 1 { 1.0 } else { 0.0 }, SINE_PHASE),
+                    // a rising ramp: alternating signs
+                    HarmonicShape::Saw => (1.0 / kf, if k % 2 == 1 { SINE_PHASE } else { flip }),
+                    HarmonicShape::Square => (if k % 2 == 1 { 1.0 / kf } else { 0.0 }, SINE_PHASE),
+                    HarmonicShape::Triangle => (if k % 2 == 1 { 1.0 / (kf * kf) } else { 0.0 }, if k % 4 == 1 { SINE_PHASE } else { flip }),
+                }
+            })
+            .unzip()
+    }
+}
+
+/// Random harmonics 1..=`n`: the fundamental always sounds (at least half as loud as the
+/// strongest, so the note keeps its pitch), every other harmonic is present or not at random
+/// and, when present, at a random level; the strongest reads 1.0. Sine phases. The same `seed`
+/// gives the same result.
+pub fn random_harmonics(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let n = n.clamp(1, MAX_HARMONICS);
+    let mut rng = DeterministicRng::new(seed, 0x4A2B_0001);
+    let mut levels: Vec<f32> = (1..=n)
+        .map(|k| {
+            if k == 1 {
+                0.5 + 0.5 * rng.unit_f32()
+            } else if rng.unit_f32() < 0.5 {
+                0.05 + 0.95 * rng.unit_f32()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let strongest = levels.iter().fold(0.0f32, |m, l| m.max(*l));
+    levels.iter_mut().for_each(|l| *l /= strongest);
+    (levels, vec![SINE_PHASE; n])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +497,67 @@ mod tests {
         assert!(cycle.iter().zip(&same).all(|(a, b)| (a - b).abs() < 1e-4));
         let sm = smooth_harmonics(&cycle, 10, 3, 1.0);
         assert!(sm.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_wave_built_from_harmonics_has_exactly_those_levels_and_nothing_above() {
+        let levels = [1.0, 0.0, 0.5, 0.25, 0.0, 0.1];
+        let cycle = build_harmonics(&levels, &[]);
+        let peak = cycle.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!((peak - HARMONIC_PEAK).abs() < 1e-5, "peak {peak}");
+        let (back, _) = harmonic_levels(&cycle, 8);
+        for (k, want) in levels.iter().enumerate() {
+            assert!((back[k] - want).abs() < 2e-3, "harmonic {}: {} vs {want}", k + 1, back[k]);
+        }
+        assert!(back[6] < 1e-3 && back[7] < 1e-3, "nothing above the sixth");
+        assert!(energy_above(&cycle, 6) < 1e-6);
+        assert!(energy_above(&cycles::saw(), 6) > 0.01, "a saw has more");
+        // levels are relative: the same proportions at half the size give the same wave
+        let half: Vec<f32> = levels.iter().map(|l| l * 0.5).collect();
+        let again = build_harmonics(&half, &[]);
+        assert!(cycle.iter().zip(&again).all(|(a, b)| (a - b).abs() < 1e-4));
+        // the phases are kept: rebuilding from the analysis gives the same wave
+        let (lv, ph) = harmonic_levels(&cycle, 6);
+        let rebuilt = build_harmonics(&lv, &ph);
+        assert!(cycle.iter().zip(&rebuilt).all(|(a, b)| (a - b).abs() < 2e-3));
+        assert!(build_harmonics(&[0.0, 0.0], &[]).iter().all(|v| *v == 0.0), "silence, no NaN");
+    }
+
+    #[test]
+    fn the_classic_shapes_have_their_harmonic_series() {
+        let (sine, _) = HarmonicShape::Sine.harmonics(16);
+        assert_eq!(sine.iter().filter(|l| **l > 0.0).count(), 1);
+        let (saw, _) = HarmonicShape::Saw.harmonics(16);
+        assert!(saw.iter().enumerate().all(|(i, l)| (l - 1.0 / (i + 1) as f32).abs() < 1e-6));
+        let (square, _) = HarmonicShape::Square.harmonics(16);
+        assert!(square.iter().enumerate().all(|(i, l)| if i % 2 == 0 { (l - 1.0 / (i + 1) as f32).abs() < 1e-6 } else { *l == 0.0 }));
+        let (tri, ph) = HarmonicShape::Triangle.harmonics(16);
+        assert!((tri[2] - 1.0 / 9.0).abs() < 1e-6 && tri[1] == 0.0);
+        // a triangle built from them looks like one: straight ramps, peak at a quarter cycle
+        let wave = build_harmonics(&tri, &ph);
+        let quarter = wave[CYCLE_LEN / 4].abs();
+        assert!(quarter > 0.97, "peak at a quarter cycle: {quarter}");
+        assert!(wave[CYCLE_LEN / 8].abs() > 0.45 && wave[CYCLE_LEN / 8].abs() < 0.55, "halfway up the ramp");
+        // a square from 16 harmonics is mostly flat at its peak level
+        let (sq, ph) = HarmonicShape::Square.harmonics(16);
+        let wave = build_harmonics(&sq, &ph);
+        let flat = wave[CYCLE_LEN / 8..3 * CYCLE_LEN / 8].iter().filter(|v| v.abs() > 0.8).count();
+        assert!(flat > CYCLE_LEN / 5, "{flat}");
+    }
+
+    #[test]
+    fn random_harmonics_keep_the_fundamental_and_stay_within_the_count() {
+        let (a, ph) = random_harmonics(16, 7);
+        assert_eq!(a.len(), 16);
+        assert_eq!(ph.len(), 16);
+        assert!(a[0] >= 0.5, "the fundamental keeps the pitch");
+        assert!(a.iter().all(|l| (0.0..=1.0).contains(l)));
+        assert!(a.contains(&1.0), "the strongest reads 1.0");
+        assert!(a.iter().skip(1).any(|l| *l == 0.0) && a.iter().skip(1).any(|l| *l > 0.0), "some present, some not: {a:?}");
+        assert_eq!(random_harmonics(16, 7).0, a, "the same seed, the same harmonics");
+        assert_ne!(random_harmonics(16, 8).0, a);
+        assert_eq!(random_harmonics(200, 1).0.len(), MAX_HARMONICS);
+        let cycle = build_harmonics(&a, &ph);
+        assert!(energy_above(&cycle, 16) < 1e-6);
     }
 }

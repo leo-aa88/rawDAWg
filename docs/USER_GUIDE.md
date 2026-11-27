@@ -44,7 +44,17 @@ The window opens with a playable **rawDAWg Synth** channel. Hold keys on the **t
 Z X C V B N M , . /     ← white keys: C D E F G A B C D E
 ```
 
-`Octave −/+` shifts the base octave (default C4), `Velocity` sets note velocity. Keys are ignored while a text field has focus or when Ctrl/Alt is held; releasing focus releases the notes. **Panic** sends all-notes-off.
+`Octave −/+` shifts the base octave (default C4), `Velocity` sets note velocity. Keys are ignored while a text field has focus or when Ctrl/Alt is held; releasing focus releases the notes. **Panic** sends all-notes-off. While typing keys are on, S plays C# everywhere (it does not split playlist clips; use **Split at playhead** or the clip's menu).
+
+The toolbar shows the keys you are holding, by name (middle C is C4), and the chord they form, for example `C4 Eb4 G4 · Cm` (typing keys, a MIDI keyboard or the on-screen piano). The same keys light up on the piano roll's keyboard (with their rows) and on the on-screen piano.
+
+### Shaping the sound
+
+The synth panel starts with the basics:
+
+- **Oscillators**: **Start from** gives a fresh sound from one wave (**Sine**, **Saw**, **Square**, **Triangle**) or a stack (**Saw + Square**, **Saw octaves**: a saw with copies one and two octaves up, **Detuned saws + sub**: two saws 7 cents apart and a sine an octave below). Each row is one oscillator: switch it on or off, pick its **Waveform**, its **Octave** (− / +), **Detune** in cents (±100) and **Level** in percent. **+ Oscillator** adds a copy of the last one an octave higher, up to three; **×** removes one. Every change is one undo step; detune and level move live while you drag.
+- **Amplitude envelope** (ADSR): drag the points on the curve (the attack peak sets the attack time, the end of the decay sets the decay time and the sustain level, the end of the sustain sets the level, the end sets the release time) or use the **Attack**, **Decay**, **Sustain** and **Release** sliders under it. The values update while you drag and each drag is one undo step. The curve's spacing is illustrative (it keeps a 1 ms attack and a 5 s release both visible), the readouts are exact.
+- The wave editor's **Harmonics** tab builds the selected oscillator's wave from harmonics: choose how many (1 to 64, **−**/**+** or type), then click or drag over the bars to set each harmonic's level (right-drag turns them off); the bar under the pointer shows its level in percent and dB, and the wave above follows. **Sine**, **Saw**, **Square** and **Triangle** fill the bars with that shape's series; **Randomize harmonics** picks random harmonics at random levels (the fundamental always stays, so the note keeps its pitch). A wave with harmonics above the count (one drawn with the brushes) says so; editing here keeps only the first harmonics. Each change is one undo step.
 
 Transport: **Play** runs the selected pattern in a loop (pattern mode), **Stop** returns to the start. The status bar shows master meters, limiter activity, voice count, device, sample rate, CPU load and xruns.
 

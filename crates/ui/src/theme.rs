@@ -11,6 +11,9 @@ pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xAA, 0xB2, 0xC0);
 pub const ACCENT: Color32 = Color32::from_rgb(0x87, 0xC8, 0xA2);
 pub const WARNING: Color32 = Color32::from_rgb(0xE6, 0xB7, 0x6E);
 pub const ERROR: Color32 = Color32::from_rgb(0xE6, 0x7D, 0x7D);
+/// Keys being played, envelope and harmonic editors: a brighter, cooler accent that stands out
+/// on the green note colours.
+pub const KEY_HELD: Color32 = Color32::from_rgb(0x5C, 0xC8, 0xF0);
 
 /// Build the permanent dark visuals.
 pub fn visuals() -> Visuals {

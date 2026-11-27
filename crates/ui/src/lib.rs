@@ -2,12 +2,14 @@
 //!
 //! - [`theme`]: the dark-only visual tokens used by the app and every first-party editor.
 //! - [`params`]: parameter widgets shared by the app's panels and the plugin editors.
+//! - [`envelope`]: the ADSR envelope editor (drag the curve's points).
 //! - [`raster`]: a software painter for egui output (no GPU).
 //! - [`window`]: native child / top-level windows (X11 on Linux, Win32 on Windows).
 //! - [`editor`]: window events → egui → painter → window, ticked on the host's UI thread.
 //! - [`plugin_editor`]: the editor rawDAWg's exported CLAP/VST3 plugins show in other hosts.
 
 pub mod editor;
+pub mod envelope;
 pub mod params;
 pub mod plugin_editor;
 pub mod raster;

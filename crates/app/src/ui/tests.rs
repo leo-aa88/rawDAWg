@@ -59,6 +59,39 @@ impl Harness {
         out.textures_delta.clear();
     }
 
+    /// The shapes one frame paints.
+    fn shapes(&mut self) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), ..Default::default() };
+        let app = &mut self.app;
+        let parts = self.parts;
+        let mut out = self.ctx.run_ui(input, |ui| {
+            app.step(ui.ctx());
+            app.draw_parts(ui, parts);
+        });
+        out.textures_delta.clear();
+        out.shapes
+    }
+
+    /// The topmost drawn widget with exactly this text.
+    fn node(&mut self, text: &str) -> Option<egui::Rect> {
+        self.drawn_nodes().into_iter().filter(|(t, _)| t == text).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()))
+    }
+
+    /// Scroll the editor panel (under the playlist) until `find` sees the widget inside its
+    /// visible part (laid-out widgets scrolled away are clipped and take no input).
+    fn scroll_into_view(&mut self, what: &str, find: impl Fn(&mut Harness) -> Option<egui::Rect>) -> egui::Rect {
+        for _ in 0..80 {
+            let clip = self.app.editor_clip;
+            let at = clip.center();
+            match find(self) {
+                Some(r) if r.top() >= clip.top() + 2.0 && r.bottom() <= clip.bottom() - 2.0 => return r,
+                Some(r) if r.top() < clip.top() + 2.0 => self.scroll(at, 90.0),
+                _ => self.scroll(at, -90.0),
+            }
+        }
+        panic!("{what} never came into view")
+    }
+
     /// Every label and value drawn in one frame, read from egui's accessibility tree.
     fn drawn_texts(&mut self) -> Vec<String> {
         self.drawn_nodes().into_iter().map(|(t, _)| t).collect()
@@ -2040,22 +2073,28 @@ fn after_randomize_the_controls_show_the_new_sound_and_a_tweak_keeps_the_rest() 
         }
         panic!("{text} never came into view")
     };
-    let randomize = into_view(&mut h, "Randomize sound");
+    let _ = (node, into_view);
+    let randomize = h.scroll_into_view("Randomize sound", |h| h.node("Randomize sound"));
     h.click_at(randomize.center(), egui::PointerButton::Primary);
     let randomized = saved(&h);
     assert_ne!(randomized, before, "Randomize changed the sound");
     // the panel shows the new sound: its mirror is the saved patch
     assert_eq!(h.app.synth_mirrors[&instance].patch(), &randomized, "the controls show the randomized values");
-    // touch only Attack: everything else stays as randomized
-    let l = into_view(&mut h, "Attack");
-    let rd = h
+    // touch only Attack (its slider under its name in the envelope section)
+    let attack_slider = |h: &mut Harness| {
+        let l = h.node("Attack")?;
+        h.drawn_nodes().into_iter().filter(|(t, r)| t == "Attack" && r.top() > l.bottom() - 1.0).map(|(_, r)| r).next()
+    };
+    h.scroll_into_view("the Attack slider", attack_slider);
+    let l = h.node("Attack").unwrap();
+    let slider = h
         .drawn_nodes()
         .into_iter()
-        .filter(|(t, r)| t != "Attack" && (r.center().y - l.center().y).abs() < 4.0 && r.left() > l.right())
+        .filter(|(t, r)| t == "Attack" && r.top() > l.bottom() - 1.0 && r.top() < l.bottom() + 30.0)
         .map(|(_, r)| r)
-        .min_by(|a, b| a.left().total_cmp(&b.left()))
-        .expect("readout");
-    let p = egui::pos2((l.right() + rd.left()) * 0.5, l.center().y);
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("the Attack slider under its name");
+    let p = slider.center();
     h.drag(p, p + egui::vec2(15.0, 0.0), egui::PointerButton::Primary);
     let after = saved(&h);
     assert_ne!(after.amp_env.attack_s, randomized.amp_env.attack_s, "Attack changed");
@@ -2579,4 +2618,322 @@ fn at_the_minimum_window_size_the_toolbar_and_status_bar_keep_every_control_visi
         assert!(x("message").right() <= x("audio state").left() && x("audio state").right() <= x(button).left());
         assert!(x(button).right() <= x("unsaved").left() && x("unsaved").right() <= x("project").left() && x("project").right() <= x("brand").left());
     }
+}
+
+/// Fill colour of every rectangle painted in `shapes`, with its rect.
+fn filled_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Color32, egui::Rect)> {
+    fn walk(s: &egui::Shape, out: &mut Vec<(egui::Color32, egui::Rect)>) {
+        match s {
+            egui::Shape::Rect(r) => out.push((r.fill, r.rect)),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for c in shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+#[test]
+fn held_keys_are_named_in_the_toolbar_and_light_up_in_the_piano_roll() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::PianoRoll;
+    h.app.typing_enabled = true;
+    h.frame(vec![]);
+    let toolbar_text = |h: &mut Harness| h.drawn_nodes().into_iter().filter(|(_, r)| r.center().y < 100.0).map(|(t, _)| t).collect::<Vec<_>>();
+    let lit = |h: &mut Harness| {
+        let mut ys: Vec<f32> = filled_rects(&h.shapes()).into_iter().filter(|(c, _)| *c == theme::KEY_HELD).map(|(_, r)| r.center().y).collect();
+        ys.sort_by(|a, b| b.total_cmp(a));
+        ys
+    };
+    assert!(lit(&mut h).is_empty());
+    // C, Eb and G on the typing keys (Z, D, B): middle C is C4
+    for k in [egui::Key::Z, egui::Key::D, egui::Key::B] {
+        h.key_event(k, true, false, egui::Modifiers::NONE);
+    }
+    h.frame(vec![]);
+    assert_eq!(h.app.held_notes.pitches(), vec![60, 63, 67]);
+    assert!(toolbar_text(&mut h).iter().any(|t| t == "C4 Eb4 G4 · Cm"), "{:?}", toolbar_text(&mut h));
+    // the piano roll lights those three keys: rows 3 and 4 semitones apart, lowest at the bottom
+    let ys = lit(&mut h);
+    assert_eq!(ys.len(), 3, "{ys:?}");
+    let row = h.app.piano_roll.row_h;
+    assert!(((ys[0] - ys[1]) - 3.0 * row).abs() < 1.0 && ((ys[1] - ys[2]) - 4.0 * row).abs() < 1.0, "{ys:?} with rows of {row}");
+    // letting go of Eb leaves C and G, then nothing
+    h.key_event(egui::Key::D, false, false, egui::Modifiers::NONE);
+    h.frame(vec![]);
+    assert!(toolbar_text(&mut h).iter().any(|t| t == "C4 G4 · C5"));
+    assert_eq!(lit(&mut h).len(), 2);
+    h.key_event(egui::Key::Z, false, false, egui::Modifiers::NONE);
+    h.key_event(egui::Key::B, false, false, egui::Modifiers::NONE);
+    h.frame(vec![]);
+    assert!(h.app.held_notes.pitches().is_empty());
+    assert!(lit(&mut h).is_empty());
+    // a MIDI keyboard's keys show too, and a panic (Esc) clears them
+    h.app.live(TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 40, 64, 0.7));
+    h.app.live(TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 41, 67, 0.7));
+    h.app.live(TimedEvent::note_on(0, EventSource::MidiDevice(0), 0, 42, 72, 0.7));
+    h.frame(vec![]);
+    assert!(toolbar_text(&mut h).iter().any(|t| t == "E4 G4 C5 · C/E"));
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.app.held_notes.pitches().is_empty(), "Panic lets go of the display too");
+    // with typing keys on, S plays C#4 over the playlist instead of splitting clips
+    h.app.key_target = super::KeyTarget::Playlist;
+    let status = h.app.status_line.clone();
+    h.key_event(egui::Key::S, true, false, egui::Modifiers::NONE);
+    h.frame(vec![]);
+    assert_eq!(h.app.held_notes.pitches(), vec![61]);
+    assert!(toolbar_text(&mut h).iter().any(|t| t == "C#4"));
+    assert_eq!(h.app.status_line, status, "no split message");
+    h.key_event(egui::Key::S, false, false, egui::Modifiers::NONE);
+    h.frame(vec![]);
+}
+
+#[test]
+fn the_amplitude_envelope_is_edited_by_dragging_its_points_and_the_values_follow_live() {
+    use rawdawg_synthesizer::params;
+    use rawdawg_ui::envelope::{Adsr, AdsrPoint, curve_rect, point_pos};
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let id = super::synth_panel::envelope_id(instance);
+    let norm = |h: &Harness, pid: u32| h.app.synth_mirrors[&instance].param(rawdawg_types::ParamId(pid)).unwrap();
+    let phys = |h: &Harness, pid: u32| {
+        let d = params::DESCRIPTORS.iter().find(|d| d.id.0 == pid).unwrap();
+        d.to_physical(norm(h, pid)) as f32
+    };
+    let adsr = |h: &Harness| Adsr {
+        attack_s: phys(h, params::AMP_ATTACK),
+        decay_s: phys(h, params::AMP_DECAY),
+        sustain: phys(h, params::AMP_SUSTAIN),
+        release_s: phys(h, params::AMP_RELEASE),
+    };
+    let rect = h.scroll_into_view("the envelope", |h| {
+        h.frame(vec![]);
+        h.ctx.read_response(id).map(|r| r.rect)
+    });
+    for name in ["Attack", "Decay", "Sustain", "Release"] {
+        assert!(h.node(name).is_some(), "{name} slider");
+    }
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    let before = saved(&h);
+    let depth = h.app.history.undo_len();
+    // drag the release point to the right, step by step: the value follows while dragging
+    let release_text = |h: &mut Harness| {
+        let l = h.node("Release").unwrap();
+        h.drawn_nodes().into_iter().filter(|(t, r)| t != "Release" && (r.center().y - l.center().y).abs() < 4.0 && r.left() > l.right()).map(|(t, _)| t).next().unwrap()
+    };
+    let text0 = release_text(&mut h);
+    let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Release);
+    let to = from - egui::vec2(120.0, 0.0);
+    h.move_to(from);
+    h.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+    for i in 1..=4 {
+        h.frame(vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+    }
+    let text_mid = release_text(&mut h);
+    assert_ne!(text_mid, text0, "the Release readout follows the drag");
+    assert_eq!(h.app.history.undo_len(), depth, "nothing committed mid-drag");
+    for i in 5..=8 {
+        h.frame(vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+    }
+    h.frame(vec![egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![]);
+    let after = saved(&h);
+    assert!(after.amp_env.release_s < before.amp_env.release_s, "dragged left: shorter release ({} → {})", before.amp_env.release_s, after.amp_env.release_s);
+    assert_eq!(h.app.history.undo_len(), depth + 1, "one undo step");
+    let mut only_release = before.clone();
+    only_release.amp_env.release_s = after.amp_env.release_s;
+    assert_eq!(after, only_release, "nothing else moved");
+    // the decay point moves decay (left/right) and sustain (up/down) in one step
+    let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Decay);
+    h.drag(from, from + egui::vec2(40.0, 30.0), egui::PointerButton::Primary);
+    let moved = saved(&h);
+    assert!(moved.amp_env.decay_s > after.amp_env.decay_s && moved.amp_env.sustain < after.amp_env.sustain, "{:?}", moved.amp_env);
+    assert_eq!(h.app.history.undo_len(), depth + 2);
+    h.app.undo();
+    assert_eq!(saved(&h), after, "one undo restores both");
+    // the sustain point only moves the level
+    let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Sustain);
+    h.drag(from, from - egui::vec2(0.0, 20.0), egui::PointerButton::Primary);
+    let up = saved(&h);
+    assert!(up.amp_env.sustain > after.amp_env.sustain && up.amp_env.decay_s == after.amp_env.decay_s);
+    // a press away from the points changes nothing
+    let depth = h.app.history.undo_len();
+    let empty = egui::pos2(rect.center().x, rect.max.y - 40.0);
+    h.drag(empty, empty + egui::vec2(30.0, 0.0), egui::PointerButton::Primary);
+    assert_eq!(h.app.history.undo_len(), depth);
+}
+
+#[test]
+fn oscillators_start_from_templates_and_stack_up_to_three_with_octave_detune_and_level() {
+    use rawdawg_dsp::oscillator::BasicWave;
+    use rawdawg_synthesizer::patch::Generator;
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    let start_from = h.scroll_into_view("Start from", |h| h.node("Start from"));
+    // a template button: on the "Start from" row
+    // a template button: the first with that name from the "Start from" row on (it may wrap)
+    let template = |h: &mut Harness, name: &str| {
+        let row = h.node("Start from").unwrap();
+        let r = h
+            .drawn_nodes()
+            .into_iter()
+            .filter(|(t, r)| t == name && r.top() > row.top() - 4.0)
+            .map(|(_, r)| r)
+            .min_by(|a, b| a.top().total_cmp(&b.top()).then(a.left().total_cmp(&b.left())))
+            .unwrap_or_else(|| panic!("template {name}"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    let _ = start_from;
+    let wave = |p: &rawdawg_synthesizer::Patch, i: usize| match &p.layers[i].generator {
+        Generator::Basic { wave, .. } => Some(*wave),
+        _ => None,
+    };
+    let depth = h.app.history.undo_len();
+    for (name, w) in [("Sine", BasicWave::Sine), ("Saw", BasicWave::Saw), ("Square", BasicWave::Pulse), ("Triangle", BasicWave::Triangle)] {
+        template(&mut h, name);
+        let p = saved(&h);
+        assert_eq!(p.layers.len(), 1);
+        assert_eq!(wave(&p, 0), Some(w), "{name}");
+        assert_eq!(p.name, name);
+    }
+    assert_eq!(h.app.history.undo_len(), depth + 4, "one undo step each");
+    template(&mut h, "Saw octaves");
+    let p = saved(&h);
+    assert_eq!(p.layers.iter().map(|l| (wave(&p, 0) == Some(BasicWave::Saw), l.coarse_semitones)).collect::<Vec<_>>(), vec![(true, 0), (true, 12), (true, 24)]);
+    template(&mut h, "Detuned saws + sub");
+    let p = saved(&h);
+    assert_eq!(p.layers.len(), 3);
+    assert_eq!((wave(&p, 0), p.layers[0].fine_cents, p.layers[0].coarse_semitones), (Some(BasicWave::Saw), -7.0, 0));
+    assert_eq!((wave(&p, 1), p.layers[1].fine_cents), (Some(BasicWave::Saw), 7.0));
+    assert_eq!((wave(&p, 2), p.layers[2].coarse_semitones), (Some(BasicWave::Sine), -12));
+    h.frame(vec![]);
+    let texts = h.drawn_texts();
+    for t in ["-7 cents", "+7 cents", "70%", "40%", "OSC 3"] {
+        assert!(texts.iter().any(|x| x == t), "{t} shown");
+    }
+    assert!(h.node("+ Oscillator").is_none(), "three is the most");
+    // from one saw: + Oscillator stacks a copy an octave up; its octave + goes one more
+    template(&mut h, "Saw");
+    let add = h.node("+ Oscillator").unwrap();
+    h.click_at(add.center(), egui::PointerButton::Primary);
+    let p = saved(&h);
+    assert_eq!(p.layers.len(), 2);
+    assert_eq!((wave(&p, 1), p.layers[1].coarse_semitones), (Some(BasicWave::Saw), 12));
+    let osc2 = h.node("OSC 2").unwrap();
+    let plus = h
+        .drawn_nodes()
+        .into_iter()
+        .filter(|(t, r)| t == "+" && (r.center().y - osc2.center().y).abs() < 6.0 && r.left() > osc2.right())
+        .map(|(_, r)| r)
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("octave + on OSC 2");
+    let depth = h.app.history.undo_len();
+    h.click_at(plus.center(), egui::PointerButton::Primary);
+    assert_eq!(saved(&h).layers[1].coarse_semitones, 24, "two octaves up");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // OSC 1's waveform menu: Square
+    let osc1 = h.node("OSC 1").unwrap();
+    let combo = h
+        .drawn_nodes()
+        .into_iter()
+        .filter(|(t, r)| t == "Saw" && (r.center().y - osc1.center().y).abs() < 6.0 && r.left() > osc1.right())
+        .map(|(_, r)| r)
+        .next()
+        .expect("OSC 1 waveform");
+    h.click_at(combo.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let square =
+        h.drawn_nodes().into_iter().filter(|(t, r)| t == "Square" && r.top() > combo.top()).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top())).expect("menu entry");
+    h.click_at(square.center(), egui::PointerButton::Primary);
+    assert_eq!(wave(&saved(&h), 0), Some(BasicWave::Pulse));
+    // × removes an oscillator
+    let x = h.drawn_nodes().into_iter().filter(|(t, _)| t == "×").map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).expect("remove");
+    h.click_at(x.center(), egui::PointerButton::Primary);
+    assert_eq!(saved(&h).layers.len(), 1);
+}
+
+#[test]
+fn the_harmonic_editor_builds_the_wave_from_levels_shapes_and_random_harmonics() {
+    use rawdawg_synthesizer::sculpt;
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.app.synth_panel.waveform.mode = super::waveform::CanvasMode::Harmonics;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let cycle = |h: &Harness| -> Vec<f32> {
+        let p: rawdawg_synthesizer::Patch = serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap();
+        match &p.layers[0].generator {
+            rawdawg_synthesizer::patch::Generator::Wavetable { cycle, .. } => cycle.clone(),
+            g => panic!("not a drawn wave: {g:?}"),
+        }
+    };
+    // the editor's own buttons sit under its bars (the Oscillators section has a "Square" too)
+    let bars_rect = |h: &mut Harness| {
+        h.frame(vec![]);
+        h.ctx.read_response(super::waveform::harmonic_bars_id(instance)).map(|r| r.rect)
+    };
+    let button = |h: &mut Harness, name: &str| {
+        let r = h.scroll_into_view(name, |h| {
+            let bars = bars_rect(h)?;
+            h.drawn_nodes().into_iter().filter(|(t, r)| t == name && r.top() > bars.bottom()).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()))
+        });
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    let depth = h.app.history.undo_len();
+    button(&mut h, "Square");
+    let (levels, _) = sculpt::harmonic_levels(&cycle(&h), 20);
+    for (k, l) in levels.iter().enumerate().take(16) {
+        let want = if k % 2 == 0 { 1.0 / (k + 1) as f32 } else { 0.0 };
+        assert!((l - want).abs() < 0.01, "harmonic {}: {l} vs {want}", k + 1);
+    }
+    assert!(sculpt::energy_above(&cycle(&h), 16) < 1e-6, "nothing above the 16 harmonics");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // paint harmonic 2 to about half height
+    let bars = h.scroll_into_view("the bars", bars_rect);
+    let slot = bars.width() / 16.0;
+    let at = egui::pos2(bars.min.x + slot * 1.5, bars.max.y - bars.height() * 0.5);
+    h.click_at(at, egui::PointerButton::Primary);
+    let (levels, _) = sculpt::harmonic_levels(&cycle(&h), 16);
+    assert!((levels[1] - 0.5).abs() < 0.03, "harmonic 2 at half: {}", levels[1]);
+    assert!((levels[0] - 1.0).abs() < 1e-3 && (levels[2] - 1.0 / 3.0).abs() < 0.01, "the others stay: {levels:?}");
+    assert_eq!(h.app.history.undo_len(), depth + 2, "a click is one undo step");
+    // a drag across bars 5..8 at full height sets each of them
+    let y = bars.min.y + 2.0;
+    h.drag(egui::pos2(bars.min.x + slot * 4.5, y), egui::pos2(bars.min.x + slot * 7.5, y), egui::PointerButton::Primary);
+    let (levels, _) = sculpt::harmonic_levels(&cycle(&h), 16);
+    assert!(levels[4..8].iter().all(|l| *l > 0.95), "{levels:?}");
+    assert_eq!(h.app.history.undo_len(), depth + 3, "a drag is one undo step");
+    // fewer harmonics: the wave keeps only the first 8
+    h.app.synth_panel.waveform.harmonics.count = 9;
+    let minus = {
+        let label = h.scroll_into_view("the count", |h| h.node("9 harmonics"));
+        h.drawn_nodes().into_iter().filter(|(t, r)| t == "−" && (r.center().y - label.center().y).abs() < 6.0).map(|(_, r)| r).next().expect("−")
+    };
+    h.click_at(minus.center(), egui::PointerButton::Primary);
+    assert_eq!(h.app.synth_panel.waveform.harmonics.count, 8);
+    assert!(sculpt::energy_above(&cycle(&h), 8) < 1e-6);
+    // random harmonics: within the count, the fundamental kept, one undo step, new each time
+    let before = cycle(&h);
+    button(&mut h, "Randomize harmonics");
+    let first = cycle(&h);
+    assert_ne!(first, before);
+    assert!(sculpt::energy_above(&first, 8) < 1e-6);
+    let (levels, _) = sculpt::harmonic_levels(&first, 8);
+    assert!(levels[0] >= 0.5, "the fundamental keeps the pitch: {levels:?}");
+    button(&mut h, "Randomize harmonics");
+    assert_ne!(cycle(&h), first, "another set");
+    h.app.undo();
+    assert_eq!(cycle(&h), first, "Undo goes back one randomization");
+    // the editor follows an undo: its bars describe the wave again
+    h.frame(vec![]);
+    let shown = h.app.synth_panel.waveform.harmonics.levels.clone();
+    let (levels, _) = sculpt::harmonic_levels(&first, sculpt::MAX_HARMONICS);
+    assert!(shown.iter().zip(&levels).all(|(a, b)| (a - b).abs() < 1e-4));
 }
