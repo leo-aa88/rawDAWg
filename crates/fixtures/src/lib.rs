@@ -234,6 +234,8 @@ pub fn demo_song_project(dir: &Path) -> anyhow::Result<Project> {
             fade_in_frames: 480,
             fade_out_frames: 4800,
             playback_rate: 1.0,
+            fade_in_offset_frames: 0,
+            fade_out_offset_frames: 0,
         },
     });
     p.assets.push(sine);

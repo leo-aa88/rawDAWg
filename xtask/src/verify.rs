@@ -567,7 +567,7 @@ fn headless_checks(root: &Path, out: &Path) -> Vec<Check> {
             // the WAV as an audio clip on its own track
             let at = TrackId::new();
             history.apply(&mut project, Command::AddTrack { track: Track { id: at, name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None }, index: None })?;
-            history.apply(&mut project, Command::AddClip { clip: Clip { id: ClipId::new(), track_id: at, start_tick: Tick(0), length_ticks: Tick(3840), muted: false, content: ClipContent::Audio { asset_id: wav.id.clone(), source_offset_frames: 0, source_length_frames: 96_000, gain_db: Db(-6.0), fade_in_frames: 0, fade_out_frames: 0, playback_rate: 1.0 } } })?;
+            history.apply(&mut project, Command::AddClip { clip: Clip { id: ClipId::new(), track_id: at, start_tick: Tick(0), length_ticks: Tick(3840), muted: false, content: ClipContent::Audio { asset_id: wav.id.clone(), source_offset_frames: 0, source_length_frames: 96_000, gain_db: Db(-6.0), fade_in_frames: 0, fade_out_frames: 0, playback_rate: 1.0, fade_in_offset_frames: 0, fade_out_offset_frames: 0 } } })?;
             rawdawg_project::save_project_dir(&dir, &project)?;
             let reloaded = rawdawg_project::load_project_dir(&dir)?;
             if reloaded.tempo != imp.tempo || reloaded.meter != imp.meter {

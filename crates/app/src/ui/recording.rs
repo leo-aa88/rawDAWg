@@ -330,6 +330,8 @@ impl App {
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 playback_rate: 1.0,
+                fade_in_offset_frames: 0,
+                fade_out_offset_frames: 0,
             },
         };
         let mut commands = Vec::new();

@@ -3388,6 +3388,261 @@ fn opening_another_project_asks_about_unsaved_changes_and_moves_the_lock() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+fn autosave_count(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir.join("recovery/autosave")).map_or(0, |r| r.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
+}
+
+/// Another rawDAWg (on another machine) holds `dir`.
+fn foreign_lock(dir: &std::path::Path) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let live = rawdawg_project::lock::LockInfo { pid: 1, host: "elsewhere".into(), acquired_unix_ms: now };
+    std::fs::create_dir_all(dir.join("recovery")).unwrap();
+    std::fs::write(lock_file(dir), serde_json::to_vec(&live).unwrap()).unwrap();
+}
+
+/// Crash autosave of a saved song: `notes` more notes than it was saved with.
+fn crash_autosave(dir: &std::path::Path, notes: usize) {
+    let mut h = Harness::new(None);
+    assert!(h.app.open_project_checked(dir.to_path_buf()));
+    let before = note_count(&h);
+    for t in 0..notes {
+        add_note(&mut h, 1000 + t as i64 * 120);
+    }
+    h.app.autosave_now(dir);
+    assert_eq!(note_count(&h), before + notes, "the notes fit the pattern");
+    crash(h);
+}
+
+#[test]
+fn kept_autosaves_survive_exit_new_and_save_and_only_this_sessions_autosaves_go() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = saved_song(&root, "K", 1, 5);
+    crash_autosave(&dir, 2);
+    assert_eq!(autosave_count(&dir), 1);
+    // Keep saved version, then a clean exit: the kept autosave is still there and offered again
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    click(&mut h, "Keep saved version (keep autosaves)");
+    assert!(h.app.files.recovery.is_empty());
+    eframe::App::on_exit(&mut h.app);
+    drop(h);
+    assert_eq!(autosave_count(&dir), 1, "kept means kept");
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.files.recovery.len(), 1, "offered again");
+    click(&mut h, "Keep saved version (keep autosaves)");
+    // this session's own autosave goes with the save; the kept one stays
+    add_note(&mut h, 0);
+    h.app.autosave_now(&dir);
+    assert_eq!(autosave_count(&dir), 2);
+    h.app.save_project_checked();
+    assert_eq!(autosave_count(&dir), 1, "only this session's autosave is removed");
+    // the save is newer than the kept autosave: not offered as a crash any more
+    drop(h);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert!(h.app.files.recovery.is_empty(), "{:?}", h.app.files.recovery);
+    // New project and a discarded close leave it alone too
+    add_note(&mut h, 0);
+    h.app.autosave_now(&dir);
+    h.app.new_project();
+    assert_eq!(autosave_count(&dir), 1, "this session's autosave went, the kept one stayed");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_copy_open_read_only_neither_autosaves_nor_takes_the_other_ones_autosaves() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-readonly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = saved_song(&root, "R", 1, 5);
+    crash_autosave(&dir, 3); // the running one's autosave, as far as this window can tell
+    foreign_lock(&dir);
+    let mut h = Harness::new(None);
+    assert!(h.app.open_project_checked(dir.clone()));
+    assert!(h.app.files.read_only.is_some());
+    assert!(h.app.files.recovery.is_empty(), "the running copy's autosaves are not a crash");
+    add_note(&mut h, 0);
+    h.app.files.last_autosave = None;
+    h.frame(vec![]);
+    assert_eq!(autosave_count(&dir), 1, "no autosave into the other copy's folder");
+    h.app.new_project();
+    eframe::App::on_exit(&mut h.app);
+    assert_eq!(autosave_count(&dir), 1, "and nothing of it deleted");
+    // taking the lock over (the other one crashed elsewhere): its autosave is offered
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    h.app.take_over_lock();
+    assert!(h.app.files.read_only.is_none());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn save_as_a_failed_discard_and_open_and_a_failed_reopen_keep_what_they_must() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let a = saved_song(&root, "A", 1, 5);
+    // Save As leaves no autosave of this session in the old folder
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(a.clone());
+    add_note(&mut h, 0);
+    h.app.autosave_now(&a);
+    assert_eq!(autosave_count(&a), 1);
+    h.app.save_project_as(root.join("C"));
+    assert_eq!(autosave_count(&a), 0, "the work was saved (elsewhere)");
+    drop(h);
+    // Discard and open a project that fails to load: nothing is discarded
+    let bad = root.join("Bad.rawdawg");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("project.json"), b"{ broken").unwrap();
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(a.clone());
+    add_note(&mut h, 0);
+    h.app.autosave_now(&a);
+    h.app.request_open(bad.clone());
+    click(&mut h, "Discard and open");
+    assert_eq!(h.app.project_path.as_ref(), Some(&a));
+    assert_eq!(note_count(&h), 2, "the edit is still here");
+    assert_eq!(autosave_count(&a), 1, "and its autosave");
+    assert!(h.app.files.open_prompt.is_some(), "the prompt stays");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("Could not open")), "and says why");
+    click(&mut h, "Cancel");
+    // reopening this project when its file is damaged keeps our lock on it
+    let ours = rawdawg_project::lock::ProjectLock::read(&a).expect("locked");
+    let manifest = std::fs::read(a.join("project.json")).unwrap();
+    std::fs::write(a.join("project.json"), b"{ broken").unwrap();
+    assert!(!h.app.open_project_checked(a.clone()));
+    assert_eq!(rawdawg_project::lock::ProjectLock::read(&a), Some(ours), "still held by this window");
+    std::fs::write(a.join("project.json"), manifest).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recovering_asks_before_replacing_edits_made_while_the_offer_was_open() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-confirm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = saved_song(&root, "S", 1, 5);
+    crash_autosave(&dir, 3);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    add_note(&mut h, 0); // an edit while the offer is up
+    click(&mut h, "Recover");
+    assert_eq!(note_count(&h), 2, "not replaced yet");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.contains("recovering replaces them")));
+    click(&mut h, "Replace my changes and recover");
+    assert_eq!(note_count(&h), 4, "the autosave's 1 + 3 notes");
+    assert!(h.app.files.recovery.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_another_project_while_listening_to_an_autosave_plays_the_opened_one() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-listen-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = saved_song(&root, "L", 1, 5);
+    let other = saved_song(&root, "O", 6, 5);
+    crash_autosave(&dir, 3);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    h.app.autosave_now(&root.join("L.rawdawg"));
+    assert!(h.app.files.last_autosave_note.is_some());
+    click(&mut h, "Compare");
+    click(&mut h, "Autosave");
+    let notes = |p: &rawdawg_project::Project| p.patterns[0].lanes.iter().map(|l| l.notes.len()).sum::<usize>();
+    assert_eq!(notes(&h.app.engine_project()), 4);
+    assert!(h.app.open_project_checked(other.clone()));
+    assert!(h.app.files.compare.is_none());
+    assert_eq!(notes(&h.app.engine_project()), 6, "the opened project plays");
+    assert!(h.app.files.last_autosave_note.is_none(), "the File menu does not show the other project's autosave");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starting_on_the_marker_file_opens_the_folder_with_its_lock() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-marker-start-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = crate::prefs::absolute(&saved_song(&root, "M", 2, 5));
+    let marker = dir.join(rawdawg_project::persist::PROJECT_MARKER);
+    assert!(marker.is_file());
+    let h = Harness::with_recovery_dir(Some(marker.to_str().unwrap()), None, root.join("unsaved"));
+    assert_eq!(h.app.project_path.as_ref(), Some(&dir), "the folder, not the marker");
+    assert!(h.app.files.read_only.is_none(), "{:?}", h.app.files.read_only);
+    assert!(lock_file(&dir).is_file());
+    assert_eq!(h.app.prefs.recent_projects.first(), Some(&dir));
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn never_saved_projects_are_offered_after_the_opened_projects_own_offer() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-both-offers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let recovery = root.join("unsaved");
+    let dir = saved_song(&root, "B", 1, 5);
+    crash_autosave(&dir, 2);
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    crash(h);
+    let mut h = Harness::with_recovery_dir(Some(dir.to_str().unwrap()), None, recovery.clone());
+    assert!(!h.app.files.recovery_unsaved && h.app.files.recovery.len() == 1, "the opened project's offer first");
+    click(&mut h, "Keep saved version (keep autosaves)");
+    h.frame(vec![]);
+    assert!(h.app.files.recovery_unsaved && h.app.files.recovery.len() == 1, "then the never-saved one");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn preset_and_screenshot_runs_never_autosave_or_offer_recovery() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-preset-runs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let recovery = root.join("unsaved");
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    crash(h);
+    let mut h = Harness::with_recovery_dir(None, Some("rack"), recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "no offer in a preset run");
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    assert!(h.app.unsaved_dir().is_none_or(|d| !d.exists()), "no autosave either");
+    drop(h);
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert_eq!(h.app.files.recovery.len(), 1, "the crash is still there for a normal start");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn save_and_open_or_close_on_a_read_only_project_keeps_the_prompt_and_says_why() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-readonly-prompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let a = saved_song(&root, "A", 1, 5);
+    let b = saved_song(&root, "B", 1, 5);
+    foreign_lock(&a);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(a.clone());
+    add_note(&mut h, 0);
+    h.app.request_open(b.clone());
+    click(&mut h, "Save and open");
+    assert!(h.app.files.open_prompt.is_some(), "the prompt stays");
+    assert_eq!(h.app.project_path.as_ref(), Some(&a));
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("Read-only")), "{:?}", h.app.files.prompt_note);
+    click(&mut h, "Cancel");
+    assert!(h.app.files.prompt_note.is_none() || h.app.files.open_prompt.is_none());
+    h.app.files.close_prompt = true;
+    click(&mut h, "Save and close");
+    assert!(h.app.files.close_prompt && !h.app.files.closing, "not closed: nothing was saved");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("Read-only")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_crash_in_a_reopened_project_is_offered_for_recovery() {
     let root = std::env::temp_dir().join(format!("rawdawg-ui-reopen-crash-{}", std::process::id()));
@@ -3415,6 +3670,12 @@ fn a_crash_in_a_reopened_project_is_offered_for_recovery() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A crash: the process ends without running any destructor, so its lock stays behind.
+fn crash(mut h: Harness) {
+    std::mem::forget(h.app.files.lock.take());
+    drop(h);
+}
+
 #[test]
 fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
     let base = std::env::temp_dir().join(format!("rawdawg-ui-unsaved-crash-{}", std::process::id()));
@@ -3431,22 +3692,27 @@ fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
     assert!(own.starts_with(&recovery));
     assert_eq!(std::fs::read_dir(own.join("recovery/autosave")).unwrap().count(), 1, "a never-saved project autosaves");
     assert!(lock_file(&own).is_file(), "and holds its folder");
-    drop(h); // the crash
-    // the next start offers it
+    crash(h);
+    // the next start offers it, named with what it holds
     let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert!(h.app.files.recovery_unsaved && h.app.files.recovery.len() == 1);
     h.frame(vec![]);
-    assert!(h.drawn_texts().iter().any(|t| t.starts_with("rawDAWg did not close normally: a project that was never saved")));
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t.starts_with("rawDAWg did not close normally: a project was never saved")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("1 channel, 4 notes, 0 clips")), "{texts:?}");
+    assert!(h.node("Compare").is_none(), "nothing to compare a never-saved project with");
     let recover = h.node("Recover").unwrap();
     h.click_at(recover.center(), egui::PointerButton::Primary);
     assert_eq!(note_count(&h), 4, "the four notes are back");
     assert!(h.app.is_never_saved() && h.app.history.is_dirty());
-    // Save asks where; Save As keeps it and the per-user autosaves are not a crash anymore
+    // Save asks where (an empty field); Save As keeps it, and the per-user folder is done with
+    h.app.files.path_input = "/somewhere/typed/for/another/dialog".into();
     h.app.save_project_checked();
     assert_eq!(h.app.files.dialog, Some(super::project_files::FileDialog::SaveAs), "never into the hidden folder");
+    assert!(h.app.files.path_input.is_empty(), "no stale path proposed");
     h.app.save_project_as(base.join("Kept"));
     assert!(!h.app.history.is_dirty() && base.join("Kept.rawdawg/project.json").is_file());
-    assert!(rawdawg_project::recovery_candidates(&own).is_empty());
+    assert!(!own.exists(), "the per-user folder is removed once the project is saved elsewhere");
     drop(h);
     let h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert!(h.app.files.recovery.is_empty(), "nothing left to offer");
@@ -3455,14 +3721,19 @@ fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
     let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
     add_note(&mut h, 0);
     h.frame(vec![]);
+    let discarded = h.app.unsaved_dir().unwrap();
+    assert!(discarded.join("recovery/autosave").is_dir());
     h.app.new_project();
-    drop(h);
+    assert!(!discarded.exists(), "New project removes the discarded work's folder");
+    crash(h);
     let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert!(h.app.files.recovery.is_empty(), "New project discarded it");
     add_note(&mut h, 0);
     h.frame(vec![]);
+    let closed = h.app.unsaved_dir().unwrap();
     h.app.history.mark_saved();
     eframe::App::on_exit(&mut h.app);
+    assert!(!closed.exists(), "a clean exit removes it");
     drop(h);
     let h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert!(h.app.files.recovery.is_empty(), "a clean exit leaves nothing to recover");
@@ -3472,22 +3743,102 @@ fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
     add_note(&mut h, 0);
     h.frame(vec![]);
     let other = h.app.unsaved_dir().unwrap();
-    drop(h);
+    crash(h);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let live = rawdawg_project::lock::LockInfo { pid: 1, host: "elsewhere".into(), acquired_unix_ms: now };
     std::fs::write(lock_file(&other), serde_json::to_vec(&live).unwrap()).unwrap();
     let h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert!(h.app.files.recovery.is_empty(), "held by a live rawDAWg");
     drop(h);
-    // once that one is gone, its work is offered; Discard removes it for good
+    // a folder without a lock was closed by an older version: not a crash either
     std::fs::remove_file(lock_file(&other)).unwrap();
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "no lock left behind, no crash");
+    drop(h);
+    // once that one is gone (its lock left behind by a process that ended), its work is
+    // offered; Discard removes it for good
+    let dead = rawdawg_project::lock::LockInfo { pid: std::process::id(), host: live_host(), acquired_unix_ms: now };
+    std::fs::write(lock_file(&other), serde_json::to_vec(&dead).unwrap()).unwrap();
     let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
     assert_eq!(h.app.files.recovery.len(), 1);
     h.frame(vec![]);
-    let discard = h.node("Discard autosaves").unwrap();
+    let discard = h.node("Discard this project").unwrap();
     h.click_at(discard.center(), egui::PointerButton::Primary);
+    assert!(!other.exists(), "its folder is gone");
     drop(h);
     let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Draw two frames, then click the widget labelled `label`.
+fn click(h: &mut Harness, label: &str) {
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let r = h.drawn_nodes().into_iter().find(|(t, _)| t == label).map(|(_, r)| r).unwrap_or_else(|| panic!("{label:?} not drawn"));
+    h.click_at(r.center(), egui::PointerButton::Primary);
+}
+
+/// This machine's name as the lock records it.
+fn live_host() -> String {
+    std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "local".into())
+}
+
+#[test]
+fn two_crashed_never_saved_projects_are_offered_apart_and_handled_one_by_one() {
+    let base = std::env::temp_dir().join(format!("rawdawg-ui-unsaved-two-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let recovery = base.join("unsaved");
+    let mut dirs = Vec::new();
+    for notes in [2, 5] {
+        let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+        for t in 0..notes {
+            add_note(&mut h, t * 240);
+        }
+        h.frame(vec![]);
+        dirs.push(h.app.unsaved_dir().unwrap());
+        crash(h);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // a third crashed before its first autosave, after an import wrote its working manifest
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    for t in 0..3 {
+        add_note(&mut h, t * 240);
+    }
+    h.app.autosave_enabled = false;
+    let third = h.app.working_dir().unwrap();
+    assert!(third.join("project.json").is_file() && !third.join("recovery/autosave").exists());
+    crash(h);
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert_eq!(h.app.files.recovery.len(), 3, "one line per project");
+    assert_eq!(h.app.files.recovery[0].dir, third, "newest first");
+    assert!(
+        h.app.files.recovery_labels[0].contains("3 notes") && h.app.files.recovery_labels[1].contains("5 notes") && h.app.files.recovery_labels[2].contains("2 notes"),
+        "{:?}",
+        h.app.files.recovery_labels
+    );
+    h.frame(vec![]);
+    // discard the chosen one only (the 5-note project)
+    h.app.files.recovery_selected = 1;
+    h.frame(vec![]);
+    click(&mut h, "Discard this project");
+    assert!(!dirs[1].exists() && dirs[0].exists() && third.exists());
+    assert_eq!(h.app.files.recovery.len(), 2, "the others are still offered");
+    // another window recovers the 2-note one first: this one refuses rather than share it
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let taken = rawdawg_project::lock::LockInfo { pid: 1, host: "elsewhere".into(), acquired_unix_ms: now };
+    std::fs::write(lock_file(&dirs[0]), serde_json::to_vec(&taken).unwrap()).unwrap();
+    h.app.files.recovery_selected = 1;
+    h.frame(vec![]);
+    click(&mut h, "Recover");
+    assert_eq!(note_count(&h), 0, "not recovered");
+    assert!(h.app.status_line.contains("recovered in another rawDAWg window"), "{}", h.app.status_line);
+    assert_eq!(h.app.files.recovery.len(), 1);
+    // the manifest-only crash is recovered from its working manifest
+    h.frame(vec![]);
+    click(&mut h, "Recover");
+    assert_eq!(note_count(&h), 3);
+    assert_eq!(h.app.project_path.as_ref(), Some(&third));
     assert!(h.app.files.recovery.is_empty());
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -3559,6 +3910,121 @@ fn splitting_audio_and_automation_clips_changes_nothing_you_hear() {
 }
 
 #[test]
+fn splitting_a_44k_sample_inside_its_fades_changes_nothing_you_hear() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    use rawdawg_project::{ClipContent, Command};
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-split-fades-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // one second of 220 Hz at 44.1 kHz, in a 48 kHz project
+    let wav = root.join("tone44k.wav");
+    {
+        let spec = hound::WavSpec { channels: 1, sample_rate: 44_100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..44_100 {
+            w.write_sample(((i as f32 * 220.0 * std::f32::consts::TAU / 44_100.0).sin() * 16_000.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    let mut h = Harness::new(None);
+    assert_eq!(h.app.project.sample_rate_hz.0, 48_000);
+    let id = rawdawg_types::AssetId::from_hex(&h.app.import_asset_only(&wav).unwrap()).unwrap();
+    let track = rawdawg_project::Track { id: rawdawg_types::TrackId::new(), name: "Audio".into(), color: None, mute: false, solo: false, height: None, mixer_id: None };
+    let tid = track.id;
+    h.app.apply(Command::AddTrack { track, index: None });
+    let mut clip = super::playlist::audio_clip_for(&h.app, &id, tid, 0).expect("measured");
+    assert_eq!(clip.length_ticks, Tick(1920), "one second is two beats at 120 BPM, read at the file's own rate");
+    // 0.4 s fades in and out (source frames)
+    if let ClipContent::Audio { fade_in_frames, fade_out_frames, .. } = &mut clip.content {
+        (*fade_in_frames, *fade_out_frames) = (17_640, 17_640);
+    }
+    let cid = clip.id;
+    h.app.apply(Command::AddClip { clip });
+    let render = |h: &Harness| {
+        let opts =
+            OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, end_tick: Some(Tick(1920)), project_dir: h.app.project_path.clone(), ..OfflineOptions::default() };
+        render_project(&h.app.project, &opts).expect("render").0
+    };
+    let before = render(&h);
+    assert!(rawdawg_dsp::math::rms(&before) > 0.05, "the tone plays");
+    // split at 0.2 s (inside the fade-in), then the right part at 0.8 s (inside the fade-out)
+    let split = |h: &mut Harness, id: rawdawg_types::ClipId, at: i64| {
+        let c = h.app.project.clips.iter().find(|c| c.id == id).unwrap().clone();
+        let mut cmds = Vec::new();
+        super::playlist::split_clips_at(&mut h.app, &mut cmds, &[c], at);
+        for cmd in cmds {
+            h.app.apply(cmd);
+        }
+    };
+    split(&mut h, cid, 384);
+    let right = h.app.project.clips.iter().find(|c| c.track_id == tid && c.start_tick == Tick(384)).unwrap().id;
+    split(&mut h, right, 1536);
+    let parts: Vec<(i64, u64, u64, u64, u64, u64, u64)> = {
+        let mut v: Vec<_> = h
+            .app
+            .project
+            .clips
+            .iter()
+            .filter(|c| c.track_id == tid)
+            .map(|c| match &c.content {
+                ClipContent::Audio { source_offset_frames, source_length_frames, fade_in_frames, fade_in_offset_frames, fade_out_frames, fade_out_offset_frames, .. } => {
+                    (c.start_tick.0, *source_offset_frames, *source_length_frames, *fade_in_frames, *fade_in_offset_frames, *fade_out_frames, *fade_out_offset_frames)
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        parts,
+        vec![
+            (0, 0, 8_820, 17_640, 0, 0, 0),                     // the fade-in begins; it never reaches the fade-out
+            (384, 8_820, 26_460, 17_640, 8_820, 17_640, 8_820), // continues the fade-in, reaches the fade-out's start
+            (1536, 35_280, 8_820, 0, 0, 17_640, 0),             // the fade-in is over; the fade-out's last 0.2 s
+        ],
+        "cut at the file's own rate (44.1 kHz), each part playing its piece of the ramps"
+    );
+    let after = render(&h);
+    assert_eq!(before.len(), after.len());
+    let worst = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 1e-3, "splits inside fades are inaudible: largest difference {worst}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn trimming_the_left_edge_stops_at_the_files_start_and_keeps_automation_in_place() {
+    use rawdawg_project::{ClipContent, Command};
+    let mut h = Harness::new(Some("../../fixtures/demo-song.rawdawg"));
+    h.frame(vec![]);
+    let audio = h.app.project.clips.iter().find(|c| matches!(c.content, ClipContent::Audio { .. })).unwrap().clone();
+    let auto = h.app.project.clips.iter().find(|c| matches!(c.content, ClipContent::Automation { .. })).unwrap().clone();
+    // move both clips a bar right, so their left edges have room to be dragged left
+    for c in [&audio, &auto] {
+        h.app.apply(Command::UpdateClip { clip: rawdawg_project::Clip { start_tick: Tick(c.start_tick.0 + 3840), ..c.clone() } });
+    }
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let row = |h: &Harness, track| h.app.project.tracks.iter().position(|t| t.id == track).unwrap();
+    let clip = |h: &Harness, id| h.app.project.clips.iter().find(|c| c.id == id).unwrap().clone();
+    // the audio clip's left edge, dragged a whole bar left: it stops where the file starts
+    let (start, arow) = (clip(&h, audio.id).start_tick.0, row(&h, audio.track_id));
+    let from = super::playlist::lane_point(&h.app.playlist, surface, start, arow) + egui::vec2(2.0, 0.0);
+    let to = super::playlist::lane_point(&h.app.playlist, surface, start - 3840, arow) + egui::vec2(2.0, 0.0);
+    h.drag(from, to, egui::PointerButton::Primary);
+    let a = clip(&h, audio.id);
+    assert_eq!(a.start_tick.0, start, "the file starts there: the edge goes no further (the audio does not slide)");
+    assert!(matches!(a.content, ClipContent::Audio { source_offset_frames: 0, .. }));
+    // trimming an automation clip's start keeps its curve where it was in time
+    let (astart, rrow) = (clip(&h, auto.id).start_tick.0, row(&h, auto.track_id));
+    let from = super::playlist::lane_point(&h.app.playlist, surface, astart, rrow) + egui::vec2(2.0, 0.0);
+    let to = super::playlist::lane_point(&h.app.playlist, surface, astart + 960, rrow) + egui::vec2(2.0, 0.0);
+    h.drag(from, to, egui::PointerButton::Primary);
+    let t = clip(&h, auto.id);
+    assert_eq!(t.start_tick.0, astart + 960, "trimmed a beat");
+    assert!(matches!(t.content, ClipContent::Automation { source_offset_ticks: Tick(960), .. }), "{:?}", t.content);
+}
+
+#[test]
 fn transpose_and_voices_show_and_take_their_real_values() {
     let mut h = Harness::new(None);
     h.app.editor_view = EditorView::Synth;
@@ -3622,6 +4088,30 @@ fn export_creates_a_folder_typed_with_the_name() {
     let wav = root.join("mixes/bounces/final.wav");
     assert!(wav.is_file(), "{:?}", h.app.export.last_result);
     assert!(h.app.export.last_result.as_deref().is_some_and(|r| !r.starts_with("Export failed")), "{:?}", h.app.export.last_result);
+    // stems into a folder that does not exist yet, next to the main file
+    let run = |h: &mut Harness| {
+        super::export::request_audio(&mut h.app);
+        for _ in 0..2000 {
+            super::export::poll(&mut h.app);
+            if !h.app.export.running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    h.app.export.path = "stems/take".into();
+    h.app.export.stems = true;
+    run(&mut h);
+    let stems = std::fs::read_dir(root.join("stems/take-stems")).map(|r| r.count()).unwrap_or(0);
+    assert!(root.join("stems/take.wav").is_file() && stems > 0, "{:?}", h.app.export.last_result);
+    // a folder that cannot be made (a file is in the way): said so, nothing written
+    std::fs::write(root.join("blocked"), b"a file").unwrap();
+    h.app.export.stems = false;
+    h.app.export.path = "blocked/mix".into();
+    run(&mut h);
+    assert!(h.app.export.last_result.as_deref().is_some_and(|r| r.contains("Could not create the folder")), "{:?}", h.app.export.last_result);
+    super::export::request_midi(&mut h.app);
+    assert!(h.app.export.last_result.as_deref().is_some_and(|r| r.contains("Could not create the folder")), "{:?}", h.app.export.last_result);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3644,6 +4134,8 @@ fn a_project_takes_its_folder_name_and_can_be_renamed() {
     // Save As again: a name that matched its folder follows the new folder
     h.app.save_project_as(root.join("RandB"));
     assert_eq!(h.app.project.name, "RandB");
+    h.frame(vec![]);
+    assert!(h.app.export.path.ends_with("RandB.wav"), "{}", h.app.export.path);
     // File › Rename project…: type, Enter; one undo step
     h.app.export.open = false;
     h.frame(vec![]);
@@ -3660,6 +4152,18 @@ fn a_project_takes_its_folder_name_and_can_be_renamed() {
     h.key(egui::Key::Enter, egui::Modifiers::NONE);
     assert_eq!(h.app.project.name, "Night Drive");
     assert!(h.app.files.rename.is_none(), "the window closed");
+    // the export proposes the new name (it was not typed by the user)
+    h.app.export.open = true;
+    h.frame(vec![]);
+    assert!(h.app.export.path.ends_with("Night Drive.wav"), "{}", h.app.export.path);
+    // a path the user typed is kept through a rename
+    h.app.export.path = root.join("mine").display().to_string();
+    h.app.export.path_custom_for_tests();
+    h.app.rename_project("Night Drive 2");
+    h.frame(vec![]);
+    assert!(h.app.export.path.ends_with("mine"), "{}", h.app.export.path);
+    h.app.undo();
+    h.app.export.open = false;
     // a name the user chose stays through Save As
     h.app.save_project_as(root.join("Elsewhere"));
     assert_eq!(h.app.project.name, "Night Drive");
@@ -3752,6 +4256,198 @@ fn enter_confirms_and_escape_cancels_dialogs_and_the_effect_search() {
     h.key(egui::Key::Escape, egui::Modifiers::NONE);
     assert!(!h.app.mixer.add_open, "Escape closes the search");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn enter_confirms_only_from_the_field_and_never_on_the_frame_a_dialog_opens_nor_in_new() {
+    let mut h = Harness::new(None);
+    add_note(&mut h, 0);
+    // New: Enter does not throw the unsaved changes away
+    h.app.files.dialog = Some(super::project_files::FileDialog::New);
+    h.frame(vec![]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(note_count(&h), 1, "Enter in New discards nothing");
+    assert_eq!(h.app.files.dialog, Some(super::project_files::FileDialog::New));
+    click(&mut h, "Cancel");
+    // the Enter that opened a dialog (a menu entry chosen with the keyboard) does not confirm it
+    h.app.history.mark_saved();
+    h.app.files.path_input = "../../fixtures/demo-song.rawdawg".into();
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.app.files.focus_field = true;
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!(h.app.project_path.is_none(), "not opened by the Enter of the frame it appeared");
+    // with the field unfocused, Enter does nothing either (it may belong to another widget)
+    let heading = h.node("Playlist").unwrap();
+    h.click_at(heading.center(), egui::PointerButton::Primary);
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!(h.app.project_path.is_none(), "Enter outside the field");
+    // from the field it opens
+    let field = h.node("../../fixtures/demo-song.rawdawg").expect("the path field");
+    h.click_at(field.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!(h.app.project_path.as_ref().is_some_and(|p| p.ends_with("demo-song.rawdawg")));
+    // Rename keeps its own focus: opening it while Save As is pending does not steal that flag
+    h.app.files.rename = Some("Song".into());
+    h.app.files.focus_rename = true;
+    h.app.files.focus_field = false;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.ctx.memory(|m| m.focused().is_some()), "the rename field has the keyboard");
+}
+
+#[test]
+fn escape_goes_to_a_gesture_then_a_menu_then_the_dialog_and_otherwise_is_panic() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::PianoRoll;
+    h.frame(vec![]);
+    let surface = h.rect(egui::Id::unique("piano-roll-surface"));
+    let p = super::piano_roll::grid_point(&h.app.piano_roll, surface, 960 + 100, 64.5);
+    h.click_at(p, egui::PointerButton::Primary);
+    assert_eq!(h.lane_notes().len(), 1);
+    // a drag of the note in progress, with the Rename window open
+    let from = super::piano_roll::grid_point(&h.app.piano_roll, surface, 960 + 60, 64.5);
+    let to = super::piano_roll::grid_point(&h.app.piano_roll, surface, 1920 + 60, 66.5);
+    h.move_to(from);
+    h.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![egui::Event::PointerMoved(to)]);
+    h.frame(vec![egui::Event::PointerMoved(to)]);
+    assert!(h.app.piano_roll.gesture_active());
+    h.app.files.rename = Some("Song".into());
+    h.frame(vec![]);
+    h.frame(vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+    assert!(!h.app.piano_roll.gesture_active(), "the gesture is cancelled");
+    assert_eq!(h.lane_notes()[0].tick, Tick(960), "the note stays where it was");
+    assert!(h.app.files.rename.is_some(), "the dialog stays");
+    h.frame(vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![]);
+    // an open menu takes Escape before the dialog
+    let file = h.node("File").unwrap();
+    h.click_at(file.center(), egui::PointerButton::Primary);
+    assert!(egui::Popup::is_any_open(&h.ctx), "the File menu is open");
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "Escape closed the menu");
+    assert!(h.app.files.rename.is_some(), "not the dialog");
+    // holding Escape closes the frontmost dialog only, not the one under it as the key repeats
+    h.app.show_settings = true;
+    h.frame(vec![]);
+    let esc = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+    h.frame(vec![esc(true)]);
+    assert!(h.app.files.rename.is_none(), "a fresh press closes the frontmost");
+    for _ in 0..3 {
+        h.frame(vec![esc(true)]); // the platform's key repeat (egui marks it as a repeat)
+    }
+    h.frame(vec![esc(false)]);
+    assert!(h.app.show_settings, "the repeats did not close Settings");
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.show_settings, "the next press does");
+    // with nothing to cancel it is the panic key: held notes are released
+    h.app.held_notes.track(&TimedEvent::note_on(0, rawdawg_types::events::EventSource::Mouse, 0, 7, 60, 0.8));
+    assert!(h.app.held_notes.contains(60));
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.held_notes.contains(60), "Escape is panic");
+}
+
+#[test]
+fn the_effect_search_takes_the_focus_once_and_escape_is_its_only_where_it_shows() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Mixer;
+    h.app.mixer.selected = Some(h.app.project.mixer.master_id);
+    h.frame(vec![]);
+    let add = h.scroll_into_view("+ Add effect", |h| h.node("+ Add effect"));
+    h.click_at(add.center(), egui::PointerButton::Primary);
+    assert!(h.ctx.memory(|m| m.focused().is_some()), "typed into at once");
+    let inserts = |h: &Harness| h.app.project.mixer_channel(h.app.project.mixer.master_id).unwrap().inserts.len();
+    let before = inserts(&h);
+    // Enter on an empty search adds nothing
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(inserts(&h), before);
+    // clicking elsewhere leaves the field: it does not grab the keyboard back
+    let heading = h.node("Playlist").unwrap();
+    h.click_at(heading.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    assert!(h.ctx.memory(|m| m.focused().is_none()), "the focus stays where the user put it");
+    // shown in another view, Escape is not swallowed by the hidden search
+    h.app.editor_view = EditorView::Rack;
+    h.app.show_settings = false;
+    h.app.held_notes.track(&TimedEvent::note_on(0, rawdawg_types::events::EventSource::Mouse, 0, 7, 60, 0.8));
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.held_notes.contains(60), "Escape was panic, not the hidden search");
+}
+
+#[test]
+fn a_failed_autosave_says_so_in_the_file_menu() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-autosave-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("file"), b"in the way").unwrap();
+    let mut h = Harness::new(None);
+    add_note(&mut h, 0);
+    h.app.autosave_now(&root.join("file").join("Song.rawdawg"));
+    assert!(matches!(h.app.files.last_autosave_note, Some(Err(_))));
+    let file = h.node("File").unwrap();
+    h.click_at(file.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Autosave failed (hover for why)"), "{:?}", h.drawn_texts());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn escape_answers_the_unsaved_changes_prompts_with_cancel() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-esc-prompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let b = saved_song(&root, "B", 1, 3);
+    let mut h = Harness::new(None);
+    add_note(&mut h, 0);
+    h.app.request_open(b.clone());
+    h.frame(vec![]);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.app.files.open_prompt.is_none() && h.app.project_path.is_none(), "cancelled: nothing opened");
+    assert_eq!(note_count(&h), 1, "nothing discarded");
+    h.app.files.close_prompt = true;
+    h.frame(vec![]);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.files.close_prompt && !h.app.files.closing, "cancelled: the window stays");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_import_after_an_autosave_in_a_never_saved_project_is_what_is_recovered() {
+    let base = std::env::temp_dir().join(format!("rawdawg-ui-import-after-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let recovery = base.join("unsaved");
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    add_note(&mut h, 0);
+    h.frame(vec![]); // the first autosave: one note
+    let dir = h.app.unsaved_dir().unwrap();
+    assert_eq!(autosave_count(&dir), 1);
+    add_note(&mut h, 240);
+    add_note(&mut h, 480);
+    // an import gives it a working folder with a manifest (three notes), newer than the autosave
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let wav = base.join("hit.wav");
+    {
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48_000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..480 {
+            w.write_sample(((i % 50) as i16 - 25) * 300).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    h.app.import_asset_only(&wav).unwrap();
+    assert!(dir.join("project.json").is_file());
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    std::fs::File::options().write(true).open(dir.join("project.json")).unwrap().set_modified(later).unwrap();
+    crash(h);
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    assert!(h.app.files.recovery_labels[0].contains("3 notes"), "the newest version, not the older autosave: {:?}", h.app.files.recovery_labels);
+    click(&mut h, "Recover");
+    assert_eq!(note_count(&h), 3);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

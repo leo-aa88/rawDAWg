@@ -53,7 +53,7 @@ fn autosave_ring_keeps_the_newest_and_recovery_offers_work_the_saved_project_lac
     assert_eq!(cands.len(), AUTOSAVE_KEEP, "written after the save, so offered whatever their revision: {cands:?}");
     assert_eq!(cands[0].revision, AUTOSAVE_KEEP as u64 + 3, "newest first");
     assert!(cands.windows(2).all(|w| w[0].saved_unix_ms >= w[1].saved_unix_ms));
-    assert_eq!(rawdawg_project::persist::candidate_project_dir(&cands[0]).unwrap(), dir);
+    assert_eq!(cands[0].dir, dir);
     let recovered = load_project_dir(&dir).unwrap();
     assert_eq!(recovered.revision, 5, "the saved manifest is untouched by autosaves");
     let from_auto = rawdawg_project::persist::parse_project(&std::fs::read(&cands[0].path).unwrap()).unwrap();
@@ -80,6 +80,67 @@ fn autosave_ring_keeps_the_newest_and_recovery_offers_work_the_saved_project_lac
     let unsaved = root.join("unsaved.rawdawg");
     autosave(&unsaved, &p).unwrap();
     assert_eq!(recovery_candidates(&unsaved).len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recovery_offers_any_change_of_the_work_and_never_saved_folders_their_newest_snapshot() {
+    use rawdawg_project::persist::{highest_autosave_revision, latest_snapshot};
+    let root = tmp("anychange");
+    let dir = root.join("A.rawdawg");
+    let mut p = Project::new_default("song", serde_json::json!({}));
+    p.tracks.push(Track { id: TrackId::new(), name: "Track 1".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
+    p.revision = 2;
+    save_project_dir(&dir, &p).unwrap();
+    // muting a track, routing a channel or turning master protection off is work too
+    let edits: [fn(&mut Project); 3] = [|q| q.tracks[0].mute = true, |q| q.channels[0].mixer_id = q.mixer.master_id, |q| q.mixer.master_protection = false];
+    for (i, edit) in edits.iter().enumerate() {
+        clear_autosaves(&dir);
+        let mut q = p.clone();
+        edit(&mut q);
+        q.revision = 3 + i as u64;
+        autosave(&dir, &q).unwrap();
+        assert_eq!(recovery_candidates(&dir).len(), 1, "edit {i} is offered");
+    }
+    assert_eq!(highest_autosave_revision(&dir), 5);
+    // by time alone (an autosave with the saved revision): a second's margin around the save
+    clear_autosaves(&dir);
+    let mut q = p.clone();
+    q.tracks[0].solo = true;
+    autosave(&dir, &q).unwrap();
+    let saved_at = |offset_ms: i64| {
+        let now = std::time::SystemTime::now();
+        let by = std::time::Duration::from_millis(offset_ms.unsigned_abs());
+        let t = if offset_ms >= 0 { now + by } else { now - by };
+        std::fs::File::options().write(true).open(dir.join("project.json")).unwrap().set_modified(t).unwrap();
+    };
+    saved_at(-500);
+    assert!(recovery_candidates(&dir).is_empty(), "written within a second of the save: taken as the same moment");
+    saved_at(-1_500);
+    assert_eq!(recovery_candidates(&dir).len(), 1, "written well after the save");
+    autosave(&dir, &Project { revision: 40, ..p.clone() }).unwrap();
+    assert_eq!(highest_autosave_revision(&dir), 40, "read from the names");
+    // a never-saved folder: the newest of its autosaves and its working manifest
+    let unsaved = root.join("u.rawdawg");
+    assert!(latest_snapshot(&unsaved).is_none());
+    let mut w = p.clone();
+    w.name = "early".into();
+    autosave(&unsaved, &w).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    w.name = "imported".into();
+    save_project_dir(&unsaved, &w).unwrap();
+    let after = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options().write(true).open(unsaved.join("project.json")).unwrap().set_modified(after).unwrap();
+    let snap = latest_snapshot(&unsaved).unwrap();
+    assert!(!snap.autosave && snap.dir == unsaved, "the manifest is newer: {snap:?}");
+    assert_eq!(rawdawg_project::persist::load_candidate(&snap).unwrap().name, "imported");
+    std::fs::File::options().write(true).open(unsaved.join("project.json")).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60)).unwrap();
+    let snap = latest_snapshot(&unsaved).unwrap();
+    assert!(snap.autosave, "the autosave is newer: {snap:?}");
+    assert_eq!(rawdawg_project::persist::load_candidate(&snap).unwrap().name, "early");
+    // an unreadable newest autosave falls back to the next readable version
+    std::fs::write(unsaved.join("recovery/autosave/9999999999999-00000001.json"), b"{ broken").unwrap();
+    assert_eq!(rawdawg_project::persist::load_candidate(&latest_snapshot(&unsaved).unwrap()).unwrap().name, "early");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -156,6 +217,8 @@ fn moved_project_folder_loads_identically_with_portable_paths() {
             fade_in_frames: 0,
             fade_out_frames: 0,
             playback_rate: 1.0,
+            fade_in_offset_frames: 0,
+            fade_out_offset_frames: 0,
         },
     });
     save_project_dir(&src, &p).unwrap();
@@ -230,6 +293,8 @@ fn relink_with_different_content_rewrites_every_reference_and_undoes() {
             fade_in_frames: 0,
             fade_out_frames: 0,
             playback_rate: 1.0,
+            fade_in_offset_frames: 0,
+            fade_out_offset_frames: 0,
         },
     });
     // sampler state and a convolution insert reference the same asset

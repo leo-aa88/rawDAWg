@@ -194,48 +194,94 @@ pub fn autosave(dir: &Path, p: &Project) -> Result<PathBuf, PersistError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryCandidate {
     pub path: PathBuf,
+    /// The project folder the file belongs to (its media and large plugin states live there).
+    pub dir: PathBuf,
     pub revision: u64,
     pub saved_unix_ms: u64,
-    /// `true` for autosaves, `false` for the previous-manifest backup.
+    /// `true` for autosaves, `false` for a never-saved project's working manifest.
     pub autosave: bool,
+}
+
+/// Whether two versions hold the same work: equal apart from bookkeeping (the revision and the
+/// selected pattern). Large plugin states must be inlined in both (`plugin_state::inline`).
+pub fn same_work(a: &Project, b: &Project) -> bool {
+    let plain = |p: &Project| Project { revision: 0, selected_pattern: None, ..p.clone() };
+    plain(a) == plain(b)
+}
+
+/// `<unix ms>-<revision>.json` → (ms, revision).
+fn autosave_name_parts(name: &str) -> Option<(u64, u64)> {
+    let (ts, rev) = name.strip_suffix(".json")?.split_once('-')?;
+    Some((ts.parse().ok()?, rev.parse().ok()?))
+}
+
+/// The autosave files of a project folder with their (ms, revision), newest first.
+fn autosave_files(dir: &Path) -> Vec<(PathBuf, u64, u64)> {
+    let mut out: Vec<(PathBuf, u64, u64)> = fs::read_dir(dir.join(AUTOSAVE_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let (ts, rev) = autosave_name_parts(path.file_name()?.to_str()?)?;
+            Some((path, ts, rev))
+        })
+        .collect();
+    out.sort_by_key(|f| std::cmp::Reverse((f.1, f.2)));
+    out
+}
+
+/// The highest revision among a folder's autosaves (read from their names). Edits after an
+/// open are numbered above it, so a later save is newer than every autosave it leaves behind.
+pub fn highest_autosave_revision(dir: &Path) -> u64 {
+    autosave_files(dir).iter().map(|f| f.2).max().unwrap_or(0)
+}
+
+/// Read a recovery candidate's file with its large plugin states inlined from its folder.
+pub fn load_candidate(c: &RecoveryCandidate) -> Result<Project, PersistError> {
+    let bytes = fs::read(&c.path).map_err(io(&c.path))?;
+    let mut p = parse_project(&bytes)?;
+    let _ = crate::plugin_state::inline(&c.dir, &mut p);
+    Ok(p)
 }
 
 /// Autosaves (newest first) with work the saved manifest lacks: what to offer after a crash.
 /// An autosave counts when its revision is above the manifest's or it was written after the
-/// manifest (revisions restarted at 0 on open in earlier versions), and its content differs
-/// from the manifest (bookkeeping aside). Without a manifest (a never-saved project) every
+/// manifest (revisions restarted at 0 on open in earlier versions), and it holds different
+/// work (`same_work`: anything but the revision and the selection). Without a manifest every
 /// autosave counts. Unparseable files are skipped.
 pub fn recovery_candidates(dir: &Path) -> Vec<RecoveryCandidate> {
     let saved = load_project_dir(dir).ok();
     let saved_rev = saved.as_ref().map_or(0, |p| p.revision);
     let saved_ms = fs::metadata(dir.join(PROJECT_FILE)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
     let mut out = Vec::new();
-    if let Ok(rd) = fs::read_dir(dir.join(AUTOSAVE_DIR)) {
-        for e in rd.flatten() {
-            let path = e.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path) else { continue };
-            let Ok(p) = parse_project(&bytes) else { continue };
-            let ts = name.split('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
-            // by time with a second's margin: file times come from a coarse clock that can lag
-            // the autosave's own stamp by milliseconds (the revision rule needs no margin)
-            let newer = p.revision > saved_rev || saved_ms.is_none_or(|ms| ts > ms + 1000);
-            let differs = saved.as_ref().is_none_or(|s| !crate::compare::describe_changes(s, &p).is_empty());
-            if newer && differs {
-                out.push(RecoveryCandidate { path, revision: p.revision, saved_unix_ms: ts, autosave: true });
-            }
+    for (path, ts, rev) in autosave_files(dir) {
+        // by time with a second's margin: file times come from a coarse clock that can lag
+        // the autosave's own stamp by milliseconds (the revision rule needs no margin)
+        if !(rev > saved_rev || saved_ms.is_none_or(|ms| ts > ms + 1000)) {
+            continue;
+        }
+        let c = RecoveryCandidate { path, dir: dir.to_path_buf(), revision: rev, saved_unix_ms: ts, autosave: true };
+        let Ok(p) = load_candidate(&c) else { continue };
+        if saved.as_ref().is_none_or(|s| !same_work(s, &p)) {
+            out.push(RecoveryCandidate { revision: p.revision, ..c });
         }
     }
-    out.sort_by(|a, b| b.saved_unix_ms.cmp(&a.saved_unix_ms).then(b.revision.cmp(&a.revision)));
     out
 }
 
-/// The project folder a recovery candidate belongs to (`<dir>/recovery/autosave/<file>`).
-pub fn candidate_project_dir(c: &RecoveryCandidate) -> Option<PathBuf> {
-    Some(c.path.parent()?.parent()?.parent()?.to_path_buf())
+/// A never-saved project's newest readable version: its newest autosave, or the working
+/// manifest written when media were first imported into it (newer by file time wins).
+pub fn latest_snapshot(dir: &Path) -> Option<RecoveryCandidate> {
+    let manifest = dir.join(PROJECT_FILE);
+    let manifest_ms = fs::metadata(&manifest).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
+    let mut all: Vec<RecoveryCandidate> =
+        autosave_files(dir).into_iter().map(|(path, ts, rev)| RecoveryCandidate { path, dir: dir.to_path_buf(), revision: rev, saved_unix_ms: ts, autosave: true }).collect();
+    if let Some(ms) = manifest_ms {
+        all.push(RecoveryCandidate { path: manifest, dir: dir.to_path_buf(), revision: 0, saved_unix_ms: ms, autosave: false });
+    }
+    all.sort_by(|a, b| b.saved_unix_ms.cmp(&a.saved_unix_ms).then(b.autosave.cmp(&a.autosave)).then(b.revision.cmp(&a.revision)));
+    all.into_iter().find_map(|c| load_candidate(&c).ok().map(|p| RecoveryCandidate { revision: p.revision, ..c }))
 }
 
 /// Remove every autosave (after a successful save, or when the user discards them).

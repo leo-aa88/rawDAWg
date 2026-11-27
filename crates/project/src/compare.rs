@@ -4,8 +4,8 @@
 use crate::model::{Clip, Project};
 use std::collections::{HashMap, HashSet};
 
-/// The differences from `from` to `to`, one line each; empty when they sound and look the same
-/// (selection, revision and other bookkeeping are ignored).
+/// The differences from `from` to `to`, one line each; empty exactly when they hold the same
+/// work (`persist::same_work`: the selection and the revision are bookkeeping).
 pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
     let mut out = Vec::new();
     if from.name != to.name {
@@ -51,6 +51,16 @@ pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
         if old.gain_db != c.gain_db || old.pan != c.pan || old.mute != c.mute || old.solo != c.solo {
             out.push(format!("{}: level, pan, mute or solo changed", c.name));
         }
+        if old.mixer_id != c.mixer_id {
+            out.push(format!("{}: plays into another mixer channel", c.name));
+        }
+        if old.color != c.color {
+            out.push(format!("{}: color changed", c.name));
+        }
+    }
+    let order = |p: &Project| p.channels.iter().map(|c| c.id).filter(|id| fc.contains_key(id) && tc.contains_key(id)).collect::<Vec<_>>();
+    if order(from) != order(to) {
+        out.push("Channel order changed".into());
     }
     // notes per pattern
     for p in &to.patterns {
@@ -65,8 +75,17 @@ pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
                 } else if ids(old) != ids(p) || old.lanes != p.lanes {
                     out.push(format!("{}: notes edited", p.name));
                 }
+                if old.name != p.name {
+                    out.push(format!("Pattern renamed: {} → {}", old.name, p.name));
+                }
                 if old.length_ticks != p.length_ticks {
                     out.push(format!("{}: length changed", p.name));
+                }
+                if old.steps != p.steps || old.step_ticks != p.step_ticks {
+                    out.push(format!("{}: steps {} → {}", p.name, old.steps, p.steps));
+                }
+                if old.color != p.color {
+                    out.push(format!("{}: color changed", p.name));
                 }
             }
         }
@@ -88,6 +107,25 @@ pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
     if from.tracks.len() != to.tracks.len() {
         out.push(format!("Tracks: {} → {}", from.tracks.len(), to.tracks.len()));
     }
+    for t in &to.tracks {
+        let Some(old) = from.tracks.iter().find(|x| x.id == t.id) else { continue };
+        if old.name != t.name {
+            out.push(format!("Track renamed: {} → {}", old.name, t.name));
+        }
+        if old.mute != t.mute || old.solo != t.solo {
+            out.push(format!("{}: mute or solo changed", t.name));
+        }
+        if old.mixer_id != t.mixer_id {
+            out.push(format!("{}: audio plays into another mixer channel", t.name));
+        }
+        if old.color != t.color || old.height != t.height {
+            out.push(format!("{}: color or height changed", t.name));
+        }
+    }
+    let track_order = |p: &Project, other: &Project| p.tracks.iter().map(|t| t.id).filter(|id| other.tracks.iter().any(|x| x.id == *id)).collect::<Vec<_>>();
+    if track_order(from, to) != track_order(to, from) {
+        out.push("Track order changed".into());
+    }
     // mixer
     for m in &to.mixer.channels {
         match from.mixer.channels.iter().find(|x| x.id == m.id) {
@@ -98,8 +136,14 @@ pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
                 } else if old.inserts != m.inserts {
                     out.push(format!("{}: effects edited", m.name));
                 }
-                if old.gain_db != m.gain_db || old.pan != m.pan || old.mute != m.mute || old.solo != m.solo || old.sends != m.sends {
+                if old.name != m.name {
+                    out.push(format!("Mixer channel renamed: {} → {}", old.name, m.name));
+                }
+                if old.gain_db != m.gain_db || old.pan != m.pan || old.mute != m.mute || old.solo != m.solo || old.sends != m.sends || old.output_id != m.output_id {
                     out.push(format!("{}: fader, pan, sends or routing changed", m.name));
+                }
+                if old.color != m.color {
+                    out.push(format!("{}: color changed", m.name));
                 }
             }
         }
@@ -109,17 +153,26 @@ pub fn describe_changes(from: &Project, to: &Project) -> Vec<String> {
             out.push(format!("Mixer channel removed: {}", m.name));
         }
     }
+    if from.mixer.master_protection != to.mixer.master_protection {
+        out.push(format!("Master protection {}", if to.mixer.master_protection { "on" } else { "off" }));
+    }
     if from.automation != to.automation {
         out.push(format!("Automation: {} → {} curve(s){}", from.automation.len(), to.automation.len(), if from.automation.len() == to.automation.len() { ", edited" } else { "" }));
     }
     if from.assets.len() != to.assets.len() {
         out.push(format!("Samples and files: {} → {}", from.assets.len(), to.assets.len()));
+    } else if from.assets != to.assets {
+        out.push("Samples and files replaced or relinked".into());
     }
     if from.midi_mappings != to.midi_mappings {
         out.push("MIDI mappings changed".into());
     }
     if from.r#loop != to.r#loop {
         out.push("Loop range changed".into());
+    }
+    // the same rule the recovery offer uses: anything but bookkeeping is a change worth naming
+    if out.is_empty() && !crate::persist::same_work(from, to) {
+        out.push("Other project settings changed".into());
     }
     out
 }
@@ -132,7 +185,9 @@ mod tests {
     use rawdawg_types::units::Tick;
 
     fn base() -> Project {
-        Project::new_default("Song", serde_json::json!({ "name": "Bright" }))
+        let mut p = Project::new_default("Song", serde_json::json!({ "name": "Bright" }));
+        p.tracks.push(crate::model::Track { id: rawdawg_types::TrackId::new(), name: "Track 1".into(), color: None, mute: false, solo: false, height: None, mixer_id: None });
+        p
     }
 
     #[test]
@@ -169,5 +224,49 @@ mod tests {
         // and the other way round
         let back = describe_changes(&b, &a);
         assert!(back.iter().any(|l| l.contains("3 → 0 notes")), "{back:?}");
+    }
+
+    #[test]
+    fn routing_names_mute_steps_and_protection_are_changes_too() {
+        let a = base();
+        // each edit alone must be named (the recovery offer depends on it)
+        type Edit = Box<dyn Fn(&mut Project)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("Track renamed", Box::new(|p| p.tracks[0].name = "Drums".into())),
+            ("mute or solo changed", Box::new(|p| p.tracks[0].mute = true)),
+            ("audio plays into another mixer channel", Box::new(|p| p.tracks[0].mixer_id = Some(p.mixer.master_id))),
+            ("Mixer channel renamed", Box::new(|p| p.mixer.channels[0].name = "Bus".into())),
+            ("routing changed", Box::new(|p| p.mixer.channels[1].output_id = None)),
+            ("plays into another mixer channel", Box::new(|p| p.channels[0].mixer_id = p.mixer.master_id)),
+            ("Pattern renamed", Box::new(|p| p.patterns[0].name = "Verse".into())),
+            ("steps 16 → 32", Box::new(|p| p.patterns[0].steps = 32)),
+            ("Master protection off", Box::new(|p| p.mixer.master_protection = false)),
+            ("Other project settings changed", Box::new(|p| p.ppq = 480)),
+        ];
+        for (expect, edit) in edits {
+            let mut b = a.clone();
+            edit(&mut b);
+            assert!(!crate::persist::same_work(&a, &b), "{expect}: the edit changes the work");
+            let d = describe_changes(&a, &b);
+            assert!(d.iter().any(|l| l.contains(expect)), "{expect}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn channel_and_track_order_are_changes() {
+        let mut a = base();
+        let mut extra = a.channels[0].clone();
+        extra.id = rawdawg_types::ChannelId::new();
+        extra.name = "Second".into();
+        a.channels.push(extra);
+        let mut b = a.clone();
+        b.channels.reverse();
+        assert!(describe_changes(&a, &b).iter().any(|l| l == "Channel order changed"));
+        let mut t = a.tracks[0].clone();
+        t.id = rawdawg_types::TrackId::new();
+        a.tracks.push(t);
+        let mut c = a.clone();
+        c.tracks.reverse();
+        assert!(describe_changes(&a, &c).iter().any(|l| l == "Track order changed"), "{:?}", describe_changes(&a, &c));
     }
 }

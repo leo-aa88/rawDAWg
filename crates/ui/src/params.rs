@@ -40,6 +40,19 @@ pub fn step_combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debu
     (r, n)
 }
 
+/// A step slider showing the values the steps stand for (Transpose −48…+48, Voices 1…64:
+/// the descriptor's display offset), not the step index. Returns the response and the value.
+pub fn step_slider(ui: &mut egui::Ui, d: &ParamDescriptor, n: f32) -> (Response, f32) {
+    let ParamMapping::Discrete { steps } = d.mapping else {
+        let mut v = n;
+        return (ui.add(slider(ui, &mut v, 0.0..=1.0).show_value(false)), v);
+    };
+    let off = i64::from(d.display_offset);
+    let mut shown = d.to_physical(n) as i64 + off;
+    let r = ui.add(slider(ui, &mut shown, off..=(off + i64::from(steps.max(1)) - 1)).show_value(true));
+    (r, d.to_normalized((shown - off) as f64))
+}
+
 /// The control for one parameter: a switch, a list of named choices, a step slider or a
 /// continuous slider. Returns the response and the (possibly changed) normalized value.
 pub fn param_control(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, d: &ParamDescriptor, n: f32, labels: Option<&[String]>) -> (Response, f32) {
@@ -50,11 +63,7 @@ pub fn param_control(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::D
             (r, if b { 1.0 } else { 0.0 })
         }
         ParamMapping::Discrete { .. } if labels.is_some() => step_combo(ui, salt, d, labels.unwrap_or_default(), n),
-        ParamMapping::Discrete { steps } => {
-            let mut idx = d.to_physical(n) as i64;
-            let r = ui.add(slider(ui, &mut idx, 0..=(i64::from(steps) - 1)).show_value(true));
-            (r, d.to_normalized(idx as f64))
-        }
+        ParamMapping::Discrete { .. } => step_slider(ui, d, n),
         _ => {
             let mut v = n;
             let r = ui.add(slider(ui, &mut v, 0.0..=1.0).show_value(false));
@@ -135,5 +144,37 @@ mod tests {
         let cont = ParamDescriptor::continuous(4, "g", "Gain", ParamUnit::None, ParamMapping::Linear { min: 0.0, max: 1.0 }, 0.5, ParamCategory::Effects);
         assert_eq!(step_labels(&cont, |_| Some(String::new())), None);
         assert_eq!(cont.id, ParamId(4));
+    }
+
+    /// Draw `param_control` once and return every label and value it exposes.
+    fn texts(d: &ParamDescriptor, n: f32) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let mut o = ctx.run_ui(egui::RawInput::default(), |ui| {
+                param_control(ui, "p", d, n, None);
+            });
+            o.textures_delta.clear();
+            out = o
+                .platform_output
+                .accesskit_update
+                .map(|u| u.nodes.iter().flat_map(|(_, node)| node.label().into_iter().chain(node.value()).map(str::to_owned).collect::<Vec<_>>()).collect())
+                .unwrap_or_default();
+        }
+        out
+    }
+
+    #[test]
+    fn a_step_slider_shows_the_values_the_steps_stand_for() {
+        let transpose = ParamDescriptor::continuous(1, "t", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Effects)
+            .stepped()
+            .with_display_offset(-48);
+        let shown = texts(&transpose, 0.5);
+        assert!(shown.iter().any(|t| t == "0") && !shown.iter().any(|t| t == "48"), "Transpose at its middle shows 0, not the step index 48: {shown:?}");
+        let voices =
+            ParamDescriptor::continuous(2, "v", "Voices", ParamUnit::None, ParamMapping::Discrete { steps: 64 }, 0.0, ParamCategory::Effects).stepped().with_display_offset(1);
+        let shown = texts(&voices, 0.0);
+        assert!(shown.iter().any(|t| t == "1") && !shown.iter().any(|t| t == "0"), "the first voice count is 1: {shown:?}");
     }
 }

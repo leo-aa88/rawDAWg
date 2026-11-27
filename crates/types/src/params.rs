@@ -326,17 +326,39 @@ impl ParamDescriptor {
 
     /// Parse user text in physical units into a normalized value.
     pub fn parse(&self, text: &str) -> Option<f32> {
-        let t = text.trim().to_ascii_lowercase();
-        // a named step by its name; an unnamed one by the number it shows
+        // a typographic minus (−12 st) reads as a minus
+        let t = text.trim().replace('\u{2212}', "-").to_lowercase();
         if let ParamMapping::Discrete { steps } = self.mapping {
-            if let Some(labels) = self.labels
-                && let Some(i) = labels.iter().position(|l| l.to_ascii_lowercase() == t)
-            {
-                return Some(self.to_normalized(i as f64));
+            let last = f64::from(steps.max(1) - 1);
+            let number = |s: &str| -> Option<f64> {
+                let num: String = s.chars().take_while(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.')).collect();
+                num.parse().ok()
+            };
+            if let Some(labels) = self.labels {
+                let labels: Vec<String> = labels.iter().take(steps as usize).map(|l| l.replace('\u{2212}', "-").to_lowercase()).collect();
+                // a step by its whole name
+                if let Some(i) = labels.iter().position(|l| *l == t) {
+                    return Some(self.to_normalized(i as f64));
+                }
+                // a number is the step whose name starts with it ("4" → "4 voices"), before a
+                // step index: names hold the numbers people read
+                if let Some(v) = t.parse::<f64>().ok().filter(|v| v.is_finite())
+                    && let Some(i) = labels.iter().position(|l| l.split_whitespace().next().and_then(|w| w.parse::<f64>().ok()) == Some(v))
+                {
+                    return Some(self.to_normalized(i as f64));
+                }
+                // the start of exactly one name ("off" → "Off (ms)", "tri" → "Triangle")
+                let starts: Vec<usize> = (0..labels.len()).filter(|i| !t.is_empty() && labels[*i].starts_with(t.as_str())).collect();
+                if let [i] = starts[..] {
+                    return Some(self.to_normalized(i as f64));
+                }
             }
-            let num: String = t.chars().take_while(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.')).collect();
-            let v: f64 = num.parse().ok()?;
-            let step = (v.round() - f64::from(self.display_offset)).clamp(0.0, f64::from(steps.max(1) - 1));
+            // an unnamed step by the number it shows
+            let v = number(&t)?;
+            if !v.is_finite() {
+                return None;
+            }
+            let step = (v.round() - f64::from(self.display_offset)).clamp(0.0, last);
             return Some(self.to_normalized(step));
         }
         if matches!(self.mapping, ParamMapping::Toggle) {
@@ -437,6 +459,32 @@ mod tests {
         assert!(!bad.is_well_formed());
         let bad2 = ParamDescriptor::continuous(8, "x", "X", ParamUnit::None, ParamMapping::Linear { min: 1.0, max: 1.0 }, 0.5, ParamCategory::Mix);
         assert!(!bad2.is_well_formed());
+    }
+
+    #[test]
+    fn named_steps_take_their_names_a_unique_start_and_the_numbers_they_hold() {
+        const LABELS: &[&str] = &["Off (ms)", "1/16", "2 voices", "4 voices", "Triangle", "Tri-saw", "\u{2212}12 st"];
+        let d = ParamDescriptor::continuous(9, "x", "X", ParamUnit::None, ParamMapping::Discrete { steps: 7 }, 0.0, ParamCategory::Mix).stepped().with_labels(LABELS);
+        let step = |t: &str| d.parse(t).map(|n| d.to_physical(n) as i64);
+        assert_eq!(step("Off (ms)"), Some(0), "a whole name");
+        assert_eq!(step("off"), Some(0), "a unique start: Off");
+        assert_eq!(step("  OFF "), Some(0));
+        assert_eq!(step("1/16"), Some(1));
+        assert_eq!(step("4"), Some(3), "a number is the name that starts with it, not step 4");
+        assert_eq!(step("2"), Some(2));
+        assert_eq!(step("4.0"), Some(3), "the number a name starts with, however it is written");
+        assert_eq!(step("tri"), None, "a start shared by two names chooses neither");
+        assert_eq!(step("trian"), Some(4), "Triangle by a unique start");
+        assert_eq!(step("tri-"), Some(5));
+        assert_eq!(step("-12 st"), Some(6), "a typographic minus reads as a minus");
+        assert_eq!(step("\u{2212}12 st"), Some(6));
+        assert_eq!(step("6"), Some(6), "an unnamed number is the step it shows");
+        assert_eq!(step("nonsense"), None);
+        // an unnamed stepped value with a typographic minus
+        let transpose = ParamDescriptor::continuous(1, "t", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Pitch)
+            .stepped()
+            .with_display_offset(-48);
+        assert_eq!(transpose.parse("\u{2212}12").map(|n| transpose.step_value(n)), Some(-12));
     }
 
     #[test]

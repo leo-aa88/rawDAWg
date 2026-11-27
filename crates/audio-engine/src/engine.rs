@@ -235,18 +235,39 @@ pub struct Engine {
     monitor_fill: usize,
 }
 
-/// Clip gain with linear fades at `local` output frames into the clip.
-#[inline]
-fn clip_gain(gain: f32, fade_in: f64, fade_out: f64, len_frames: i64, local: f64) -> f32 {
-    let mut g = gain;
-    if fade_in > 0.0 && local < fade_in {
-        g *= (local / fade_in) as f32;
+/// An audio clip's gain with its linear fades, read once per block (plain values, so the
+/// clip's source can be borrowed mutably while it plays).
+#[derive(Clone, Copy)]
+struct ClipFades {
+    gain: f32,
+    fade_in: f64,
+    fade_out: f64,
+    in_offset: f64,
+    out_offset: f64,
+    len: f64,
+}
+
+impl ClipFades {
+    fn of(c: &crate::plan::AudioClipNode) -> Self {
+        Self { gain: c.gain, fade_in: c.fade_in, fade_out: c.fade_out, in_offset: c.fade_in_offset, out_offset: c.fade_out_offset, len: c.len_frames as f64 }
     }
-    let remaining = len_frames as f64 - local;
-    if fade_out > 0.0 && remaining < fade_out {
-        g *= (remaining / fade_out).max(0.0) as f32;
+
+    /// The gain `local` output frames into the clip. A clip that starts `in_offset` frames into
+    /// its fade-in, or ends `out_offset` frames before its fade-out does, plays that part of the
+    /// ramp (the halves of a clip split inside a fade).
+    #[inline]
+    fn gain_at(&self, local: f64) -> f32 {
+        let mut g = self.gain;
+        let into = local + self.in_offset;
+        if self.fade_in > 0.0 && into < self.fade_in {
+            g *= (into / self.fade_in).max(0.0) as f32;
+        }
+        let remaining = self.len - local + self.out_offset;
+        if self.fade_out > 0.0 && remaining < self.fade_out {
+            g *= (remaining / self.fade_out).max(0.0) as f32;
+        }
+        g
     }
-    g
 }
 
 /// Frames the monitor ring holds (≈ 170 ms at 48 kHz).
@@ -756,13 +777,14 @@ impl Engine {
                 let to = clip_end.min(end);
                 let (bl, br) = plan.mixer[clip.mixer_index].buffer.stereo_mut(offset + len);
                 let mut dropouts = 0u64;
+                let fades = ClipFades::of(clip);
                 match &mut clip.source {
                     crate::plan::ClipSource::Resident(asset) => {
                         let stereo = asset.is_stereo();
                         for f in from..to {
                             let local = (f - clip.start_frame) as f64;
                             let src = clip.source_offset + local * clip.rate;
-                            let g = clip_gain(clip.gain, clip.fade_in, clip.fade_out, clip.len_frames, local);
+                            let g = fades.gain_at(local);
                             let i = offset + (f - start) as usize;
                             let l = asset.read(0, src) * g;
                             let r = if stereo { asset.read(1, src) * g } else { l };
@@ -776,7 +798,7 @@ impl Engine {
                         for f in from..to {
                             let local = (f - clip.start_frame) as f64;
                             let src = clip.source_offset + local * clip.rate;
-                            let g = clip_gain(clip.gain, clip.fade_in, clip.fade_out, clip.len_frames, local);
+                            let g = fades.gain_at(local);
                             let i = offset + (f - start) as usize;
                             match stream.read_or_head(src) {
                                 Some((l, r)) => {

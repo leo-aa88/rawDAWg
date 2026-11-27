@@ -27,6 +27,8 @@ pub(crate) struct MixerState {
     rename: Option<(MixerChannelId, String)>,
     add_search: String,
     pub add_open: bool,
+    /// Give the search field the keyboard focus once, when the search opens.
+    add_focus: bool,
     /// Rack randomisation: chaos 0–100 and locks (mix/safety/routing locked by default).
     pub chaos: f32,
     pub locks: RackLocks,
@@ -407,18 +409,20 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
                 ui.interact(hdr.rect, egui::Id::unique("mixer-inserts-header"), Sense::hover());
                 if ui.button("+ Add effect").clicked() {
                     app.mixer.add_open = !app.mixer.add_open;
-                    // a new search each time it opens
+                    // a new search each time it opens, typed into at once
                     app.mixer.add_search.clear();
+                    app.mixer.add_focus = app.mixer.add_open;
                 }
             });
             if app.mixer.add_open {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut app.mixer.add_search).hint_text("search effects…").desired_width(180.0));
-                    // Enter adds the first match (Escape closes, as every dialog)
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if !enter {
+                    if std::mem::take(&mut app.mixer.add_focus) {
                         r.request_focus();
                     }
+                    // Enter in the field adds the first match of what was typed (Escape closes, as
+                    // every dialog); Enter on an empty search adds nothing
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !app.mixer.add_search.trim().is_empty();
                     let needle = app.mixer.add_search.to_lowercase();
                     let native: Vec<&rawdawg_effects::EffectInfo> = rawdawg_effects::CATALOG
                         .iter()

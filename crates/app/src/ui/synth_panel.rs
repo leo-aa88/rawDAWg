@@ -548,7 +548,7 @@ fn param_grid(
                     n = if b { 1.0 } else { 0.0 };
                     r
                 }
-                ParamMapping::Discrete { steps } => {
+                ParamMapping::Discrete { .. } => {
                     let mut idx = d.to_physical(n) as i64;
                     match &labeled {
                         Some(labels) => {
@@ -570,10 +570,8 @@ fn param_grid(
                         }
                         None => {
                             // the values the steps stand for (Transpose −48…+48, Voices 1…64)
-                            let off = i64::from(d.display_offset);
-                            let mut shown = idx + off;
-                            let r = ui.add(rawdawg_ui::params::slider(ui, &mut shown, off..=(off + steps as i64 - 1)).show_value(true));
-                            n = d.to_normalized((shown - off) as f64);
+                            let (r, v) = rawdawg_ui::params::step_slider(ui, d, n);
+                            n = v;
                             r
                         }
                     }

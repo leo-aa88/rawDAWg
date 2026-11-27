@@ -200,6 +200,10 @@ pub struct Pattern {
     pub lanes: Vec<Lane>,
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 fn default_steps() -> u16 {
     16
 }
@@ -290,6 +294,14 @@ pub enum ClipContent {
         fade_out_frames: u64,
         #[serde(default = "one_f64")]
         playback_rate: f64,
+        /// How far into its fade-in the clip starts (source frames): the right half of a clip
+        /// split inside its fade-in continues the same ramp. 0 for a whole fade.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        fade_in_offset_frames: u64,
+        /// How much of its fade-out lies after the clip's end (source frames): the left half of
+        /// a clip split inside its fade-out continues the same ramp. 0 for a whole fade.
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        fade_out_offset_frames: u64,
     },
     Automation {
         curve_id: CurveId,

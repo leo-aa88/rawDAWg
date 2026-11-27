@@ -838,6 +838,8 @@ fn audio_clip_project(tag: &str) -> (std::path::PathBuf, Project, rawdawg_types:
             fade_in_frames: 0,
             fade_out_frames: 0,
             playback_rate: 1.0,
+            fade_in_offset_frames: 0,
+            fade_out_offset_frames: 0,
         },
     });
     // an extra bar of silence keeps the song end past the clip
@@ -1132,6 +1134,8 @@ fn long_clip_project(tag: &str) -> (std::path::PathBuf, Project, rawdawg_types::
                 fade_in_frames: 0,
                 fade_out_frames: 0,
                 playback_rate: 1.0,
+                fade_in_offset_frames: 0,
+                fade_out_offset_frames: 0,
             },
         });
     }

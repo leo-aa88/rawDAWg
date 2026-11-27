@@ -39,6 +39,19 @@ pub(crate) struct ProjectFilesState {
     pub open_after_save: Option<PathBuf>,
     /// The recovery offer is for never-saved projects of an earlier session (found at start).
     pub recovery_unsaved: bool,
+    /// Which offered candidate is chosen (the list's selection; Compare shows this one).
+    pub recovery_selected: usize,
+    /// A never-saved recovery offer's line per candidate (name and what it holds).
+    pub recovery_labels: Vec<String>,
+    /// Recover was clicked while the project has unsaved changes: ask before replacing them.
+    pub recover_confirm: bool,
+    /// Offer never-saved projects of earlier sessions once the current offer is answered.
+    pub unsaved_offer_pending: bool,
+    /// The autosave files this session wrote (or took over by recovering) for this project:
+    /// the only ones removed when its work is saved or given up.
+    pub session_autosaves: Vec<PathBuf>,
+    /// Why "Save and close" / "Save and open" could not save (the prompt stays open).
+    pub prompt_note: Option<String>,
     /// The window is asked to close (set when rawDAWg sends the close request; tests read it).
     pub closing: bool,
     pub last_autosave: Option<Instant>,
@@ -46,18 +59,22 @@ pub(crate) struct ProjectFilesState {
     pub last_autosave_note: Option<Result<(u64, PathBuf), String>>,
     /// The Rename project window, with the name being typed.
     pub rename: Option<String>,
-    /// Give the open dialog's text field the keyboard focus (once, when it opens).
+    /// Give the file dialog's text field the keyboard focus (once, when it opens).
     pub focus_field: bool,
+    /// The same for the Rename project window.
+    pub focus_rename: bool,
+    /// The file dialog and Rename window drawn last frame: Enter on the frame one opens (say,
+    /// the Enter that chose the menu entry) does not confirm it.
+    shown_dialog: Option<FileDialog>,
+    shown_rename: bool,
     /// Relink: asset id → path typed by the user.
     pub relink: Option<(rawdawg_types::AssetId, String)>,
-    /// The recovery offer's Compare view: the chosen autosave, what it changes, and which
-    /// version the engine plays.
+    /// The recovery offer's Compare view: the chosen autosave (`recovery_selected`), what it
+    /// changes, and which version the engine plays.
     pub compare: Option<RecoveryCompare>,
 }
 
 pub(crate) struct RecoveryCompare {
-    /// Index into `recovery`.
-    pub candidate: usize,
     pub autosave: Project,
     pub changes: Vec<String>,
     /// The engine plays the autosave instead of the saved project (listening only).
@@ -98,20 +115,47 @@ impl App {
         if self.files.lock.is_none() {
             self.files.lock = ProjectLock::acquire(&dir, false).ok();
         }
-        Some(dir)
+        // a folder another window holds is not ours to write into
+        self.files.lock.as_ref().map(|_| dir)
     }
 
-    /// The work since the last save is given up (discarded, or the window closed cleanly):
-    /// its autosaves go too, so the next start or open does not offer them as a crash.
-    pub(crate) fn forget_unsaved_autosaves(&mut self) {
-        let dir = if self.is_never_saved() { self.project_path.clone().or_else(|| self.unsaved_dir()) } else { self.project_path.clone() };
-        if let Some(dir) = dir {
-            rawdawg_project::persist::clear_autosaves(&dir);
+    /// The never-saved project's per-user folder (where its media and autosaves are, or would be).
+    fn unsaved_folder(&self) -> Option<PathBuf> {
+        if !self.is_never_saved() {
+            return None;
+        }
+        self.project_path.clone().or_else(|| self.unsaved_dir())
+    }
+
+    /// Delete a never-saved project's per-user folder; nothing outside the per-user area.
+    fn remove_unsaved_folder(&self, dir: &Path) {
+        let Some(root) = &self.unsaved_root else { return };
+        if dir.starts_with(root) && dir != root.as_path() && dir.extension().is_some_and(|e| e == "rawdawg") {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 
-    /// At start: never-saved projects of earlier sessions that ended without closing (their
-    /// autosaves are still there and no running rawDAWg holds them) are offered for recovery.
+    /// Delete the autosaves this session wrote: the work they protect was saved or given up.
+    /// Older ones (a crash the user chose to keep) stay.
+    fn forget_session_autosaves(&mut self) {
+        for p in std::mem::take(&mut self.files.session_autosaves) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The work since the last save is given up (discarded, or the window closed with nothing
+    /// unsaved): this session's autosaves go, and a never-saved project's folder with them, so
+    /// the next start or open offers nothing as a crash.
+    pub(crate) fn give_up_session_work(&mut self) {
+        self.forget_session_autosaves();
+        if let Some(dir) = self.unsaved_folder() {
+            self.files.lock = None;
+            self.remove_unsaved_folder(&dir);
+        }
+    }
+
+    /// Never-saved projects of earlier sessions that ended without closing (their folder still
+    /// holds the lock of a process that is gone) are offered for recovery, one line each.
     pub(crate) fn offer_unsaved_recovery(&mut self) {
         let Some(root) = self.unsaved_root.clone() else { return };
         let own = self.unsaved_dir();
@@ -121,47 +165,75 @@ impl App {
             if !dir.is_dir() || Some(&dir) == own.as_ref() {
                 continue;
             }
-            if ProjectLock::read(&dir).is_some_and(|l| rawdawg_project::lock::is_live(&l)) {
+            // a clean exit removes the folder (or at least its lock); a running rawDAWg holds it
+            if ProjectLock::read(&dir).is_none_or(|l| rawdawg_project::lock::is_live(&l)) {
                 continue;
             }
-            found.extend(rawdawg_project::recovery_candidates(&dir));
+            if let Some(c) = rawdawg_project::persist::latest_snapshot(&dir) {
+                let label = rawdawg_project::persist::load_candidate(&c).map_or_else(|_| "A project".to_owned(), |p| summary(&p));
+                found.push((c, label));
+            }
         }
-        found.sort_by_key(|c| std::cmp::Reverse(c.saved_unix_ms));
+        found.sort_by_key(|(c, _)| std::cmp::Reverse(c.saved_unix_ms));
         if !found.is_empty() {
-            self.files.recovery = found;
+            (self.files.recovery, self.files.recovery_labels) = found.into_iter().unzip();
             self.files.recovery_unsaved = true;
+            self.files.recovery_selected = 0;
+            self.files.recover_confirm = false;
         }
     }
 
-    /// Open a project folder: lock it, load, then look for newer autosaves.
-    pub(crate) fn open_project_checked(&mut self, path: PathBuf) {
+    /// Open a project folder: lock it, load, then look for newer autosaves. Whether it opened.
+    pub(crate) fn open_project_checked(&mut self, path: PathBuf) -> bool {
         let dir = match rawdawg_project::persist::resolve_project_dir(&path) {
-            Ok(d) => d,
+            Ok(d) => crate::prefs::absolute(&d),
             Err(e) => {
                 self.status_line = format!("Could not open {}: {e}", path.display());
                 self.files.error = Some(e.to_string());
-                return;
+                return false;
             }
         };
-        // the new project's lock first; the current project keeps its own if the open fails
-        let (lock, read_only) = match ProjectLock::acquire(&dir, false) {
-            Ok(l) => (Some(l), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
+        // reopening this project keeps our lock (a second one would take the file with it if
+        // the load failed); another project's lock is taken first, the current one kept if the
+        // open fails
+        let reopen = self.project_path.as_ref() == Some(&dir) && self.files.lock.is_some();
+        let acquired = (!reopen).then(|| ProjectLock::acquire(&dir, false));
+        // what this session leaves behind once the other project is open
+        let left_autosaves = std::mem::take(&mut self.files.session_autosaves);
+        let left_unsaved = self.unsaved_folder().filter(|d| *d != dir);
+        // the engine must play the opened project, not an autosave being compared
+        let compare = self.files.compare.take();
         if !self.open_project(dir.clone()) {
+            self.files.session_autosaves = left_autosaves;
+            self.files.compare = compare;
             self.files.error = Some(self.status_line.clone());
-            return;
+            return false;
         }
-        // the previous project's lock is released here (replaced), the new one held
-        self.files.lock = lock;
-        self.files.read_only = read_only;
-        self.files.recovery = rawdawg_project::recovery_candidates(&dir);
+        // the work left behind was saved, or the user chose to discard it
+        for p in left_autosaves {
+            let _ = std::fs::remove_file(p);
+        }
+        match acquired {
+            Some(Ok(l)) => (self.files.lock, self.files.read_only) = (Some(l), None),
+            Some(Err(e)) => (self.files.lock, self.files.read_only) = (None, Some(e.to_string())),
+            None => {}
+        }
+        if let Some(old) = left_unsaved {
+            self.remove_unsaved_folder(&old);
+        }
+        // a copy open read-only beside a running one: that one's autosaves are not a crash
+        self.files.recovery = if self.files.read_only.is_some() { Vec::new() } else { rawdawg_project::recovery_candidates(&dir) };
         self.files.recovery_unsaved = false;
+        self.files.recovery_labels.clear();
+        self.files.recovery_selected = 0;
+        self.files.recover_confirm = false;
         self.files.open_prompt = None;
-        self.files.compare = None;
+        self.files.prompt_note = None;
         self.files.last_autosave = Some(Instant::now());
+        self.files.last_autosave_note = None;
         self.files.error = None;
         self.files.dialog = None;
+        true
     }
 
     /// Take over a lock held elsewhere (the user's explicit choice).
@@ -171,16 +243,18 @@ impl App {
             self.files.lock = Some(l);
             self.files.read_only = None;
             self.status_line = "Project lock taken over; saving enabled".into();
+            // the holder's autosaves are offered now, as after a crash (it may be one elsewhere)
+            if self.files.recovery.is_empty() && !self.is_never_saved() {
+                self.files.recovery = rawdawg_project::recovery_candidates(&dir);
+                self.files.recovery_unsaved = false;
+                self.files.recovery_selected = 0;
+            }
         }
     }
 
     /// Read a recovery candidate (large plugin states inlined from its folder's plugin-state/).
     fn load_candidate(&self, candidate: &RecoveryCandidate) -> Result<Project, String> {
-        let mut p = std::fs::read(&candidate.path).map_err(|e| e.to_string()).and_then(|b| rawdawg_project::persist::parse_project(&b).map_err(|e| e.to_string()))?;
-        if let Some(dir) = rawdawg_project::persist::candidate_project_dir(candidate) {
-            let _ = rawdawg_project::plugin_state::inline(&dir, &mut p);
-        }
-        Ok(p)
+        rawdawg_project::persist::load_candidate(candidate).map_err(|e| e.to_string())
     }
 
     /// Open the Compare view on recovery candidate `index` (what it changes; listen to either).
@@ -190,7 +264,8 @@ impl App {
         match self.load_candidate(&c) {
             Ok(autosave) => {
                 let changes = rawdawg_project::compare::describe_changes(&self.project, &autosave);
-                self.files.compare = Some(RecoveryCompare { candidate: index, autosave, changes, listen_autosave });
+                self.files.compare = Some(RecoveryCompare { autosave, changes, listen_autosave });
+                self.files.recovery_selected = index;
                 if listen_autosave {
                     self.recompile();
                 }
@@ -211,7 +286,7 @@ impl App {
     }
 
     /// Leave the Compare view; the engine plays the document again.
-    fn end_compare(&mut self) {
+    pub(crate) fn end_compare(&mut self) {
         if self.files.compare.take().is_some_and(|c| c.listen_autosave) {
             self.send(EngineCommand::Panic { source: None });
             self.recompile();
@@ -220,25 +295,49 @@ impl App {
 
     /// Use a recovery candidate as the working project (dirty; the saved manifest stays until Save).
     pub(crate) fn recover_from(&mut self, candidate: &RecoveryCandidate) {
+        let unsaved = self.files.recovery_unsaved;
+        // a never-saved project's folder is taken with its lock or not at all: two windows
+        // offered the same crash, and the other one recovered it first
+        let lock = if unsaved {
+            match ProjectLock::acquire(&candidate.dir, false) {
+                Ok(l) => Some(l),
+                Err(_) => {
+                    self.status_line = "That project was recovered in another rawDAWg window".to_owned();
+                    self.drop_offered(&candidate.dir);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.end_compare();
         match self.load_candidate(candidate) {
             Ok(p) => {
                 self.send(EngineCommand::Panic { source: None });
-                // later edits (and autosaves) number after both the saved and the recovered work
-                self.history = History::continuing_from(self.project.revision.max(p.revision));
+                if unsaved {
+                    // the project it replaces is given up (the user confirmed when it had changes)
+                    self.give_up_session_work();
+                    self.files.lock = lock;
+                    self.files.read_only = None;
+                    // its folder (media, autosaves) is this session's now; Save asks where to put it
+                    self.project_path = Some(candidate.dir.clone());
+                    self.files.session_autosaves = autosave_paths(&candidate.dir);
+                } else {
+                    // the crash's autosaves are taken over: saving or discarding this work removes them
+                    let offered: Vec<PathBuf> = self.files.recovery.iter().map(|c| c.path.clone()).collect();
+                    self.files.session_autosaves.extend(offered);
+                }
+                // later edits (and autosaves) number after the saved, the recovered and every kept autosave
+                let floor = self.project.revision.max(p.revision).max(rawdawg_project::persist::highest_autosave_revision(&candidate.dir));
+                self.history = History::continuing_from(floor);
                 self.history.mark_dirty();
                 self.project = p;
-                if self.files.recovery_unsaved {
-                    // the crashed session's own folder: its media live there; Save asks where to put it
-                    let dir = rawdawg_project::persist::candidate_project_dir(candidate);
-                    self.files.lock = dir.as_ref().and_then(|d| ProjectLock::acquire(d, false).ok());
-                    self.files.read_only = None;
-                    self.project_path = dir;
-                }
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
                 self.rebuild_mirrors();
                 self.recompile();
-                self.status_line = if self.files.recovery_unsaved {
+                self.files.last_autosave = Some(Instant::now());
+                self.files.last_autosave_note = None;
+                self.status_line = if unsaved {
                     "Recovered the never-saved project; File › Save As… to keep it".to_owned()
                 } else {
                     format!("Recovered the autosave from {}; save to keep it", ago(candidate.saved_unix_ms))
@@ -246,24 +345,53 @@ impl App {
             }
             Err(e) => self.status_line = format!("Could not recover: {e}"),
         }
-        self.files.recovery.clear();
+        if unsaved {
+            // other never-saved projects stay offered
+            self.drop_offered(&candidate.dir);
+        } else {
+            self.files.recovery.clear();
+        }
+        self.files.recover_confirm = false;
     }
 
+    /// Remove one folder's entries from the recovery offer.
+    fn drop_offered(&mut self, dir: &Path) {
+        let keep: Vec<bool> = self.files.recovery.iter().map(|c| c.dir != dir).collect();
+        let mut i = 0;
+        self.files.recovery.retain(|_| (keep[i], i += 1).0);
+        if self.files.recovery_labels.len() == keep.len() {
+            let mut j = 0;
+            self.files.recovery_labels.retain(|_| (keep[j], j += 1).0);
+        }
+        self.files.recovery_selected = 0;
+        self.files.recover_confirm = false;
+    }
+
+    /// Discard autosaves: of this project, the offered ones; of never-saved projects, the
+    /// selected one only (its whole folder).
     pub(crate) fn discard_recovery(&mut self) {
         self.end_compare();
-        // the folders the offered autosaves belong to (the project's, or never-saved ones)
-        let dirs: Vec<PathBuf> = self.files.recovery.iter().filter_map(rawdawg_project::persist::candidate_project_dir).collect();
-        for dir in dirs {
-            rawdawg_project::persist::clear_autosaves(&dir);
+        if self.files.recovery_unsaved {
+            let Some(c) = self.files.recovery.get(self.files.recovery_selected).cloned() else { return };
+            // not if another window took it meanwhile
+            if ProjectLock::read(&c.dir).is_none_or(|l| !rawdawg_project::lock::is_live(&l)) {
+                self.remove_unsaved_folder(&c.dir);
+            }
+            self.drop_offered(&c.dir);
+        } else {
+            for c in std::mem::take(&mut self.files.recovery) {
+                let _ = std::fs::remove_file(&c.path);
+            }
         }
-        self.files.recovery.clear();
+        self.files.recover_confirm = false;
     }
 
     /// New empty project (unsaved working folder); the current one must be clean or confirmed.
     pub(crate) fn new_project(&mut self) {
         self.send(EngineCommand::Panic { source: None });
+        self.end_compare();
         // the user chose to lose the unsaved work: no crash offer for it later
-        self.forget_unsaved_autosaves();
+        self.give_up_session_work();
         self.files.lock = None;
         self.files.read_only = None;
         self.project = Project::new_default("Untitled", serde_json::to_value(rawdawg_synthesizer::Patch::default()).unwrap_or(serde_json::Value::Null));
@@ -271,7 +399,8 @@ impl App {
         self.project_path = None;
         self.selected_channel = self.project.channels.first().map(|c| c.id);
         self.files.recovery.clear();
-        self.files.compare = None;
+        self.files.recovery_unsaved = false;
+        self.files.last_autosave_note = None;
         self.rebuild_mirrors();
         self.recompile();
         self.seek(0);
@@ -286,6 +415,9 @@ impl App {
         }
         // a never-saved project (also one with media in its per-user folder) asks where to go
         let Some(path) = self.project_path.clone().filter(|_| !self.is_never_saved()) else {
+            // an empty field: never the per-user folder, nor a path typed for something else
+            self.files.path_input.clear();
+            self.files.error = None;
             self.files.dialog = Some(FileDialog::SaveAs);
             self.files.focus_field = true;
             return;
@@ -295,7 +427,8 @@ impl App {
         match rawdawg_project::save_project_dir(&path, &self.project) {
             Ok(()) => {
                 self.history.mark_saved_at(revision);
-                rawdawg_project::persist::clear_autosaves(&path);
+                self.forget_session_autosaves();
+                self.files.last_autosave_note = None;
                 self.status_line = format!("Saved {}", path.display());
             }
             Err(e) => self.status_line = format!("Save failed: {e}"),
@@ -317,7 +450,7 @@ impl App {
         let revision = self.history.revision();
         self.project.revision = revision;
         let src = self.project_path.clone();
-        let unsaved_before = self.is_never_saved().then(|| self.project_path.clone().or_else(|| self.unsaved_dir())).flatten();
+        let unsaved_before = self.unsaved_folder();
         // a project still called "Untitled" (or after its old folder) takes the new folder's name
         let old_name = self.project.name.clone();
         let old_folder = src.as_ref().filter(|_| !self.is_never_saved()).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
@@ -329,12 +462,15 @@ impl App {
         }
         match rawdawg_project::save_as(src.as_deref(), &dst, &self.project) {
             Ok(()) => {
-                // saved for real now: the per-user autosaves of the never-saved project are not a crash
-                if let Some(old) = unsaved_before {
-                    rawdawg_project::persist::clear_autosaves(&old);
-                }
+                // saved for real now: this session's autosaves (in the old folder) are not a crash
+                self.forget_session_autosaves();
                 self.files.lock = ProjectLock::acquire(&dst, false).ok();
                 self.files.read_only = None;
+                self.files.last_autosave_note = None;
+                // a never-saved project's per-user folder is done with (its media were copied)
+                if let Some(old) = unsaved_before {
+                    self.remove_unsaved_folder(&old);
+                }
                 self.project_path = Some(dst.clone());
                 self.history.mark_saved_at(revision);
                 self.prefs.remember_project(dst.clone());
@@ -353,8 +489,11 @@ impl App {
 
     /// Every frame: autosave when dirty and due; handle a close request while dirty.
     pub(crate) fn poll_project_files(&mut self, ctx: &egui::Context) {
-        // a never-saved project autosaves too (into its per-user folder)
-        if self.history.is_dirty()
+        // a never-saved project autosaves too (into its per-user folder); a copy open read-only
+        // beside a running one does not write into that one's folder
+        if self.autosave_enabled
+            && self.files.read_only.is_none()
+            && self.history.is_dirty()
             && self.files.last_autosave.is_none_or(|t| t.elapsed() >= AUTOSAVE_EVERY)
             && let Some(dir) = self.autosave_dir()
         {
@@ -371,16 +510,22 @@ impl App {
         self.files.last_autosave = Some(Instant::now());
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         self.files.last_autosave_note = Some(match rawdawg_project::autosave(dir, &self.project) {
-            Ok(p) => Ok((now, p)),
+            Ok(p) => {
+                // the ring prunes old files: keep the list to the ones still there
+                self.files.session_autosaves.retain(|f| f.is_file());
+                self.files.session_autosaves.push(p.clone());
+                Ok((now, p))
+            }
             Err(e) => Err(e.to_string()),
         });
     }
 
-    /// The File menu's autosave line: short ("Autosaved 2 min ago"), the file on hover.
-    pub(crate) fn autosave_summary(&self) -> Option<(String, String)> {
+    /// The File menu's autosave line: short ("Autosaved 2 min ago"), the file (or the error) on
+    /// hover, and whether it failed.
+    pub(crate) fn autosave_summary(&self) -> Option<(String, String, bool)> {
         self.files.last_autosave_note.as_ref().map(|n| match n {
-            Ok((at, path)) => (format!("Autosaved {}", ago(*at)), path.display().to_string()),
-            Err(e) => ("Autosave failed".to_owned(), e.clone()),
+            Ok((at, path)) => (format!("Autosaved {}", ago(*at)), path.display().to_string(), false),
+            Err(e) => ("Autosave failed (hover for why)".to_owned(), e.clone(), true),
         })
     }
 
@@ -414,7 +559,8 @@ impl App {
             self.show_settings = false;
             return true;
         }
-        if self.mixer.add_open {
+        // the add-effect search is a dialog only where it is drawn
+        if self.mixer.add_open && self.editor_view == EditorView::Mixer {
             self.mixer.add_open = false;
             return true;
         }
@@ -454,6 +600,10 @@ impl App {
 }
 
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
+    // a prompt's note belongs to that prompt
+    if app.files.open_prompt.is_none() && !app.files.close_prompt {
+        app.files.prompt_note = None;
+    }
     // "Save and close" belongs to the Save As it opened: leaving that for another dialog (New,
     // Open) forgets it, or a later ordinary Save As would quit
     if !matches!(app.files.dialog, Some(FileDialog::SaveAs)) {
@@ -461,6 +611,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         app.files.open_after_save = None;
     }
     // ---- file dialog (dark, in-app: a path field plus the recent list)
+    let just_opened = (app.files.dialog != app.files.shown_dialog).then_some(());
+    app.files.shown_dialog = app.files.dialog;
+    let rename_just_opened = app.files.rename.is_some() && !app.files.shown_rename;
+    app.files.shown_rename = app.files.rename.is_some();
     if let Some(kind) = app.files.dialog {
         let title = match kind {
             FileDialog::Open => "Open project",
@@ -471,10 +625,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         egui::Window::new(title).open(&mut open).collapsible(false).resizable(true).default_size([520.0, 300.0]).show(ctx, |ui| {
             match kind {
                 FileDialog::New => {
+                    // no Enter here: it throws the unsaved changes away, so only a click does
                     ui.label("Start a new empty project? Unsaved changes in the current project will be lost.");
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
-                        if ui.button("New project").clicked() || enter {
+                        if ui.button("New project").clicked() {
                             app.new_project();
                             app.files.dialog = None;
                         }
@@ -493,8 +647,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     if std::mem::take(&mut app.files.focus_field) {
                         field.request_focus();
                     }
-                    // Enter confirms (in the field, or with no other field focused); Escape cancels
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus() || ui.memory(|m| m.focused().is_none()));
+                    // Enter in the field confirms (not on the frame the dialog opened); Escape cancels
+                    let enter = just_opened.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus());
                     ui.horizontal(|ui| {
                         if (ui.button(if kind == FileDialog::Open { "Open" } else { "Save as" }).clicked() || enter) && !app.files.path_input.trim().is_empty() {
                             let p = PathBuf::from(app.files.path_input.trim());
@@ -543,23 +697,31 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             app.files.open_after_save = None;
         }
     }
-    // ---- recovery offer
+    // ---- recovery offer (another of never-saved projects may follow once this one is answered)
+    if app.files.recovery.is_empty() && std::mem::take(&mut app.files.unsaved_offer_pending) {
+        app.offer_unsaved_recovery();
+    }
     if !app.files.recovery.is_empty() {
         let mut keep_saved = false;
         let mut recover: Option<RecoveryCandidate> = None;
         let mut discard = false;
         let mut compare_index: Option<usize> = None;
+        let mut pick: Option<usize> = None;
         let mut listen: Option<bool> = None;
         let unsaved = app.files.recovery_unsaved;
         let title = if unsaved { "Recover a project that was never saved?" } else { "Recover unsaved changes?" };
         egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
-            let selected = app.files.compare.as_ref().map_or(0, |c| c.candidate);
-            let c = app.files.recovery[selected.min(app.files.recovery.len() - 1)].clone();
+            let selected = app.files.recovery_selected.min(app.files.recovery.len() - 1);
+            let c = app.files.recovery[selected].clone();
+            let label = |i: usize, r: &RecoveryCandidate| match app.files.recovery_labels.get(i).filter(|_| unsaved) {
+                Some(l) => format!("{l} · {}", ago(r.saved_unix_ms)),
+                None => format!("{} (revision {})", ago(r.saved_unix_ms), r.revision),
+            };
             ui.label(if unsaved {
                 format!(
-                    "rawDAWg did not close normally: a project that was never saved has autosaved work from {} ({} autosave(s)). Compare it, recover it (then Save As to keep it), leave it for the next start, or discard it.",
-                    ago(c.saved_unix_ms),
-                    app.files.recovery.len()
+                    "rawDAWg did not close normally: {} never saved, last autosaved {}. Recover one (then Save As to keep it), leave them for the next start, or discard the chosen one.",
+                    if app.files.recovery.len() == 1 { "a project was".to_owned() } else { format!("{} projects were", app.files.recovery.len()) },
+                    ago(c.saved_unix_ms)
                 )
             } else {
                 format!(
@@ -568,17 +730,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     app.files.recovery.len()
                 )
             });
-            if app.files.recovery.len() > 1 {
-                let label = |r: &RecoveryCandidate| format!("{} (revision {})", ago(r.saved_unix_ms), r.revision);
-                egui::ComboBox::from_id_salt("recovery-candidate").selected_text(label(&c)).show_ui(ui, |ui| {
+            if app.files.recovery.len() > 1 || unsaved {
+                egui::ComboBox::from_id_salt("recovery-candidate").width(420.0).selected_text(label(selected, &c)).show_ui(ui, |ui| {
                     for (i, r) in app.files.recovery.iter().enumerate() {
-                        if ui.selectable_label(i == selected, label(r)).clicked() {
-                            compare_index = Some(i);
+                        if ui.selectable_label(i == selected, label(i, r)).clicked() {
+                            pick = Some(i);
                         }
                     }
                 });
             }
+            // comparing a never-saved project with the current one says nothing useful
             match &app.files.compare {
+                None if unsaved => {}
                 None => {
                     if ui.button("Compare").on_hover_text("What the autosave changes, and listen to either version before choosing").clicked() {
                         compare_index = Some(selected);
@@ -587,9 +750,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 Some(cmp) => {
                     ui.separator();
                     if cmp.changes.is_empty() {
-                        ui.label(egui::RichText::new("No musical difference: only bookkeeping changed.").color(theme::TEXT_SECONDARY));
+                        ui.label(egui::RichText::new("No difference from the current project.").color(theme::TEXT_SECONDARY));
                     } else {
-                        ui.label(egui::RichText::new("The autosave, compared with the saved project:").strong());
+                        ui.label(egui::RichText::new("The autosave, compared with the current project:").strong());
                         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                             for line in &cmp.changes {
                                 ui.label(format!("• {line}"));
@@ -598,7 +761,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     }
                     ui.horizontal(|ui| {
                         ui.label("Listen to");
-                        if ui.selectable_label(!cmp.listen_autosave, "Saved").clicked() {
+                        if ui.selectable_label(!cmp.listen_autosave, "Saved").on_hover_text("The project as it is now (the saved version plus any edits since opening)").clicked() {
                             listen = Some(false);
                         }
                         if ui.selectable_label(cmp.listen_autosave, "Autosave").clicked() {
@@ -609,18 +772,34 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     ui.separator();
                 }
             }
+            if app.files.recover_confirm {
+                ui.colored_label(theme::WARNING, "The current project has unsaved changes: recovering replaces them.");
+            }
             ui.horizontal(|ui| {
-                if ui.button("Recover").clicked() {
-                    recover = Some(c.clone());
+                let recover_label = if app.files.recover_confirm { "Replace my changes and recover" } else { "Recover" };
+                if ui.button(recover_label).clicked() {
+                    // edits made while this offer was open are not replaced without asking
+                    if app.history.is_dirty() && !app.files.recover_confirm {
+                        app.files.recover_confirm = true;
+                    } else {
+                        recover = Some(c.clone());
+                    }
                 }
                 if ui.button(if unsaved { "Not now (ask at the next start)" } else { "Keep saved version (keep autosaves)" }).clicked() {
                     keep_saved = true;
                 }
-                if ui.button("Discard autosaves").clicked() {
+                if ui.button(if unsaved { "Discard this project" } else { "Discard autosaves" }).clicked() {
                     discard = true;
                 }
             });
         });
+        if let Some(i) = pick {
+            app.files.recovery_selected = i;
+            app.files.recover_confirm = false;
+            if app.files.compare.is_some() {
+                app.compare_recovery(i);
+            }
+        }
         if let Some(i) = compare_index {
             app.compare_recovery(i);
         }
@@ -632,11 +811,13 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         } else if keep_saved {
             app.end_compare();
             app.files.recovery.clear();
+            app.files.recover_confirm = false;
         } else if discard {
             app.discard_recovery();
         }
         if app.files.recovery.is_empty() {
             app.files.recovery_unsaved = false;
+            app.files.recovery_labels.clear();
         }
     }
     // ---- read-only banner
@@ -660,17 +841,21 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 if ui.button("Save and close").clicked() {
                     app.save_project_checked();
+                    app.files.close_prompt = false;
                     if !app.history.is_dirty() {
                         app.files.closing = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     } else if app.files.dialog == Some(FileDialog::SaveAs) {
                         // a never-saved project: close once Save As succeeds
                         app.files.close_after_save = true;
+                    } else {
+                        // not saved (read-only, or the save failed): stay, and say why
+                        app.files.close_prompt = true;
+                        app.files.prompt_note = Some(app.status_line.clone());
                     }
-                    app.files.close_prompt = false;
                 }
                 if ui.button("Discard and close").clicked() {
-                    app.forget_unsaved_autosaves();
+                    app.give_up_session_work();
                     app.history.mark_saved();
                     app.files.close_prompt = false;
                     app.files.closing = true;
@@ -680,6 +865,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     app.files.close_prompt = false;
                 }
             });
+            if let Some(n) = &app.files.prompt_note {
+                ui.colored_label(theme::WARNING, n);
+            }
         });
     }
     // ---- unsaved changes before opening another project
@@ -696,17 +884,24 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     } else if app.files.dialog == Some(FileDialog::SaveAs) {
                         // a never-saved project: open once Save As succeeds
                         app.files.open_after_save = Some(next.clone());
+                    } else {
+                        // not saved (read-only, or the save failed): stay, and say why
+                        app.files.open_prompt = Some(next.clone());
+                        app.files.prompt_note = Some(app.status_line.clone());
                     }
                 }
-                if ui.button("Discard and open").clicked() {
-                    app.files.open_prompt = None;
-                    app.forget_unsaved_autosaves();
-                    app.open_project_checked(next.clone());
+                // the current work goes only once the other project opened (see open_project_checked)
+                if ui.button("Discard and open").clicked() && !app.open_project_checked(next.clone()) {
+                    app.files.open_prompt = Some(next.clone());
+                    app.files.prompt_note = Some(app.status_line.clone());
                 }
                 if ui.button("Cancel").clicked() {
                     app.files.open_prompt = None;
                 }
             });
+            if let Some(n) = &app.files.prompt_note {
+                ui.colored_label(theme::WARNING, n);
+            }
         });
     }
     // ---- rename the project
@@ -716,10 +911,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         egui::Window::new("Rename project").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("The name proposes export file names and titles exported MIDI files.");
             let field = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
-            if std::mem::take(&mut app.files.focus_field) {
+            if std::mem::take(&mut app.files.focus_rename) {
                 field.request_focus();
             }
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus() || ui.memory(|m| m.focused().is_none()));
+            let enter = !rename_just_opened && ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus());
             ui.horizontal(|ui| {
                 if ui.button("Rename").clicked() || enter {
                     app.rename_project(&name);
@@ -750,7 +945,24 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             app.files.relink = None;
         }
     }
-    let _ = EditorView::Rack;
+}
+
+/// One line for an offered never-saved project: its name and what it holds.
+fn summary(p: &Project) -> String {
+    let notes: usize = p.patterns.iter().flat_map(|pat| pat.lanes.iter()).map(|l| l.notes.len()).sum();
+    let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    format!("{} — {}, {}, {}", p.name, plural(p.channels.len(), "channel"), plural(notes, "note"), plural(p.clips.len(), "clip"))
+}
+
+/// Every autosave file in a project folder.
+fn autosave_paths(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir.join(rawdawg_project::persist::AUTOSAVE_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect()
 }
 
 /// "3 min ago" for a unix-millisecond time stamp.

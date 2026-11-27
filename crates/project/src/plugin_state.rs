@@ -222,6 +222,28 @@ mod tests {
     }
 
     #[test]
+    fn recovery_compares_large_states_by_content_not_by_reference() {
+        let dir = tmpdir("recovery");
+        let mut p = project_with_state(&blob(64 * 1024, 3), b"small");
+        p.revision = 4;
+        crate::persist::save_project_dir(&dir, &p).unwrap();
+        // the same work, autosaved later: its large state is a file reference like the manifest's
+        let mut same = p.clone();
+        same.revision = 9;
+        crate::persist::autosave(&dir, &same).unwrap();
+        assert!(crate::persist::recovery_candidates(&dir).is_empty(), "nothing the saved project lacks");
+        // another sound in the plugin: offered
+        let mut other = restate(&p, &blob(64 * 1024, 4));
+        other.revision = 10;
+        crate::persist::autosave(&dir, &other).unwrap();
+        let c = crate::persist::recovery_candidates(&dir);
+        assert_eq!(c.len(), 1, "{c:?}");
+        let loaded = crate::persist::load_candidate(&c[0]).unwrap();
+        assert_eq!(loaded.channels[0].instrument.state, other.channels[0].instrument.state, "inlined from the folder");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn large_blobs_move_to_files_and_come_back_identically() {
         let dir = tmpdir("roundtrip");
         let big = blob(200_000, 1);

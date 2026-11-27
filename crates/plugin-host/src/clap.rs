@@ -357,6 +357,15 @@ impl ClapInstance {
         Some(f(&mut handle))
     }
 
+    /// The normalized value the plugin reads from typed `text` (its `text_to_value`), or `None`
+    /// when it does not understand the text (main thread).
+    pub fn param_from_text(&self, id: ParamId, text: &str) -> Option<f32> {
+        let d = self.descriptors.iter().find(|d| d.id == id)?;
+        let text = std::ffi::CString::new(text).ok()?;
+        let value = self.with_handle(|handle| handle.get_extension::<PluginParams>()?.text_to_value(handle, ClapId::new(id.0), &text)).flatten()?;
+        value.is_finite().then(|| d.to_normalized(value))
+    }
+
     /// Run `f` with the plugin instance itself (owner thread only).
     fn with_instance<R>(&self, f: impl FnOnce(&mut PluginInstance<RawdawgHost>) -> R) -> Option<R> {
         let inst = self.cell.get()?;

@@ -312,8 +312,21 @@ pub fn validate_with(p: &Project, lim: &Limits) -> Result<(), ValidationError> {
                     return Err(ValidationError::InvalidValue(format!("clip {} offset", c.id)));
                 }
             }
-            ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, playback_rate, fade_in_frames, fade_out_frames } => {
-                if [*source_offset_frames, *source_length_frames, *fade_in_frames, *fade_out_frames].iter().any(|f| *f > MAX_CLIP_FRAMES) {
+            ClipContent::Audio {
+                asset_id,
+                source_offset_frames,
+                source_length_frames,
+                gain_db,
+                playback_rate,
+                fade_in_frames,
+                fade_out_frames,
+                fade_in_offset_frames,
+                fade_out_offset_frames,
+            } => {
+                if [*source_offset_frames, *source_length_frames, *fade_in_frames, *fade_out_frames, *fade_in_offset_frames, *fade_out_offset_frames]
+                    .iter()
+                    .any(|f| *f > MAX_CLIP_FRAMES)
+                {
                     return Err(ValidationError::InvalidValue(format!("audio clip {} frame range", c.id)));
                 }
                 // Missing assets are allowed (placeholder) but the id must be well-formed.

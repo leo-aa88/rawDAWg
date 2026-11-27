@@ -126,8 +126,18 @@ pub(crate) fn cancel_gesture(app: &mut App) {
 }
 
 /// Source frames per output frame of an audio clip (its asset's rate against the project's).
+/// The rate is the decoded file's, as the engine plays it (the project's asset entry does not
+/// always carry it); the project rate only when the file cannot be read.
 fn audio_rate(app: &App, asset_id: &AssetId, playback_rate: f64) -> f64 {
-    let asset_rate = app.project.assets.iter().find(|a| &a.id == asset_id).and_then(|a| a.original_rate_hz).unwrap_or(app.project.sample_rate_hz.0);
+    use rawdawg_audio_engine::AssetResolver;
+    let asset_rate = app
+        .assets
+        .sample(asset_id)
+        .filter(|s| s.sample_rate > 0)
+        .map(|s| s.sample_rate)
+        .or_else(|| app.assets.stream_info(asset_id).map(|i| i.sample_rate).filter(|r| *r > 0))
+        .or_else(|| app.project.assets.iter().find(|a| &a.id == asset_id).and_then(|a| a.original_rate_hz))
+        .unwrap_or(app.project.sample_rate_hz.0);
     (playback_rate * f64::from(asset_rate) / app.project.sample_rate_hz.as_f64()).max(1e-6)
 }
 
@@ -172,8 +182,18 @@ pub(crate) fn audio_clip_for(app: &App, asset_id: &AssetId, track: TrackId, tick
             fade_in_frames: 0,
             fade_out_frames: 0,
             playback_rate: 1.0,
+            fade_in_offset_frames: 0,
+            fade_out_offset_frames: 0,
         },
     })
+}
+
+/// The tick `out_frames` project frames before `tick` under the tempo map (not before 0).
+fn tick_before(app: &App, tick: i64, out_frames: f64) -> i64 {
+    let rate = app.project.sample_rate_hz;
+    let Ok(tempo) = app.project.tempo_map() else { return (tick as f64 - out_frames / rate.as_f64() * 2.0 * PPQ as f64).round().max(0.0) as i64 };
+    let at = tempo.tick_to_frame(Tick(tick), rate) - out_frames.round() as i64;
+    tempo.frame_to_tick_f64(at.max(0), rate).round().max(0.0) as i64
 }
 
 /// Place an asset as an audio clip (one undo step) and select it.
@@ -195,13 +215,34 @@ fn audio_rate_of(app: &App, c: &Clip) -> f64 {
 }
 
 /// Re-derive an audio clip's source bounds from its (edited) tick bounds: the end edge sets
-/// the source length, the start edge shifts the source offset. Pattern/automation clips are
-/// returned unchanged.
+/// the source length, the start edge shifts the source offset (and stops at the file's first
+/// frame: dragged further the audio would slide). Pattern/automation clips are returned unchanged.
 fn audio_bounds_from_ticks(app: &App, orig: &Clip, edited: Clip) -> Clip {
-    let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &orig.content else { return edited };
+    let ClipContent::Audio {
+        asset_id,
+        source_offset_frames,
+        source_length_frames,
+        gain_db,
+        fade_in_frames,
+        fade_out_frames,
+        playback_rate,
+        fade_in_offset_frames,
+        fade_out_offset_frames,
+    } = &orig.content
+    else {
+        return edited;
+    };
+    let mut edited = edited;
     let rate = audio_rate(app, asset_id, *playback_rate);
     let total = asset_frames(app, asset_id).unwrap_or(*source_offset_frames + *source_length_frames);
-    let shift_src = (ticks_to_frames(app, orig.start_tick.0, edited.start_tick.0 - orig.start_tick.0) * rate).round();
+    let mut shift_src = (ticks_to_frames(app, orig.start_tick.0, edited.start_tick.0 - orig.start_tick.0) * rate).round();
+    if edited.start_tick < orig.start_tick && *source_offset_frames as f64 + shift_src < 0.0 {
+        let end = edited.end_tick().0;
+        let earliest = tick_before(app, orig.start_tick.0, *source_offset_frames as f64 / rate).min(orig.start_tick.0);
+        edited.start_tick = Tick(earliest);
+        edited.length_ticks = Tick(end - earliest);
+        shift_src = -(*source_offset_frames as f64);
+    }
     let offset = ((*source_offset_frames as f64 + shift_src).max(0.0) as u64).min(total.saturating_sub(1));
     let len_src = (ticks_to_frames(app, edited.start_tick.0, edited.length_ticks.0) * rate).round().max(1.0) as u64;
     let length = len_src.min(total - offset).max(1);
@@ -214,9 +255,12 @@ fn audio_bounds_from_ticks(app: &App, orig: &Clip, edited: Clip) -> Clip {
             source_offset_frames: offset,
             source_length_frames: length,
             gain_db: *gain_db,
-            fade_in_frames: (*fade_in_frames).min(length),
-            fade_out_frames: (*fade_out_frames).min(length),
+            // a split half's ramp may be longer than the half itself (it continues the ramp)
+            fade_in_frames: (*fade_in_frames).min(length + *fade_in_offset_frames),
+            fade_out_frames: (*fade_out_frames).min(length + *fade_out_offset_frames),
             playback_rate: *playback_rate,
+            fade_in_offset_frames: *fade_in_offset_frames,
+            fade_out_offset_frames: *fade_out_offset_frames,
         },
         ..edited
     }
@@ -886,6 +930,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                             ClipContent::Pattern { pattern_id, source_offset_ticks, looped } => {
                                 ClipContent::Pattern { pattern_id: *pattern_id, source_offset_ticks: Tick((source_offset_ticks.0 + shift).max(0)), looped: *looped }
                             }
+                            // an automation clip's curve stays where it was in time, as a pattern's notes do
+                            ClipContent::Automation { curve_id, source_offset_ticks, looped } => {
+                                ClipContent::Automation { curve_id: *curve_id, source_offset_ticks: Tick((source_offset_ticks.0 + shift).max(0)), looped: *looped }
+                            }
                             other => other.clone(),
                         };
                         audio_bounds_from_ticks(app, c, Clip { start_tick: Tick(start), length_ticks: Tick(c.end_tick().0 - start), content, ..c.clone() })
@@ -1023,13 +1071,24 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     ui.close();
                 }
             }
-            if let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &c.content {
+            if let ClipContent::Audio {
+                asset_id,
+                source_offset_frames,
+                source_length_frames,
+                gain_db,
+                fade_in_frames,
+                fade_out_frames,
+                playback_rate,
+                fade_in_offset_frames,
+                fade_out_offset_frames,
+            } = &c.content
+            {
                 let rate = audio_rate(app, asset_id, *playback_rate);
-                let (mut gain, mut fi, mut fo) = (
-                    gain_db.0,
-                    *fade_in_frames as f64 / rate / app.project.sample_rate_hz.as_f64() * 1000.0,
-                    *fade_out_frames as f64 / rate / app.project.sample_rate_hz.as_f64() * 1000.0,
-                );
+                // what this clip plays of its fades (a split half plays part of a longer ramp)
+                let ms = |frames: u64| frames as f64 / rate / app.project.sample_rate_hz.as_f64() * 1000.0;
+                let (mut gain, mut fi, mut fo) =
+                    (gain_db.0, ms(fade_in_frames.saturating_sub(*fade_in_offset_frames)), ms(fade_out_frames.saturating_sub(*fade_out_offset_frames)));
+                let (fi0, fo0) = (fi, fo);
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Gain");
@@ -1043,6 +1102,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 });
                 if changed {
                     let to_src = |ms: f64| ((ms / 1000.0 * app.project.sample_rate_hz.as_f64() * rate).round() as u64).min(*source_length_frames);
+                    // an edited fade is this clip's own, whole fade; an untouched one stays as it was
+                    let (fade_in, in_off) = if fi != fi0 { (to_src(fi), 0) } else { (*fade_in_frames, *fade_in_offset_frames) };
+                    let (fade_out, out_off) = if fo != fo0 { (to_src(fo), 0) } else { (*fade_out_frames, *fade_out_offset_frames) };
                     cmds.push(Command::UpdateClip {
                         clip: Clip {
                             content: ClipContent::Audio {
@@ -1050,9 +1112,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                                 source_offset_frames: *source_offset_frames,
                                 source_length_frames: *source_length_frames,
                                 gain_db: rawdawg_types::units::Db(gain),
-                                fade_in_frames: to_src(fi),
-                                fade_out_frames: to_src(fo),
+                                fade_in_frames: fade_in,
+                                fade_out_frames: fade_out,
                                 playback_rate: *playback_rate,
+                                fade_in_offset_frames: in_off,
+                                fade_out_offset_frames: out_off,
                             },
                             ..c.clone()
                         },
@@ -1166,7 +1230,7 @@ fn split_selected(app: &mut App, cmds: &mut Vec<Command>) {
 }
 
 /// Split `clips` at tick `at` (clips that do not span it are left alone; one undo step).
-fn split_clips_at(app: &mut App, cmds: &mut Vec<Command>, clips: &[Clip], at: i64) {
+pub(crate) fn split_clips_at(app: &mut App, cmds: &mut Vec<Command>, clips: &[Clip], at: i64) {
     let mut batch = Vec::new();
     for c in clips.iter().cloned() {
         if at <= c.start_tick.0 || at >= c.end_tick().0 {
@@ -1186,29 +1250,50 @@ fn split_clips_at(app: &mut App, cmds: &mut Vec<Command>, clips: &[Clip], at: i6
         let left = Clip { length_ticks: Tick(shift), ..c.clone() };
         let right = Clip { id: ClipId::new(), start_tick: Tick(at), length_ticks: Tick(c.end_tick().0 - at), content, ..c.clone() };
         // an audio clip plays its source range: the two halves divide that range at the split
-        // (in source frames, through the tempo and the playback rate); the fades stay at the
-        // outer ends, none at the cut
+        // (in source frames, through the tempo and the playback rate); each half plays its part
+        // of the fades: the left the rest of its fade-out ramp lying right of the cut, the right
+        // its fade-in ramp from where the cut fell (no new fade at the cut)
         let (left, right) = match &c.content {
-            ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } => {
+            ClipContent::Audio {
+                asset_id,
+                source_offset_frames,
+                source_length_frames,
+                gain_db,
+                fade_in_frames,
+                fade_out_frames,
+                playback_rate,
+                fade_in_offset_frames,
+                fade_out_offset_frames,
+            } => {
                 let cut = (ticks_to_frames(app, c.start_tick.0, shift) * audio_rate_of(app, &c)).round().max(0.0) as u64;
                 if cut >= *source_length_frames {
                     // the sample ends before the split: nothing to its right but silence
                     batch.push(Command::UpdateClip { clip: left });
                     continue;
                 }
-                let audio = |offset: u64, length: u64, fade_in: u64, fade_out: u64| ClipContent::Audio {
+                // a ramp a half no longer reaches is no fade there
+                let ramp = |frames: u64, offset: u64| if offset >= frames { (0, 0) } else { (frames, offset) };
+                let audio = |offset: u64, length: u64, fade_in: (u64, u64), fade_out: (u64, u64)| ClipContent::Audio {
                     asset_id: asset_id.clone(),
                     source_offset_frames: offset,
                     source_length_frames: length,
                     gain_db: *gain_db,
-                    fade_in_frames: fade_in.min(length),
-                    fade_out_frames: fade_out.min(length),
+                    fade_in_frames: fade_in.0,
+                    fade_out_frames: fade_out.0,
                     playback_rate: *playback_rate,
+                    fade_in_offset_frames: fade_in.1,
+                    fade_out_offset_frames: fade_out.1,
                 };
                 let rest = source_length_frames - cut;
                 (
-                    Clip { content: audio(*source_offset_frames, cut, *fade_in_frames, 0), ..left },
-                    Clip { content: audio(source_offset_frames + cut, rest, 0, *fade_out_frames), ..right },
+                    Clip {
+                        content: audio(*source_offset_frames, cut, ramp(*fade_in_frames, *fade_in_offset_frames), ramp(*fade_out_frames, fade_out_offset_frames + rest)),
+                        ..left
+                    },
+                    Clip {
+                        content: audio(source_offset_frames + cut, rest, ramp(*fade_in_frames, fade_in_offset_frames + cut), ramp(*fade_out_frames, *fade_out_offset_frames)),
+                        ..right
+                    },
                 )
             }
             _ => (left, right),

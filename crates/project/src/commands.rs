@@ -1035,6 +1035,9 @@ fn check_curve(c: &AutomationCurve) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// The highest revision a history starts from; billions of edits above it still fit in a u64.
+pub const MAX_REVISION: u64 = u64::MAX / 2;
+
 /// Undo/redo history with gesture coalescing and revision tracking.
 #[derive(Debug, Default)]
 pub struct History {
@@ -1055,7 +1058,10 @@ impl History {
     /// A history for a project opened at `revision`: clean, and every edit numbered above it,
     /// so an autosave of this session is newer than the saved manifest (revisions used to restart
     /// at 0 on open, and a crash in a reopened song was never offered for recovery).
+    /// A damaged or hand-edited manifest's huge revision is clamped (to `MAX_REVISION`), so
+    /// numbering edits can never overflow.
     pub fn continuing_from(revision: u64) -> Self {
+        let revision = revision.min(MAX_REVISION);
         Self { revision, saved_revision: revision, max_depth: 1000, ..Default::default() }
     }
 
@@ -1279,6 +1285,20 @@ mod tests {
         assert!(!h.is_dirty());
         h.undo(&mut p).unwrap();
         assert!(h.is_dirty());
+    }
+
+    #[test]
+    fn a_huge_saved_revision_is_clamped_so_edits_never_overflow() {
+        let mut p = proj();
+        let mut h = History::continuing_from(u64::MAX);
+        assert_eq!(h.revision(), MAX_REVISION);
+        assert!(!h.is_dirty());
+        h.apply(&mut p, Command::RenameProject { name: "A".into() }).unwrap();
+        assert_eq!(h.revision(), MAX_REVISION + 1);
+        assert!(h.is_dirty());
+        h.mark_dirty();
+        h.undo(&mut p).unwrap();
+        assert!(h.is_dirty(), "marked dirty stays dirty even back at the opened revision");
     }
 
     #[test]

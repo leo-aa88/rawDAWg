@@ -762,6 +762,38 @@ mod tests {
         synth.set_param(rawdawg_types::ParamId(FILTER_MODE), d(FILTER_MODE).parse("Notch").unwrap());
         assert_eq!(synth.patch().filter.mode, rawdawg_dsp::filter::FilterMode::Notch);
     }
+
+    #[test]
+    fn grain_window_and_pluck_type_names_choose_what_they_say() {
+        use crate::patch::{Excitation, Generator, GrainWindow};
+        use rawdawg_dsp::processor::{PrepareSpec, Processor};
+        let d = |id: u32| DESCRIPTORS.iter().find(|d| d.id.0 == id).unwrap();
+        let mut synth = crate::Synth::default();
+        synth.prepare(&PrepareSpec::new(48_000.0, 256, rawdawg_dsp::BusLayout::Stereo)).unwrap();
+        let mut patch = synth.patch().clone();
+        patch.layers.truncate(1);
+        patch.layers[0].generator = Generator::default_of_kind(4);
+        let mut second = patch.layers[0].clone();
+        second.generator = Generator::default_of_kind(5);
+        patch.layers.push(second);
+        synth.set_patch(patch).unwrap();
+        let windows = [GrainWindow::Hann, GrainWindow::Triangle, GrainWindow::Rect];
+        assert_eq!(GRAIN_WINDOW_LABELS.len(), windows.len());
+        for (label, want) in GRAIN_WINDOW_LABELS.iter().zip(windows) {
+            let id = gen_param(0, G_GRAIN_WINDOW);
+            synth.set_param(rawdawg_types::ParamId(id), d(id).parse(label).unwrap());
+            let Generator::Granular { settings, .. } = &synth.patch().layers[0].generator else { panic!("granular") };
+            assert_eq!(settings.window, want, "{label}");
+        }
+        let kinds = [Excitation::Noise, Excitation::Impulse, Excitation::Pick];
+        assert_eq!(PLUCK_EXCITATION_LABELS.len(), kinds.len());
+        for (label, want) in PLUCK_EXCITATION_LABELS.iter().zip(kinds) {
+            let id = gen_param(1, G_PLUCK_EXCITATION);
+            synth.set_param(rawdawg_types::ParamId(id), d(id).parse(label).unwrap());
+            let Generator::Pluck(settings) = &synth.patch().layers[1].generator else { panic!("pluck") };
+            assert_eq!(settings.excitation, want, "{label}");
+        }
+    }
     use std::collections::HashSet;
 
     #[test]

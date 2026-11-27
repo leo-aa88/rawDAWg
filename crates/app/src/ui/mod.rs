@@ -125,6 +125,9 @@ pub(crate) struct App {
     pub history: History,
     /// Folder of never-saved projects (`<project id>.rawdawg` each, with their autosaves).
     pub unsaved_root: Option<PathBuf>,
+    /// Autosave and crash recovery run (not in `--ui-preset` / `--screenshot` runs, which must
+    /// neither write into nor offer anyone's work).
+    pub(crate) autosave_enabled: bool,
     pub project_path: Option<PathBuf>,
     pub piano_roll: piano_roll::PianoRollState,
     pub playlist: playlist::PlaylistState,
@@ -232,15 +235,18 @@ impl App {
         let (project, project_path, mut status_line) = match &project_to_open {
             Some(p) => match rawdawg_project::load_project_dir(p) {
                 Ok(proj) => {
-                    prefs.remember_project(p.clone());
-                    (proj, Some(p.clone()), format!("Opened {}", p.display()))
+                    // the folder, also when started on its project.json or project.rawdawg marker
+                    let dir = rawdawg_project::persist::resolve_project_dir(p).map_or_else(|_| p.clone(), |d| crate::prefs::absolute(&d));
+                    prefs.remember_project(dir.clone());
+                    (proj, Some(dir.clone()), format!("Opened {}", dir.display()))
                 }
                 Err(e) => (default_project(), None, format!("Could not open {}: {e}", p.display())),
             },
             None => (default_project(), None, "Ready — hold Z X C V B N M to play".to_owned()),
         };
-        // edits of an opened project are numbered after its saved revision (crash recovery)
-        let start_revision = project.revision;
+        // edits of an opened project are numbered after its saved revision and its autosaves (crash recovery)
+        let start_revision = project.revision.max(project_path.as_deref().map_or(0, rawdawg_project::persist::highest_autosave_revision));
+        let autosave_enabled = opts.ui_preset.is_none() && opts.screenshot.is_none();
         let unsaved_root = opts.recovery_dir.clone().or_else(|| directories::ProjectDirs::from("", "", rawdawg_types::PACKAGE_NAME).map(|d| d.data_dir().join("unsaved")));
         let devices = enumerate();
         let req = StreamConfigRequest {
@@ -282,6 +288,7 @@ impl App {
             project,
             history: History::continuing_from(start_revision),
             unsaved_root,
+            autosave_enabled,
             project_path,
             devices,
             audio,
@@ -425,11 +432,20 @@ impl App {
                 Ok(l) => app.files.lock = Some(l),
                 Err(e) => app.files.read_only = Some(e.to_string()),
             }
-            app.files.recovery = rawdawg_project::recovery_candidates(&dir);
+            // a copy open read-only beside a running one: that one's autosaves are not a crash
+            if app.files.read_only.is_none() && app.autosave_enabled {
+                app.files.recovery = rawdawg_project::recovery_candidates(&dir);
+            }
             app.files.last_autosave = Some(std::time::Instant::now());
-        } else {
-            // a never-saved project of an earlier session that ended without closing
-            app.offer_unsaved_recovery();
+        }
+        // never-saved projects of an earlier session that ended without closing: now, or once
+        // the opened project's own offer is answered
+        if app.autosave_enabled {
+            if app.files.recovery.is_empty() {
+                app.offer_unsaved_recovery();
+            } else {
+                app.files.unsaved_offer_pending = true;
+            }
         }
         app
     }
@@ -939,9 +955,13 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // Escape cancels the frontmost dialog first (also while its text field has the focus);
-        // with no dialog open it is the panic key below
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.close_top_dialog() {
+        // Escape (a fresh press: holding it does not close one dialog after the other) cancels,
+        // in this order: an editor gesture (the editor takes it), an open menu or list (egui
+        // closes it), the frontmost dialog (also while its text field has the focus); with none
+        // of those it is the panic key below
+        let fresh_escape = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. })));
+        let gesture = self.piano_roll.gesture_active() || self.playlist.gesture_active() || self.automation.gesture_active();
+        if fresh_escape && !gesture && !egui::Popup::is_any_open(ctx) && self.close_top_dialog() {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             return;
         }
@@ -951,6 +971,8 @@ impl App {
         }
         // AltGr arrives as Ctrl+Alt on Windows: a Ctrl+Alt chord is typing, not undo/redo
         let alt = ctx.input(|i| i.modifiers.alt);
+        // read before the input lock below (egui's memory and input share the context lock)
+        let popup_open = egui::Popup::is_any_open(ctx);
         let (redo, undo, space, f6, f7, f8, f9, esc) = ctx.input_mut(|i| {
             (
                 // redo first: egui matches Ctrl+Z "logically", so it also takes Ctrl+Shift+Z
@@ -963,7 +985,7 @@ impl App {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F8),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F9),
                 // Escape cancels a piano-roll gesture first; otherwise it is the panic key
-                if self.piano_roll.gesture_active() || self.playlist.gesture_active() || self.automation.gesture_active() {
+                if self.piano_roll.gesture_active() || self.playlist.gesture_active() || self.automation.gesture_active() || popup_open {
                     false
                 } else {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
@@ -1407,7 +1429,8 @@ impl App {
         match rawdawg_project::load_project_dir(&path) {
             Ok(p) => {
                 self.send(EngineCommand::Panic { source: None });
-                self.history = History::continuing_from(p.revision);
+                // numbered after the saved revision and every autosave left in the folder
+                self.history = History::continuing_from(p.revision.max(rawdawg_project::persist::highest_autosave_revision(&path)));
                 self.project = p;
                 self.project_path = Some(path.clone());
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
@@ -1745,7 +1768,8 @@ impl App {
                     ui.close();
                 }
                 if ui.button("Open…").clicked() {
-                    self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    // never the hidden per-user folder of a never-saved project
+                    self.files.path_input = self.project_path.as_ref().filter(|_| !self.is_never_saved()).map(|p| p.display().to_string()).unwrap_or_default();
                     self.files.dialog = Some(project_files::FileDialog::Open);
                     self.files.focus_field = true;
                     ui.close();
@@ -1755,19 +1779,21 @@ impl App {
                     ui.close();
                 }
                 if ui.button("Save As…").clicked() {
-                    self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    self.files.path_input = self.project_path.as_ref().filter(|_| !self.is_never_saved()).map(|p| p.display().to_string()).unwrap_or_default();
+                    self.files.error = None;
                     self.files.dialog = Some(project_files::FileDialog::SaveAs);
                     self.files.focus_field = true;
                     ui.close();
                 }
                 if ui.button(format!("Rename project ({})…", self.project.name)).on_hover_text("The name proposes export file names").clicked() {
                     self.files.rename = Some(self.project.name.clone());
-                    self.files.focus_field = true;
+                    self.files.focus_rename = true;
                     ui.close();
                 }
                 // one short line (a wrapped label in a menu is justified letter by letter)
-                if let Some((line, detail)) = self.autosave_summary() {
-                    ui.add(egui::Label::new(egui::RichText::new(line).color(theme::TEXT_SECONDARY).small()).truncate()).on_hover_text(detail);
+                if let Some((line, detail, failed)) = self.autosave_summary() {
+                    let color = if failed { theme::WARNING } else { theme::TEXT_SECONDARY };
+                    ui.add(egui::Label::new(egui::RichText::new(line).color(color).small()).truncate()).on_hover_text(detail);
                 }
                 if ui.button("Export…").on_hover_text("Render to WAV/FLAC (and stems) or a MIDI file with the playback engine").clicked() {
                     self.export.open = true;
@@ -1931,9 +1957,10 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // clean shutdown: the next start must not offer safe mode because of us
         self.plugin_host.clear_marker();
-        // nor recovery of a never-saved project that closed without unsaved work
+        // nor recovery of work that closed without unsaved changes (a never-saved project's
+        // folder goes with it)
         if !self.history.is_dirty() {
-            self.forget_unsaved_autosaves();
+            self.give_up_session_work();
         }
     }
 }

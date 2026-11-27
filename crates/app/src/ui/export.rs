@@ -29,9 +29,10 @@ pub(crate) struct ExportState {
     pub unprotected: bool,
     /// What the user typed; the extension follows the format when writing (see [`audio_path`]).
     pub path: String,
-    /// Whose path it is: the project (by id) and its folder when it was set. Another project
-    /// gets its own default path; a Save As of the same one keeps a path the user typed.
-    path_for: Option<(rawdawg_types::ProjectId, Option<PathBuf>)>,
+    /// Whose path it is: the project (by id), its folder and its name when it was set. Another
+    /// project gets its own default path; a Save As or a rename of the same one keeps a path the
+    /// user typed (and renews the proposed one).
+    path_for: Option<(rawdawg_types::ProjectId, Option<PathBuf>, String)>,
     /// The user typed the path.
     path_custom: bool,
     /// An export waiting for "Replace" because its files exist.
@@ -48,6 +49,12 @@ enum Pending {
 }
 
 impl ExportState {
+    /// Tests: mark the path as typed by the user.
+    #[cfg(test)]
+    pub(crate) fn path_custom_for_tests(&mut self) {
+        self.path_custom = true;
+    }
+
     pub fn running(&self) -> bool {
         self.job.is_some()
     }
@@ -398,10 +405,10 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             ui.checkbox(&mut app.export.unprotected, "Unprotected (bypass the master limiter; float output recommended)");
             // the path belongs to the open project: another project (also a never-saved one)
             // starts from its own default; a Save As of this one keeps a path the user typed
-            let owner = (app.project.project_id, app.project_path.clone());
+            let owner = (app.project.project_id, app.project_path.clone(), app.project.name.clone());
             let reset = match &app.export.path_for {
-                Some((id, _)) if *id != owner.0 => true,
-                Some((_, dir)) => *dir != owner.1 && !app.export.path_custom,
+                Some((id, ..)) if *id != owner.0 => true,
+                Some((_, dir, name)) => (*dir != owner.1 || *name != owner.2) && !app.export.path_custom,
                 None => false,
             };
             if reset {

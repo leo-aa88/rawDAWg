@@ -174,8 +174,12 @@ pub struct AudioClipNode {
     pub source_offset: f64,
     pub rate: f64,
     pub gain: f32,
+    /// Fades in output frames: the whole ramp's length, and how far into the fade-in the clip
+    /// starts / how much of the fade-out lies after its end (a split clip's halves).
     pub fade_in: f64,
     pub fade_out: f64,
+    pub fade_in_offset: f64,
+    pub fade_out_offset: f64,
     pub mixer_index: usize,
 }
 
@@ -366,7 +370,20 @@ fn audio_clip_nodes(
     let mut out = Vec::new();
     let mut stream_requests: Vec<crate::stream::StreamRequest> = Vec::new();
     for clip in &project.clips {
-        let ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } = &clip.content else { continue };
+        let ClipContent::Audio {
+            asset_id,
+            source_offset_frames,
+            source_length_frames,
+            gain_db,
+            fade_in_frames,
+            fade_out_frames,
+            playback_rate,
+            fade_in_offset_frames,
+            fade_out_offset_frames,
+        } = &clip.content
+        else {
+            continue;
+        };
         if clip.muted || out.len() >= MAX_AUDIO_CLIPS {
             continue;
         }
@@ -415,6 +432,8 @@ fn audio_clip_nodes(
             gain: gain_db.to_linear() as f32,
             fade_in: *fade_in_frames as f64 / eff_rate,
             fade_out: *fade_out_frames as f64 / eff_rate,
+            fade_in_offset: *fade_in_offset_frames as f64 / eff_rate,
+            fade_out_offset: *fade_out_offset_frames as f64 / eff_rate,
             mixer_index,
         });
     }

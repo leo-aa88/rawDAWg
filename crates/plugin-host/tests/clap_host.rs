@@ -345,6 +345,14 @@ fn hosted_readouts_are_the_plugins_own_text_and_discrete_parameters_keep_their_s
             assert_eq!(text(sp::TRANSPOSE, 0.5).as_deref(), Some("+0 st"));
             assert_eq!(text(sp::MAX_VOICES, 31.0 / 63.0).as_deref(), Some("32"));
             assert_eq!(text(sp::layer_param(0, sp::L_WAVE), 2.0 / 3.0).as_deref(), Some("Saw"));
+            // and what typing a value in another host sets (the plugin's text_to_value)
+            let typed = |id: u32, t: &str| inst.param_from_text(rawdawg_types::ParamId(id), t).and_then(|n| text(id, n));
+            assert_eq!(typed(sp::TRANSPOSE, "12").as_deref(), Some("+12 st"), "an octave up, not step 12");
+            assert_eq!(typed(sp::TRANSPOSE, "\u{2212}7").as_deref(), Some("-7 st"));
+            assert_eq!(typed(sp::MAX_VOICES, "8").as_deref(), Some("8"));
+            assert_eq!(typed(sp::FILTER_MODE, "notch").as_deref(), Some("Notch"));
+            assert_eq!(typed(sp::layer_param(0, sp::L_WAVE), "tri").as_deref(), Some("Triangle"), "a unique start");
+            assert_eq!(inst.param_from_text(rawdawg_types::ParamId(sp::FILTER_MODE), "nonsense"), None);
         }
     }
     assert!(discrete >= 20, "discrete read-backs checked: {discrete}");
