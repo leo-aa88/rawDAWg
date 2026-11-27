@@ -1,5 +1,7 @@
 # rawDAWg
 
+<img width="1774" height="887" alt="Cão Áudio RawDAWg em Alto Contraste" src="https://github.com/user-attachments/assets/a032c7d7-46e2-4b36-9fc7-40c888325eb8" />
+
 [![CI](https://github.com/leo-aa88/rawDAWg/actions/workflows/ci.yml/badge.svg)](https://github.com/leo-aa88/rawDAWg/actions/workflows/ci.yml)
 [![Release](https://github.com/leo-aa88/rawDAWg/actions/workflows/release.yml/badge.svg)](https://github.com/leo-aa88/rawDAWg/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/leo-aa88/rawDAWg?include_prereleases&sort=semver)](https://github.com/leo-aa88/rawDAWg/releases)
