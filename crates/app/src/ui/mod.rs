@@ -51,6 +51,9 @@ pub struct GuiOptions {
     pub ui_preset: Option<String>,
     /// Plugin catalog file override (tests, portable setups).
     pub catalog: Option<PathBuf>,
+    /// Folder for never-saved projects and their autosaves (default: `unsaved` in the per-user
+    /// data folder; tests use their own).
+    pub recovery_dir: Option<PathBuf>,
 }
 
 pub fn run_gui(opts: GuiOptions) -> anyhow::Result<()> {
@@ -120,6 +123,8 @@ pub(crate) enum EditorView {
 pub(crate) struct App {
     pub project: Project,
     pub history: History,
+    /// Folder of never-saved projects (`<project id>.rawdawg` each, with their autosaves).
+    pub unsaved_root: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
     pub piano_roll: piano_roll::PianoRollState,
     pub playlist: playlist::PlaylistState,
@@ -234,6 +239,9 @@ impl App {
             },
             None => (default_project(), None, "Ready — hold Z X C V B N M to play".to_owned()),
         };
+        // edits of an opened project are numbered after its saved revision (crash recovery)
+        let start_revision = project.revision;
+        let unsaved_root = opts.recovery_dir.clone().or_else(|| directories::ProjectDirs::from("", "", rawdawg_types::PACKAGE_NAME).map(|d| d.data_dir().join("unsaved")));
         let devices = enumerate();
         let req = StreamConfigRequest {
             device_id: opts.device.clone().or(prefs.audio_device_id.clone()),
@@ -272,7 +280,8 @@ impl App {
         let opened_dir = project_path.clone();
         let mut app = Self {
             project,
-            history: History::new(),
+            history: History::continuing_from(start_revision),
+            unsaved_root,
             project_path,
             devices,
             audio,
@@ -418,6 +427,9 @@ impl App {
             }
             app.files.recovery = rawdawg_project::recovery_candidates(&dir);
             app.files.last_autosave = Some(std::time::Instant::now());
+        } else {
+            // a never-saved project of an earlier session that ended without closing
+            app.offer_unsaved_recovery();
         }
         app
     }
@@ -586,9 +598,13 @@ impl App {
         if let Some(p) = &self.project_path {
             return Some(p.clone());
         }
-        let dir = directories::ProjectDirs::from("", "", rawdawg_types::PACKAGE_NAME)?.data_dir().join("unsaved").join(format!("{}.rawdawg", self.project.project_id));
+        // a never-saved project keeps its media in its per-user folder (Save still asks where)
+        let dir = self.unsaved_dir()?;
         if rawdawg_project::save_project_dir(&dir, &self.project).is_err() {
             return None;
+        }
+        if self.files.lock.is_none() {
+            self.files.lock = rawdawg_project::lock::ProjectLock::acquire(&dir, false).ok();
         }
         self.project_path = Some(dir.clone());
         self.status_line = format!("Working folder {}", dir.display());
@@ -1258,7 +1274,8 @@ impl App {
             for p in recent {
                 let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 if ui.button(&name).on_hover_text(p.display().to_string()).clicked() {
-                    self.open_project(p);
+                    // like File › Open: asks about unsaved changes, locks the project, offers recovery
+                    self.request_open(p);
                 }
             }
         });
@@ -1377,13 +1394,15 @@ impl App {
         });
     }
 
-    pub(crate) fn open_project(&mut self, path: PathBuf) {
+    /// Load the project folder at `path` (no lock, no recovery check: see `open_project_checked`).
+    /// Returns whether it opened.
+    pub(crate) fn open_project(&mut self, path: PathBuf) -> bool {
         let path = crate::prefs::absolute(&path);
         match rawdawg_project::load_project_dir(&path) {
             Ok(p) => {
                 self.send(EngineCommand::Panic { source: None });
+                self.history = History::continuing_from(p.revision);
                 self.project = p;
-                self.history = History::new();
                 self.project_path = Some(path.clone());
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
                 self.prefs.remember_project(path.clone());
@@ -1392,8 +1411,14 @@ impl App {
                 self.rebuild_mirrors();
                 self.recompile();
                 self.recover_takes();
+                // the next autosave is due a full interval after opening
+                self.files.last_autosave = Some(std::time::Instant::now());
+                true
             }
-            Err(e) => self.status_line = format!("Could not open {}: {e}", path.display()),
+            Err(e) => {
+                self.status_line = format!("Could not open {}: {e}", path.display());
+                false
+            }
         }
     }
 
@@ -1889,6 +1914,10 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // clean shutdown: the next start must not offer safe mode because of us
         self.plugin_host.clear_marker();
+        // nor recovery of a never-saved project that closed without unsaved work
+        if !self.history.is_dirty() {
+            self.forget_unsaved_autosaves();
+        }
     }
 }
 

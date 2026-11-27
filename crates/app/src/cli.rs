@@ -216,6 +216,7 @@ pub fn run(args: Args) -> anyhow::Result<i32> {
         return Ok(0);
     }
     crate::ui::run_gui(crate::ui::GuiOptions {
+        recovery_dir: None,
         open: args.open.clone(),
         safe_mode: args.safe_mode,
         device: args.device.clone(),

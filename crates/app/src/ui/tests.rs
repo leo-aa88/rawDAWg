@@ -28,6 +28,16 @@ impl Harness {
     }
 
     fn with_preset(project_dir: Option<&str>, ui_preset: Option<&str>) -> Self {
+        // each test app keeps its never-saved projects in a folder of its own (never the user's)
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let recovery = std::env::temp_dir().join(format!("rawdawg-test-unsaved-{}-{n}", std::process::id()));
+        Self::with_recovery_dir(project_dir, ui_preset, recovery)
+    }
+
+    /// A test app whose never-saved projects live in `recovery` (a crash test starts two apps on
+    /// the same folder).
+    fn with_recovery_dir(project_dir: Option<&str>, ui_preset: Option<&str>, recovery: PathBuf) -> Self {
         let ctx = egui::Context::default();
         let opts = GuiOptions {
             open: project_dir.map(PathBuf::from),
@@ -38,6 +48,7 @@ impl Harness {
             screenshot: None,
             ui_preset: ui_preset.map(str::to_owned),
             catalog: None,
+            recovery_dir: Some(recovery),
         };
         let app = App::build(&ctx, opts, Preferences::default(), false);
         let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX, size: egui::vec2(W, H) };
@@ -3285,4 +3296,198 @@ fn the_running_status_puts_voices_first_and_only_shows_counters_that_matter() {
     let busy = super::running_status(12, 2.5, 4, 2, Some("plan error"));
     assert_eq!(busy.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(), ["voices 12", "limiter −2.5 dB", "dropped 4", "late MIDI 2", "plan error"]);
     assert_eq!(busy[2].1, theme::ERROR);
+}
+
+/// A saved project folder `root/<name>.rawdawg` with `notes` notes, at `revision`.
+fn saved_song(root: &std::path::Path, name: &str, notes: usize, revision: u64) -> PathBuf {
+    let dir = root.join(format!("{name}.rawdawg"));
+    let mut p = rawdawg_project::Project::new_default(name, serde_json::to_value(rawdawg_synthesizer::Patch::default()).unwrap());
+    p.revision = revision;
+    p.patterns[0].lanes[0].notes = (0..notes)
+        .map(|i| rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(i as i64 * 240), duration_ticks: Tick(120), pitch: 60, velocity: 0.8, channel: 0 })
+        .collect();
+    rawdawg_project::save_project_dir(&dir, &p).unwrap();
+    dir
+}
+
+fn add_note(h: &mut Harness, tick: i64) {
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(tick), duration_ticks: Tick(120), pitch: 64, velocity: 0.8, channel: 0 }],
+    });
+}
+
+fn note_count(h: &Harness) -> usize {
+    h.app.project.patterns[0].lanes[0].notes.len()
+}
+
+fn lock_file(dir: &std::path::Path) -> PathBuf {
+    dir.join("recovery/lock.json")
+}
+
+#[test]
+fn opening_another_project_asks_about_unsaved_changes_and_moves_the_lock() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-open-prompt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let a = saved_song(&root, "A", 1, 3);
+    let b = saved_song(&root, "B", 2, 3);
+    let mut h = Harness::new(None);
+    h.app.prefs.recent_projects = vec![a.clone(), b.clone()];
+    h.app.request_open(a.clone());
+    assert_eq!(h.app.project_path.as_deref(), Some(a.as_path()));
+    assert!(lock_file(&a).is_file(), "A is locked");
+    add_note(&mut h, 960);
+    // Browser › Projects › B: asked first, nothing lost yet
+    let click = |h: &mut Harness, text: &str| {
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let r = h.node(text).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    click(&mut h, "B.rawdawg");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Save the current project before opening B.rawdawg?"));
+    assert_eq!(h.app.project_path.as_deref(), Some(a.as_path()));
+    click(&mut h, "Cancel");
+    assert_eq!((h.app.project_path.as_deref(), note_count(&h)), (Some(a.as_path()), 2), "cancelled: A with its edit");
+    assert!(h.app.history.is_dirty() && h.app.history.can_undo());
+    // again, discarding: B opens, locked; A's lock is released
+    click(&mut h, "B.rawdawg");
+    click(&mut h, "Discard and open");
+    assert_eq!((h.app.project_path.as_deref(), note_count(&h)), (Some(b.as_path()), 2));
+    assert!(lock_file(&b).is_file(), "the project opened from the list is locked");
+    assert!(!lock_file(&a).exists(), "the one left is not");
+    assert_eq!(rawdawg_project::load_project_dir(&a).unwrap().patterns[0].lanes[0].notes.len(), 1, "A as saved");
+    // File › Open › Recent with an edit in B: Save and open keeps it
+    add_note(&mut h, 1920);
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let recent = h.drawn_nodes().into_iter().find(|(t, _)| *t == a.display().to_string()).map(|(_, r)| r).expect("the Recent entry");
+    h.click_at(recent.center(), egui::PointerButton::Primary);
+    click(&mut h, "Save and open");
+    assert_eq!(h.app.project_path.as_deref(), Some(a.as_path()));
+    assert_eq!(rawdawg_project::load_project_dir(&b).unwrap().patterns[0].lanes[0].notes.len(), 3, "B was saved with its edit");
+    assert!(lock_file(&a).is_file() && !lock_file(&b).exists());
+    // a project that is not dirty opens at once
+    h.app.request_open(b.clone());
+    assert_eq!(h.app.project_path.as_deref(), Some(b.as_path()));
+    assert!(h.app.files.open_prompt.is_none());
+    // a never-saved project: Save and open goes through Save As, then opens
+    h.app.new_project();
+    add_note(&mut h, 0);
+    h.app.request_open(a.clone());
+    click(&mut h, "Save and open");
+    assert_eq!(h.app.files.dialog, Some(super::project_files::FileDialog::SaveAs));
+    h.app.files.path_input = root.join("Fresh").display().to_string();
+    click(&mut h, "Save as");
+    assert!(root.join("Fresh.rawdawg/project.json").is_file());
+    assert_eq!(h.app.project_path.as_deref(), Some(a.as_path()), "then the project asked for opened");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_crash_in_a_reopened_project_is_offered_for_recovery() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-reopen-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // saved after 25 edits in an earlier session
+    let dir = saved_song(&root, "Rand", 1, 25);
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.history.revision(), 25, "this session's edits number after the saved ones");
+    assert!(!h.app.history.is_dirty());
+    for t in 1..=3 {
+        add_note(&mut h, t * 240);
+    }
+    h.app.autosave_now(&dir);
+    drop(h); // the crash (no save, no clean exit)
+    let mut h = Harness::new(None);
+    h.app.open_project_checked(dir.clone());
+    assert_eq!(h.app.files.recovery.len(), 1, "the autosave with 3 more notes is offered");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Recover"));
+    let c = h.app.files.recovery[0].clone();
+    h.app.recover_from(&c);
+    assert_eq!(note_count(&h), 4);
+    assert!(h.app.history.revision() >= 28 && h.app.history.is_dirty(), "work after recovery is numbered above it too");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
+    let base = std::env::temp_dir().join(format!("rawdawg-ui-unsaved-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let recovery = base.join("unsaved");
+    // a new project, a few edits, autosaved into the per-user folder
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "nothing to offer on a first start");
+    for t in 0..4 {
+        add_note(&mut h, t * 240);
+    }
+    h.frame(vec![]);
+    let own = h.app.unsaved_dir().unwrap();
+    assert!(own.starts_with(&recovery));
+    assert_eq!(std::fs::read_dir(own.join("recovery/autosave")).unwrap().count(), 1, "a never-saved project autosaves");
+    assert!(lock_file(&own).is_file(), "and holds its folder");
+    drop(h); // the crash
+    // the next start offers it
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery_unsaved && h.app.files.recovery.len() == 1);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("rawDAWg did not close normally: a project that was never saved")));
+    let recover = h.node("Recover").unwrap();
+    h.click_at(recover.center(), egui::PointerButton::Primary);
+    assert_eq!(note_count(&h), 4, "the four notes are back");
+    assert!(h.app.is_never_saved() && h.app.history.is_dirty());
+    // Save asks where; Save As keeps it and the per-user autosaves are not a crash anymore
+    h.app.save_project_checked();
+    assert_eq!(h.app.files.dialog, Some(super::project_files::FileDialog::SaveAs), "never into the hidden folder");
+    h.app.save_project_as(base.join("Kept"));
+    assert!(!h.app.history.is_dirty() && base.join("Kept.rawdawg/project.json").is_file());
+    assert!(rawdawg_project::recovery_candidates(&own).is_empty());
+    drop(h);
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "nothing left to offer");
+    drop(h);
+    // work given up on purpose is not offered: New project, Discard and close, a clean exit
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    h.app.new_project();
+    drop(h);
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "New project discarded it");
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    h.app.history.mark_saved();
+    eframe::App::on_exit(&mut h.app);
+    drop(h);
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "a clean exit leaves nothing to recover");
+    drop(h);
+    // another running rawDAWg's never-saved project is not taken for a crash
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    add_note(&mut h, 0);
+    h.frame(vec![]);
+    let other = h.app.unsaved_dir().unwrap();
+    drop(h);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let live = rawdawg_project::lock::LockInfo { pid: 1, host: "elsewhere".into(), acquired_unix_ms: now };
+    std::fs::write(lock_file(&other), serde_json::to_vec(&live).unwrap()).unwrap();
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty(), "held by a live rawDAWg");
+    drop(h);
+    // once that one is gone, its work is offered; Discard removes it for good
+    std::fs::remove_file(lock_file(&other)).unwrap();
+    let mut h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert_eq!(h.app.files.recovery.len(), 1);
+    h.frame(vec![]);
+    let discard = h.node("Discard autosaves").unwrap();
+    h.click_at(discard.center(), egui::PointerButton::Primary);
+    drop(h);
+    let h = Harness::with_recovery_dir(None, None, recovery.clone());
+    assert!(h.app.files.recovery.is_empty());
+    let _ = std::fs::remove_dir_all(&base);
 }

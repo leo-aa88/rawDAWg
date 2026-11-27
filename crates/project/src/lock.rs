@@ -51,8 +51,33 @@ pub fn is_live(info: &LockInfo) -> bool {
         {
             return Path::new(&format!("/proc/{}", info.pid)).exists();
         }
+        #[cfg(target_os = "windows")]
+        {
+            return process_alive(info.pid);
+        }
     }
     true
+}
+
+/// Whether process `pid` is still running (Windows). A process we may not query counts as
+/// running: the safe side for a lock.
+#[cfg(target_os = "windows")]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: OpenProcess takes plain values and returns a process handle or null; a non-null
+    // handle is only passed to GetExitCodeProcess (which writes one u32 into a local we own) and
+    // then closed exactly once before returning. GetLastError reads this thread's error code.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        !ok || code == STILL_ACTIVE as u32
+    }
 }
 
 impl ProjectLock {

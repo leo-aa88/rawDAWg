@@ -25,31 +25,55 @@ fn wav(path: &std::path::Path, seed: u32) {
 }
 
 #[test]
-fn autosave_ring_keeps_the_newest_and_recovery_offers_only_newer_revisions() {
+fn autosave_ring_keeps_the_newest_and_recovery_offers_work_the_saved_project_lacks() {
     let root = tmp("autosave");
     let dir = root.join("A.rawdawg");
     let mut p = Project::new_default("auto", serde_json::json!({}));
     p.revision = 5;
     save_project_dir(&dir, &p).unwrap();
     assert!(recovery_candidates(&dir).is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // a session that reopened the project: revisions from 1 again (as earlier versions did),
+    // each autosave with more work
     for r in 1..=(AUTOSAVE_KEEP as u64 + 3) {
         p.revision = r;
+        p.name = format!("auto {r}");
         autosave(&dir, &p).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let files = std::fs::read_dir(dir.join("recovery/autosave")).unwrap().count();
     assert_eq!(files, AUTOSAVE_KEEP, "ring pruned to the newest {AUTOSAVE_KEEP}");
     let cands = recovery_candidates(&dir);
-    assert!(!cands.is_empty());
-    assert!(cands.iter().all(|c| c.revision > 5), "only revisions above the saved one: {cands:?}");
+    assert_eq!(cands.len(), AUTOSAVE_KEEP, "written after the save, so offered whatever their revision: {cands:?}");
     assert_eq!(cands[0].revision, AUTOSAVE_KEEP as u64 + 3, "newest first");
-    assert!(cands.windows(2).all(|w| w[0].revision >= w[1].revision));
-    let recovered = load_project_dir(cands[0].path.parent().unwrap().parent().unwrap().parent().unwrap()).unwrap();
+    assert!(cands.windows(2).all(|w| w[0].saved_unix_ms >= w[1].saved_unix_ms));
+    assert_eq!(rawdawg_project::persist::candidate_project_dir(&cands[0]).unwrap(), dir);
+    let recovered = load_project_dir(&dir).unwrap();
     assert_eq!(recovered.revision, 5, "the saved manifest is untouched by autosaves");
     let from_auto = rawdawg_project::persist::parse_project(&std::fs::read(&cands[0].path).unwrap()).unwrap();
     assert_eq!(from_auto.revision, AUTOSAVE_KEEP as u64 + 3);
     clear_autosaves(&dir);
     assert!(recovery_candidates(&dir).is_empty());
+    // an autosave with nothing the saved project lacks is not offered
+    p.name = "auto".into();
+    p.revision = 9;
+    autosave(&dir, &p).unwrap();
+    assert!(recovery_candidates(&dir).is_empty(), "same content, only bookkeeping differs");
+    // an older autosave (written before the manifest, lower revision) is not offered either
+    clear_autosaves(&dir);
+    p.name = "older work".into();
+    p.revision = 3;
+    autosave(&dir, &p).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let mut saved = load_project_dir(&dir).unwrap();
+    saved.name = "saved later".into();
+    saved.revision = 7;
+    save_project_dir(&dir, &saved).unwrap();
+    assert!(recovery_candidates(&dir).is_empty(), "the save came after it");
+    // a folder with autosaves but no manifest (a never-saved project): every autosave counts
+    let unsaved = root.join("unsaved.rawdawg");
+    autosave(&unsaved, &p).unwrap();
+    assert_eq!(recovery_candidates(&unsaved).len(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }
 

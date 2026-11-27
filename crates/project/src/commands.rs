@@ -1052,6 +1052,13 @@ impl History {
         Self { max_depth: 1000, ..Default::default() }
     }
 
+    /// A history for a project opened at `revision`: clean, and every edit numbered above it,
+    /// so an autosave of this session is newer than the saved manifest (revisions used to restart
+    /// at 0 on open, and a crash in a reopened song was never offered for recovery).
+    pub fn continuing_from(revision: u64) -> Self {
+        Self { revision, saved_revision: revision, max_depth: 1000, ..Default::default() }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }

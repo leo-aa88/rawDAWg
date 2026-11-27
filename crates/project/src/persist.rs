@@ -200,10 +200,15 @@ pub struct RecoveryCandidate {
     pub autosave: bool,
 }
 
-/// Autosaves (newest first) whose revision is above the saved manifest's: what to offer
-/// after a crash. Unparseable files are skipped.
+/// Autosaves (newest first) with work the saved manifest lacks: what to offer after a crash.
+/// An autosave counts when its revision is above the manifest's or it was written after the
+/// manifest (revisions restarted at 0 on open in earlier versions), and its content differs
+/// from the manifest (bookkeeping aside). Without a manifest (a never-saved project) every
+/// autosave counts. Unparseable files are skipped.
 pub fn recovery_candidates(dir: &Path) -> Vec<RecoveryCandidate> {
-    let saved_rev = load_project_dir(dir).map(|p| p.revision).unwrap_or(0);
+    let saved = load_project_dir(dir).ok();
+    let saved_rev = saved.as_ref().map_or(0, |p| p.revision);
+    let saved_ms = fs::metadata(dir.join(PROJECT_FILE)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(dir.join(AUTOSAVE_DIR)) {
         for e in rd.flatten() {
@@ -215,13 +220,20 @@ pub fn recovery_candidates(dir: &Path) -> Vec<RecoveryCandidate> {
             let Ok(bytes) = fs::read(&path) else { continue };
             let Ok(p) = parse_project(&bytes) else { continue };
             let ts = name.split('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
-            if p.revision > saved_rev {
+            let newer = p.revision > saved_rev || saved_ms.is_none_or(|ms| ts > ms);
+            let differs = saved.as_ref().is_none_or(|s| !crate::compare::describe_changes(s, &p).is_empty());
+            if newer && differs {
                 out.push(RecoveryCandidate { path, revision: p.revision, saved_unix_ms: ts, autosave: true });
             }
         }
     }
-    out.sort_by(|a, b| b.revision.cmp(&a.revision).then(b.saved_unix_ms.cmp(&a.saved_unix_ms)));
+    out.sort_by(|a, b| b.saved_unix_ms.cmp(&a.saved_unix_ms).then(b.revision.cmp(&a.revision)));
     out
+}
+
+/// The project folder a recovery candidate belongs to (`<dir>/recovery/autosave/<file>`).
+pub fn candidate_project_dir(c: &RecoveryCandidate) -> Option<PathBuf> {
+    Some(c.path.parent()?.parent()?.parent()?.to_path_buf())
 }
 
 /// Remove every autosave (after a successful save, or when the user discards them).
