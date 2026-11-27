@@ -2547,10 +2547,11 @@ fn at_the_minimum_window_size_the_toolbar_and_status_bar_keep_every_control_visi
                 .map(|(_, r)| *r)
                 .unwrap_or_else(|| panic!("{what} not drawn ({toolbar_audio})"))
         };
-        let toolbar: Vec<(&str, egui::Rect)> = ["Undo", "Redo", "Settings", "MIDI n/a", toolbar_audio, "Metronome", "Play", "Typing keys", "C4", "Vel"]
-            .into_iter()
-            .map(|t| (t, find(&|x: &str| x == t, false, t)))
-            .collect();
+        let mut toolbar: Vec<(&str, egui::Rect)> =
+            ["Undo", "Redo", "Settings", toolbar_audio, "Metronome", "Play", "Typing keys", "C4", "Vel"].into_iter().map(|t| (t, find(&|x: &str| x == t, false, t))).collect();
+        // "MIDI n/a" without a MIDI backend, "MIDI 0" with one (the Windows runner has WinMM)
+        let midi = |x: &str| x.strip_prefix("MIDI ").is_some_and(|n| n == "n/a" || n.parse::<usize>().is_ok());
+        toolbar.push(("MIDI status", find(&midi, false, "MIDI status")));
         let status: Vec<(&str, egui::Rect)> = vec![
             ("message", find(&|t: &str| t.starts_with("Ready"), true, "message")),
             ("audio state", find(&|t: &str| t.starts_with(status_audio), true, "audio state")),
