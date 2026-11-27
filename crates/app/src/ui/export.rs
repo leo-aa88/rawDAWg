@@ -239,7 +239,19 @@ pub(crate) fn request_midi(app: &mut App) {
     }
 }
 
+/// Create the folder a file goes into (as the command-line render does).
+fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => std::fs::create_dir_all(dir).map_err(|e| format!("Could not create the folder {}: {e}", dir.display())),
+        None => Ok(()),
+    }
+}
+
 fn write_midi(app: &mut App, path: &std::path::Path) {
+    if let Err(e) = ensure_parent(path) {
+        app.export.last_result = Some(e);
+        return;
+    }
     let bytes = match midi_view(app) {
         Some(view) => rawdawg_project::smf::export_song(&view),
         None => Err(rawdawg_project::smf::SmfError::Empty),
@@ -259,6 +271,11 @@ pub(crate) fn start(app: &mut App) {
         app.export.last_result = Some("Choose an output path first".into());
         return;
     };
+    // a folder typed with the name (mixes/final) is created, as the command-line render does
+    if let Err(e) = ensure_parent(&path) {
+        app.export.last_result = Some(e);
+        return;
+    }
     // a replaced stems folder loses the stems of the earlier export (strips may have gone or
     // been renumbered); other files in it stay
     if app.export.stems

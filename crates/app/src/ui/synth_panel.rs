@@ -521,20 +521,9 @@ fn gen_visible(kind: usize, offset: u32) -> bool {
     }
 }
 
+/// The names of a parameter's steps (the descriptors carry them, for other hosts too).
 fn labels_for(d: &ParamDescriptor) -> Option<Vec<&'static str>> {
-    match params::decode(d.id.0)? {
-        ParamBlock::Global => match d.id.0 {
-            params::FILTER_MODE => Some(rawdawg_dsp::filter::FilterMode::ALL.iter().map(|m| m.label()).collect()),
-            params::VOICE_MODE => Some(rawdawg_synthesizer::VoiceMode::ALL.iter().map(|m| m.label()).collect()),
-            _ => None,
-        },
-        ParamBlock::Layer { offset: params::L_WAVE, .. } => Some(vec!["Sine", "Triangle", "Saw", "Pulse"]),
-        ParamBlock::Gen { offset: params::G_FM_ALGORITHM, .. } => Some(rawdawg_synthesizer::patch::FmAlgorithm::ALL.iter().map(|a| a.label()).collect()),
-        ParamBlock::Gen { offset: params::G_GRAIN_WINDOW, .. } => Some(vec!["Hann", "Triangle", "Rectangular"]),
-        ParamBlock::Gen { offset: params::G_PLUCK_EXCITATION, .. } => Some(vec!["Noise", "Impulse", "Pick"]),
-        ParamBlock::Lfo { offset: params::LFO_SHAPE, .. } => Some(rawdawg_synthesizer::patch::LfoShape::ALL.iter().map(|s| s.label()).collect()),
-        _ => None,
-    }
+    d.labels.map(<[&str]>::to_vec)
 }
 
 /// A grid of parameter widgets; collects edits as (id, normalized, gesture start, gesture end).
@@ -580,8 +569,11 @@ fn param_grid(
                             r.response
                         }
                         None => {
-                            let r = ui.add(rawdawg_ui::params::slider(ui, &mut idx, 0..=(steps as i64 - 1)).show_value(true));
-                            n = d.to_normalized(idx as f64);
+                            // the values the steps stand for (Transpose −48…+48, Voices 1…64)
+                            let off = i64::from(d.display_offset);
+                            let mut shown = idx + off;
+                            let r = ui.add(rawdawg_ui::params::slider(ui, &mut shown, off..=(off + steps as i64 - 1)).show_value(true));
+                            n = d.to_normalized((shown - off) as f64);
                             r
                         }
                     }

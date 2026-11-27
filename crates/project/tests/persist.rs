@@ -32,7 +32,13 @@ fn autosave_ring_keeps_the_newest_and_recovery_offers_work_the_saved_project_lac
     p.revision = 5;
     save_project_dir(&dir, &p).unwrap();
     assert!(recovery_candidates(&dir).is_empty());
-    std::thread::sleep(std::time::Duration::from_millis(5));
+    // the save was a minute ago (file times, not sleeps: they are coarse)
+    let set_saved = |dir: &std::path::Path, offset_s: i64| {
+        let (now, by) = (std::time::SystemTime::now(), std::time::Duration::from_secs(offset_s.unsigned_abs()));
+        let t = if offset_s >= 0 { now + by } else { now - by };
+        std::fs::File::options().write(true).open(dir.join("project.json")).unwrap().set_modified(t).unwrap();
+    };
+    set_saved(&dir, -60);
     // a session that reopened the project: revisions from 1 again (as earlier versions did),
     // each autosave with more work
     for r in 1..=(AUTOSAVE_KEEP as u64 + 3) {
@@ -64,11 +70,11 @@ fn autosave_ring_keeps_the_newest_and_recovery_offers_work_the_saved_project_lac
     p.name = "older work".into();
     p.revision = 3;
     autosave(&dir, &p).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(5));
     let mut saved = load_project_dir(&dir).unwrap();
     saved.name = "saved later".into();
     saved.revision = 7;
     save_project_dir(&dir, &saved).unwrap();
+    set_saved(&dir, 60);
     assert!(recovery_candidates(&dir).is_empty(), "the save came after it");
     // a folder with autosaves but no manifest (a never-saved project): every autosave counts
     let unsaved = root.join("unsaved.rawdawg");

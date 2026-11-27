@@ -96,6 +96,11 @@ pub struct ParamDescriptor {
     /// Display labels for a `Discrete` mapping, one per step (menus and readouts use them).
     #[serde(skip)]
     pub labels: Option<&'static [&'static str]>,
+    /// Added to an unlabelled `Discrete` step for display and typing: step 48 of a −48…+48
+    /// transpose reads "+0 st", step 31 of a 1…64 voice count reads "32". The parameter's
+    /// value stays the step (saved states, automation and hosts are unaffected).
+    #[serde(default)]
+    pub display_offset: i32,
 }
 
 impl ParamDescriptor {
@@ -112,7 +117,19 @@ impl ParamDescriptor {
             flags: ParamFlags { automatable: true, modulatable: true, stepped: false, hidden: false, read_only: false, is_bypass: false },
             category,
             labels: None,
+            display_offset: 0,
         }
+    }
+
+    /// Show (and accept) a discrete step as `step + offset`.
+    pub const fn with_display_offset(mut self, offset: i32) -> Self {
+        self.display_offset = offset;
+        self
+    }
+
+    /// The number a discrete step stands for (its step plus the display offset).
+    pub fn step_value(&self, normalized: f32) -> i64 {
+        self.to_physical(normalized) as i64 + i64::from(self.display_offset)
     }
 
     /// Attach one display label per discrete step.
@@ -261,7 +278,15 @@ impl ParamDescriptor {
         let p = self.to_physical(normalized);
         match (self.mapping, self.unit) {
             (ParamMapping::Toggle, _) => (if p >= 0.5 { "On" } else { "Off" }).to_owned(),
-            (ParamMapping::Discrete { .. }, _) => self.label_for(normalized).map(str::to_owned).unwrap_or_else(|| format!("{}", p as i64)),
+            (ParamMapping::Discrete { .. }, unit) => self.label_for(normalized).map(str::to_owned).unwrap_or_else(|| {
+                let v = self.step_value(normalized);
+                match unit {
+                    // a range that goes below zero shows its sign (+12 st, −12 st)
+                    ParamUnit::Semitones if self.display_offset < 0 => format!("{v:+} st"),
+                    ParamUnit::Semitones => format!("{v} st"),
+                    _ => format!("{v}"),
+                }
+            }),
             (ParamMapping::LogWithZero { .. }, _) if p <= 0.0 => "Off".to_owned(),
             (_, ParamUnit::Percent) => {
                 // physical ranges wider than unity are already expressed in percent
@@ -302,6 +327,18 @@ impl ParamDescriptor {
     /// Parse user text in physical units into a normalized value.
     pub fn parse(&self, text: &str) -> Option<f32> {
         let t = text.trim().to_ascii_lowercase();
+        // a named step by its name; an unnamed one by the number it shows
+        if let ParamMapping::Discrete { steps } = self.mapping {
+            if let Some(labels) = self.labels
+                && let Some(i) = labels.iter().position(|l| l.to_ascii_lowercase() == t)
+            {
+                return Some(self.to_normalized(i as f64));
+            }
+            let num: String = t.chars().take_while(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.')).collect();
+            let v: f64 = num.parse().ok()?;
+            let step = (v.round() - f64::from(self.display_offset)).clamp(0.0, f64::from(steps.max(1) - 1));
+            return Some(self.to_normalized(step));
+        }
         if matches!(self.mapping, ParamMapping::Toggle) {
             return match t.as_str() {
                 "on" | "1" | "true" | "yes" => Some(1.0),
@@ -400,5 +437,34 @@ mod tests {
         assert!(!bad.is_well_formed());
         let bad2 = ParamDescriptor::continuous(8, "x", "X", ParamUnit::None, ParamMapping::Linear { min: 1.0, max: 1.0 }, 0.5, ParamCategory::Mix);
         assert!(!bad2.is_well_formed());
+    }
+
+    #[test]
+    fn discrete_steps_show_and_accept_the_values_they_stand_for() {
+        let transpose = ParamDescriptor::continuous(1, "t", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Pitch)
+            .stepped()
+            .with_display_offset(-48);
+        assert_eq!(transpose.format(0.5), "+0 st");
+        assert_eq!(transpose.format(1.0), "+48 st");
+        assert_eq!(transpose.format(0.0), "-48 st");
+        let up = transpose.parse("12").unwrap();
+        assert_eq!(transpose.to_physical(up), 60.0, "typing 12 is the step for +12, not 12 steps from −48");
+        assert_eq!(transpose.format(up), "+12 st");
+        assert_eq!(transpose.to_physical(transpose.parse("-12 st").unwrap()), 36.0);
+        assert_eq!(transpose.to_physical(transpose.parse("99").unwrap()), 96.0, "clamped to the range");
+        let voices =
+            ParamDescriptor::continuous(2, "v", "Voices", ParamUnit::None, ParamMapping::Discrete { steps: 64 }, 31.0 / 63.0, ParamCategory::Topology).with_display_offset(1);
+        assert_eq!(voices.format(31.0 / 63.0), "32");
+        assert_eq!(voices.to_physical(voices.parse("8").unwrap()), 7.0);
+        let bend = ParamDescriptor::continuous(3, "b", "Bend", ParamUnit::Semitones, ParamMapping::Discrete { steps: 49 }, 2.0 / 48.0, ParamCategory::Pitch);
+        assert_eq!(bend.format(2.0 / 48.0), "2 st", "no sign for a range that starts at zero");
+        let mode = ParamDescriptor::continuous(4, "m", "Mode", ParamUnit::None, ParamMapping::Discrete { steps: 3 }, 0.0, ParamCategory::Filter).with_labels(&[
+            "Low-pass",
+            "High-pass",
+            "Notch",
+        ]);
+        assert_eq!(mode.format(0.5), "High-pass");
+        assert_eq!(mode.to_physical(mode.parse("notch").unwrap()), 2.0, "a name is accepted");
+        assert_eq!(mode.to_physical(mode.parse("1").unwrap()), 1.0, "and the step number");
     }
 }

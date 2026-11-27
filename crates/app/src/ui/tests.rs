@@ -3491,3 +3491,136 @@ fn a_crash_in_a_never_saved_project_is_offered_at_the_next_start() {
     assert!(h.app.files.recovery.is_empty());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn splitting_audio_and_automation_clips_changes_nothing_you_hear() {
+    use rawdawg_audio_engine::offline::{OfflineOptions, render_project};
+    let fixture = PathBuf::from("../../fixtures/demo-song.rawdawg");
+    let mut h = Harness::new(Some("../../fixtures/demo-song.rawdawg"));
+    h.frame(vec![]);
+    let render = |p: &rawdawg_project::Project| {
+        let opts = OfflineOptions { mode: TransportMode::Song, tail_seconds: 0.0, project_dir: Some(fixture.clone()), ..OfflineOptions::default() };
+        render_project(p, &opts).expect("render").0
+    };
+    let before = render(&h.app.project);
+    let audio = h.app.project.clips.iter().find(|c| matches!(c.content, rawdawg_project::ClipContent::Audio { .. })).unwrap().clone();
+    let auto = h.app.project.clips.iter().find(|c| matches!(c.content, rawdawg_project::ClipContent::Automation { .. })).unwrap().clone();
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let row = |h: &Harness, track| h.app.project.tracks.iter().position(|t| t.id == track).unwrap();
+    // right-click › Split here, on the sample at beat 2 (0.5 s) and on the ramp at bar 4
+    let split_here = |h: &mut Harness, tick: i64, row: usize| {
+        let p = super::playlist::lane_point(&h.app.playlist, surface, tick, row);
+        h.click_at(p, egui::PointerButton::Secondary);
+        h.frame(vec![]);
+        let entry = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Split here")).map(|(_, r)| r).expect("Split here");
+        h.click_at(entry.center(), egui::PointerButton::Primary);
+    };
+    let audio_row = row(&h, audio.track_id);
+    split_here(&mut h, 960, audio_row);
+    let halves: Vec<rawdawg_project::Clip> = h.app.project.clips.iter().filter(|c| c.track_id == audio.track_id).cloned().collect();
+    assert_eq!(halves.len(), 2, "split in two");
+    let bounds = |c: &rawdawg_project::Clip| match &c.content {
+        rawdawg_project::ClipContent::Audio { source_offset_frames, source_length_frames, fade_in_frames, fade_out_frames, .. } => {
+            (*source_offset_frames, *source_length_frames, *fade_in_frames, *fade_out_frames)
+        }
+        _ => unreachable!(),
+    };
+    let (l, r) = if halves[0].start_tick.0 == 0 { (&halves[0], &halves[1]) } else { (&halves[1], &halves[0]) };
+    assert_eq!(bounds(l), (0, 24_000, 480, 0), "the left half's sample ends at the split, it keeps the fade-in");
+    assert_eq!(bounds(r), (24_000, 24_000, 0, 4_800), "the right half continues from there with the fade-out");
+    let auto_row = row(&h, auto.track_id);
+    split_here(&mut h, 3 * 3840, auto_row);
+    let ramps: Vec<i64> = h
+        .app
+        .project
+        .clips
+        .iter()
+        .filter_map(|c| match &c.content {
+            rawdawg_project::ClipContent::Automation { source_offset_ticks, .. } => Some(source_offset_ticks.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ramps.len(), 2);
+    assert!(ramps.contains(&0) && ramps.contains(&3840), "the second half of the ramp continues it: {ramps:?}");
+    // the song renders the same as before the splits
+    let after = render(&h.app.project);
+    assert_eq!(before.len(), after.len());
+    let worst = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 1e-4, "splits are inaudible: largest difference {worst}");
+    // a split after the sample has ended (the clip runs on in silence) only trims the clip
+    h.app.undo();
+    h.app.undo();
+    let clips = h.app.project.clips.len();
+    split_here(&mut h, 2400, audio_row);
+    assert_eq!(h.app.project.clips.len(), clips, "nothing to the right but silence: no new clip");
+    let trimmed = h.app.project.clips.iter().find(|c| c.id == audio.id).unwrap();
+    assert_eq!(bounds(trimmed), (0, 48_000, 480, 4_800), "the whole sample, once");
+    assert_eq!(render(&h.app.project), before, "still the same sound");
+}
+
+#[test]
+fn transpose_and_voices_show_and_take_their_real_values() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.app.synth_panel.advanced = true;
+    h.frame(vec![]);
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    let label = h.scroll_into_view("Transpose", |h| h.node("Transpose"));
+    let row: Vec<(String, egui::Rect)> = h.drawn_nodes().into_iter().filter(|(_, r)| (r.center().y - label.center().y).abs() < 6.0 && r.left() > label.right()).collect();
+    assert!(row.iter().any(|(t, _)| t == "+0 st"), "the readout says +0 st: {row:?}");
+    let value = row.iter().filter(|(t, _)| t == "0").map(|(_, r)| *r).next().expect("the slider's value box shows 0, not 48");
+    // type 12 into it, as a user does
+    h.click_at(value.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    for _ in 0..4 {
+        h.key(egui::Key::Backspace, egui::Modifiers::NONE);
+    }
+    h.frame(vec![egui::Event::Text("12".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    h.frame(vec![]);
+    assert_eq!(saved(&h).tuning.transpose_semitones, 12, "an octave up, not three octaves down");
+    let label = h.node("Transpose").unwrap();
+    assert!(h.drawn_nodes().into_iter().any(|(t, r)| t == "+12 st" && (r.center().y - label.center().y).abs() < 6.0));
+    // Voices reads 32, the voice count the project stores
+    let voices = h.scroll_into_view("Voices", |h| h.node("Voices"));
+    let row: Vec<String> = h.drawn_nodes().into_iter().filter(|(_, r)| (r.center().y - voices.center().y).abs() < 6.0).map(|(t, _)| t).collect();
+    assert!(row.iter().any(|t| t == "32"), "{row:?}");
+    assert!(!row.iter().any(|t| t == "31"));
+}
+
+#[test]
+fn export_creates_a_folder_typed_with_the_name() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-export-folder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(480), pitch: 60, velocity: 0.8, channel: 0 }],
+    });
+    h.app.project_path = Some(root.clone());
+    h.app.export.song = false;
+    h.app.export.open = true;
+    h.frame(vec![]);
+    h.app.export.path = "mixes/bounces/final".into();
+    // MIDI
+    super::export::request_midi(&mut h.app);
+    assert!(root.join("mixes/bounces/final.mid").is_file(), "{:?}", h.app.export.last_result);
+    // audio, on its worker
+    std::fs::remove_dir_all(root.join("mixes")).unwrap();
+    h.app.export.tail_seconds = 0.0;
+    super::export::request_audio(&mut h.app);
+    for _ in 0..2000 {
+        super::export::poll(&mut h.app);
+        if !h.app.export.running() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let wav = root.join("mixes/bounces/final.wav");
+    assert!(wav.is_file(), "{:?}", h.app.export.last_result);
+    assert!(h.app.export.last_result.as_deref().is_some_and(|r| !r.starts_with("Export failed")), "{:?}", h.app.export.last_result);
+    let _ = std::fs::remove_dir_all(&root);
+}

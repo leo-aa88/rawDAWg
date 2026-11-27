@@ -336,6 +336,16 @@ fn hosted_readouts_are_the_plugins_own_text_and_discrete_parameters_keep_their_s
             }
         }
         assert_eq!(inst.param_text(rawdawg_types::ParamId(0xDEAD_BEEF), 0.5), None, "unknown ids have no text");
+        if exported.is_synth() {
+            // what another host shows for the synth's choices and counts (issue #28)
+            use rawdawg_synthesizer::params as sp;
+            let text = |id: u32, n: f32| inst.param_text(rawdawg_types::ParamId(id), n);
+            assert_eq!(text(sp::FILTER_MODE, 0.0).as_deref(), Some("Low-pass"));
+            assert_eq!(text(sp::VOICE_MODE, 1.0).as_deref(), Some("Legato"));
+            assert_eq!(text(sp::TRANSPOSE, 0.5).as_deref(), Some("+0 st"));
+            assert_eq!(text(sp::MAX_VOICES, 31.0 / 63.0).as_deref(), Some("32"));
+            assert_eq!(text(sp::layer_param(0, sp::L_WAVE), 2.0 / 3.0).as_deref(), Some("Saw"));
+        }
     }
     assert!(discrete >= 20, "discrete read-backs checked: {discrete}");
     assert_eq!(stepped_ranges, 2, "limiter lookahead and reverb shimmer pitch");

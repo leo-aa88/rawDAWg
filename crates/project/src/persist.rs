@@ -220,7 +220,9 @@ pub fn recovery_candidates(dir: &Path) -> Vec<RecoveryCandidate> {
             let Ok(bytes) = fs::read(&path) else { continue };
             let Ok(p) = parse_project(&bytes) else { continue };
             let ts = name.split('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
-            let newer = p.revision > saved_rev || saved_ms.is_none_or(|ms| ts > ms);
+            // by time with a second's margin: file times come from a coarse clock that can lag
+            // the autosave's own stamp by milliseconds (the revision rule needs no margin)
+            let newer = p.revision > saved_rev || saved_ms.is_none_or(|ms| ts > ms + 1000);
             let differs = saved.as_ref().is_none_or(|s| !crate::compare::describe_changes(s, &p).is_empty());
             if newer && differs {
                 out.push(RecoveryCandidate { path, revision: p.revision, saved_unix_ms: ts, autosave: true });

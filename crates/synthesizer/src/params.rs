@@ -149,6 +149,17 @@ pub fn decode_layer_param(id: u32) -> Option<(usize, u32)> {
     }
 }
 
+/// Names of the choices, in step order (the app's menus and other hosts show them; a test keeps
+/// them equal to the enums' own labels).
+pub const FILTER_MODE_LABELS: &[&str] = &["Low-pass", "High-pass", "Band-pass", "Notch"];
+pub const VOICE_MODE_LABELS: &[&str] = &["Poly", "Mono", "Legato"];
+pub const WAVE_LABELS: &[&str] = &["Sine", "Triangle", "Saw", "Pulse"];
+pub const GENERATOR_LABELS: &[&str] = &["Basic", "Wavetable", "FM", "Additive", "Granular", "Pluck"];
+pub const FM_ALGORITHM_LABELS: &[&str] = &["Serial 4>3>2>1", "Pairs (2>1)+(4>3)", "Fan 2,3,4>1", "Parallel"];
+pub const GRAIN_WINDOW_LABELS: &[&str] = &["Hann", "Triangle", "Rectangular"];
+pub const PLUCK_EXCITATION_LABELS: &[&str] = &["Noise", "Impulse", "Pick"];
+pub const LFO_SHAPE_LABELS: &[&str] = &["Sine", "Triangle", "Saw", "Square", "Sample & hold"];
+
 const fn time(id: u32, key: &'static str, name: &'static str, default_n: f32, cat: ParamCategory) -> ParamDescriptor {
     ParamDescriptor::continuous(id, key, name, ParamUnit::Seconds, ParamMapping::LogWithZero { min: 0.001, max: 30.0 }, default_n, cat).with_smoothing(0.0)
 }
@@ -163,7 +174,9 @@ const GLOBAL: [ParamDescriptor; 23] = [
     time(AMP_RELEASE, "amp.release", "Release", 0.0, ParamCategory::Envelope),
     ParamDescriptor::continuous(FILTER_CUTOFF, "filter.cutoff", "Cutoff", ParamUnit::Hertz, ParamMapping::Log { min: 20.0, max: 20_000.0 }, 1.0, ParamCategory::Filter),
     ParamDescriptor::continuous(FILTER_RESONANCE, "filter.resonance", "Resonance", ParamUnit::None, ParamMapping::Log { min: 0.5, max: 20.0 }, 0.0, ParamCategory::Filter),
-    ParamDescriptor::continuous(FILTER_MODE, "filter.mode", "Filter Type", ParamUnit::None, ParamMapping::Discrete { steps: 4 }, 0.0, ParamCategory::Filter).stepped(),
+    ParamDescriptor::continuous(FILTER_MODE, "filter.mode", "Filter Type", ParamUnit::None, ParamMapping::Discrete { steps: 4 }, 0.0, ParamCategory::Filter)
+        .stepped()
+        .with_labels(FILTER_MODE_LABELS),
     ParamDescriptor::continuous(FILTER_ENV_AMOUNT, "filter.env_amount", "Filter Env", ParamUnit::None, ParamMapping::Linear { min: -8.0, max: 8.0 }, 0.5, ParamCategory::Filter),
     ParamDescriptor::continuous(FILTER_KEYTRACK, "filter.key_track", "Key Track", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 1.0 }, 0.0, ParamCategory::Filter),
     ParamDescriptor::continuous(FILTER_ENABLED, "filter.enabled", "Filter On", ParamUnit::None, ParamMapping::Toggle, 1.0, ParamCategory::Filter).stepped(),
@@ -172,13 +185,20 @@ const GLOBAL: [ParamDescriptor; 23] = [
     ParamDescriptor::continuous(FENV_SUSTAIN, "fenv.sustain", "Filter Sustain", ParamUnit::Percent, ParamMapping::Linear { min: 0.0, max: 1.0 }, 0.0, ParamCategory::Filter)
         .with_smoothing(0.0),
     time(FENV_RELEASE, "fenv.release", "Filter Release", 0.0, ParamCategory::Filter),
-    ParamDescriptor::continuous(VOICE_MODE, "voice.mode", "Voice Mode", ParamUnit::None, ParamMapping::Discrete { steps: 3 }, 0.0, ParamCategory::Topology).stepped(),
+    ParamDescriptor::continuous(VOICE_MODE, "voice.mode", "Voice Mode", ParamUnit::None, ParamMapping::Discrete { steps: 3 }, 0.0, ParamCategory::Topology)
+        .stepped()
+        .with_labels(VOICE_MODE_LABELS),
     ParamDescriptor::continuous(PORTAMENTO, "voice.portamento", "Glide", ParamUnit::Seconds, ParamMapping::LogWithZero { min: 0.005, max: 10.0 }, 0.0, ParamCategory::Pitch)
         .with_smoothing(0.0),
     ParamDescriptor::continuous(BEND_RANGE, "tuning.bend_range", "Bend Range", ParamUnit::Semitones, ParamMapping::Discrete { steps: 49 }, 2.0 / 48.0, ParamCategory::Pitch)
         .stepped(),
-    ParamDescriptor::continuous(MAX_VOICES, "voice.max", "Voices", ParamUnit::None, ParamMapping::Discrete { steps: 64 }, 31.0 / 63.0, ParamCategory::Topology).stepped(),
-    ParamDescriptor::continuous(TRANSPOSE, "tuning.transpose", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Pitch).stepped(),
+    // steps 0…63 are 1…64 voices; steps 0…96 are −48…+48 semitones
+    ParamDescriptor::continuous(MAX_VOICES, "voice.max", "Voices", ParamUnit::None, ParamMapping::Discrete { steps: 64 }, 31.0 / 63.0, ParamCategory::Topology)
+        .stepped()
+        .with_display_offset(1),
+    ParamDescriptor::continuous(TRANSPOSE, "tuning.transpose", "Transpose", ParamUnit::Semitones, ParamMapping::Discrete { steps: 97 }, 0.5, ParamCategory::Pitch)
+        .stepped()
+        .with_display_offset(-48),
     ParamDescriptor::continuous(DETUNE, "tuning.detune", "Detune", ParamUnit::Cents, ParamMapping::Linear { min: -100.0, max: 100.0 }, 0.5, ParamCategory::Pitch),
     ParamDescriptor::continuous(CC74_BRIGHTNESS, "midi.cc74_brightness", "CC 74 → brightness (MPE)", ParamUnit::None, ParamMapping::Toggle, 0.0, ParamCategory::Routing).stepped(),
 ];
@@ -205,7 +225,8 @@ macro_rules! layer_block {
                 0.0,
                 ParamCategory::Wave,
             )
-            .stepped(),
+            .stepped()
+            .with_labels(WAVE_LABELS),
             ParamDescriptor::continuous(
                 LAYER_BASE + $l * LAYER_STRIDE + L_PULSE_WIDTH,
                 concat!("layer", $l, ".pulse_width"),
@@ -242,7 +263,8 @@ macro_rules! layer_block {
                 0.5,
                 ParamCategory::Pitch,
             )
-            .stepped(),
+            .stepped()
+            .with_display_offset(-48),
             ParamDescriptor::continuous(
                 LAYER_BASE + $l * LAYER_STRIDE + L_FINE,
                 concat!("layer", $l, ".fine"),
@@ -271,7 +293,8 @@ macro_rules! layer_block {
                 0.0,
                 ParamCategory::Wave,
             )
-            .stepped(),
+            .stepped()
+            .with_display_offset(1),
             ParamDescriptor::continuous(
                 LAYER_BASE + $l * LAYER_STRIDE + L_UNISON_DETUNE,
                 concat!("layer", $l, ".unison_detune"),
@@ -309,6 +332,7 @@ macro_rules! layer_block {
                 ParamCategory::Topology,
             )
             .stepped()
+            .with_labels(GENERATOR_LABELS)
             .read_only(),
         ]
     };
@@ -407,7 +431,8 @@ macro_rules! gen_block {
                 0.0,
                 ParamCategory::Topology,
             )
-            .stepped(),
+            .stepped()
+            .with_labels(FM_ALGORITHM_LABELS),
             ParamDescriptor::continuous(
                 GEN_BASE + $l * GEN_STRIDE + G_ADD_STRETCH,
                 concat!("layer", $l, ".add.stretch"),
@@ -472,7 +497,8 @@ macro_rules! gen_block {
                 0.0,
                 ParamCategory::Wave,
             )
-            .stepped(),
+            .stepped()
+            .with_labels(GRAIN_WINDOW_LABELS),
             ParamDescriptor::continuous(
                 GEN_BASE + $l * GEN_STRIDE + G_PLUCK_DAMPING,
                 concat!("layer", $l, ".pluck.damping"),
@@ -500,7 +526,8 @@ macro_rules! gen_block {
                 0.0,
                 ParamCategory::Wave,
             )
-            .stepped(),
+            .stepped()
+            .with_labels(PLUCK_EXCITATION_LABELS),
         ]
     };
 }
@@ -517,7 +544,8 @@ macro_rules! lfo_block {
                 0.0,
                 ParamCategory::Modulation,
             )
-            .stepped(),
+            .stepped()
+            .with_labels(LFO_SHAPE_LABELS),
             ParamDescriptor::continuous(
                 LFO_BASE + $n * LFO_STRIDE + LFO_RATE,
                 concat!("lfo", $n, ".rate"),
@@ -702,6 +730,38 @@ pub static DESCRIPTORS: [ParamDescriptor; DESCRIPTOR_COUNT] = concat_all();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choices_are_named_like_the_sound_and_counts_read_their_real_values() {
+        use crate::patch::{FmAlgorithm, Generator, LfoShape};
+        let names = |v: Vec<&'static str>| v;
+        assert_eq!(FILTER_MODE_LABELS, names(rawdawg_dsp::filter::FilterMode::ALL.iter().map(|m| m.label()).collect()).as_slice());
+        assert_eq!(VOICE_MODE_LABELS, names(crate::patch::VoiceMode::ALL.iter().map(|m| m.label()).collect()).as_slice());
+        assert_eq!(WAVE_LABELS, names(rawdawg_dsp::oscillator::BasicWave::ALL.iter().map(|w| w.label()).collect()).as_slice());
+        assert_eq!(GENERATOR_LABELS, Generator::KINDS.as_slice());
+        assert_eq!(FM_ALGORITHM_LABELS, names(FmAlgorithm::ALL.iter().map(|a| a.label()).collect()).as_slice());
+        assert_eq!(LFO_SHAPE_LABELS, names(LfoShape::ALL.iter().map(|s| s.label()).collect()).as_slice());
+        let d = |id: u32| DESCRIPTORS.iter().find(|d| d.id.0 == id).unwrap();
+        // what a host or the Advanced view shows at the defaults
+        assert_eq!(d(TRANSPOSE).format(d(TRANSPOSE).default_normalized), "+0 st");
+        assert_eq!(d(MAX_VOICES).format(d(MAX_VOICES).default_normalized), "32");
+        assert_eq!(d(FILTER_MODE).format(0.0), "Low-pass");
+        assert_eq!(d(layer_param(0, L_COARSE)).format(0.5), "+0 st");
+        assert_eq!(d(layer_param(0, L_UNISON)).format(0.0), "1");
+        assert_eq!(d(layer_param(1, L_WAVE)).format(1.0), "Pulse");
+        // typing a real value sets that value in the sound
+        let mut synth = crate::Synth::default();
+        use rawdawg_dsp::processor::{PrepareSpec, Processor};
+        // prepared as the engine does (its voice pool is allocated then, off the audio thread)
+        synth.prepare(&PrepareSpec::new(48_000.0, 256, rawdawg_dsp::BusLayout::Stereo)).unwrap();
+        let up = d(TRANSPOSE).parse("12").unwrap();
+        synth.set_param(rawdawg_types::ParamId(TRANSPOSE), up);
+        assert_eq!(synth.patch().tuning.transpose_semitones, 12, "an octave up, not three down");
+        synth.set_param(rawdawg_types::ParamId(MAX_VOICES), d(MAX_VOICES).parse("8").unwrap());
+        assert_eq!(synth.patch().max_voices, 8);
+        synth.set_param(rawdawg_types::ParamId(FILTER_MODE), d(FILTER_MODE).parse("Notch").unwrap());
+        assert_eq!(synth.patch().filter.mode, rawdawg_dsp::filter::FilterMode::Notch);
+    }
     use std::collections::HashSet;
 
     #[test]

@@ -348,6 +348,16 @@ fn hosted_readouts_are_the_plugins_own_text_and_steps_match_the_native_parameter
             }
         }
         assert_eq!(inst.param_text(rawdawg_types::ParamId(0xDEAD_BEEF), 0.5), None, "unknown ids have no text");
+        if exported.is_synth() {
+            // what another host shows for the synth's choices and counts (issue #28)
+            use rawdawg_synthesizer::params as sp;
+            let text = |id: u32, n: f32| inst.param_text(rawdawg_types::ParamId(id), n);
+            assert_eq!(text(sp::FILTER_MODE, 0.0).as_deref(), Some("Low-pass"));
+            assert_eq!(text(sp::VOICE_MODE, 1.0).as_deref(), Some("Legato"));
+            assert_eq!(text(sp::TRANSPOSE, 0.5).as_deref(), Some("+0 st"));
+            assert_eq!(text(sp::MAX_VOICES, 31.0 / 63.0).as_deref(), Some("32"));
+            assert_eq!(text(sp::layer_param(0, sp::L_WAVE), 2.0 / 3.0).as_deref(), Some("Saw"));
+        }
         // a state load forgets cached readouts and still answers afterwards
         let saved = inst.save_state();
         inst.load_state(&saved).expect("reload own state");
@@ -356,5 +366,7 @@ fn hosted_readouts_are_the_plugins_own_text_and_steps_match_the_native_parameter
     }
     assert!(discrete >= 30, "step mappings checked: {discrete}");
     assert!(readouts > 500, "readouts checked: {readouts}");
-    assert!(with_units > 0 && with_units < readouts / 4, "unit labels appended to bare numbers: {with_units}");
+    // the unit is added only to bare numbers (checked per readout above); rawDAWg's own plugins
+    // show their stepped counts with units now (Transpose "+0 st", not "48"), so few or none need it
+    assert!(with_units < readouts / 4, "unit labels appended to bare numbers: {with_units}");
 }

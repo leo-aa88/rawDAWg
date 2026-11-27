@@ -186,6 +186,14 @@ pub(crate) fn place_audio_clip(app: &mut App, asset_id: &AssetId, track: TrackId
     Some(id)
 }
 
+/// Source frames per project frame of an audio clip (its asset's rate over the project's, times its playback rate).
+fn audio_rate_of(app: &App, c: &Clip) -> f64 {
+    match &c.content {
+        ClipContent::Audio { asset_id, playback_rate, .. } => audio_rate(app, asset_id, *playback_rate),
+        _ => 1.0,
+    }
+}
+
 /// Re-derive an audio clip's source bounds from its (edited) tick bounds: the end edge sets
 /// the source length, the start edge shifts the source offset. Pattern/automation clips are
 /// returned unchanged.
@@ -1164,15 +1172,47 @@ fn split_clips_at(app: &mut App, cmds: &mut Vec<Command>, clips: &[Clip], at: i6
         if at <= c.start_tick.0 || at >= c.end_tick().0 {
             continue;
         }
-        let left = Clip { length_ticks: Tick(at - c.start_tick.0), ..c.clone() };
         let shift = at - c.start_tick.0;
+        // the right half continues where the left half stops: its source starts `shift` later
         let content = match &c.content {
             ClipContent::Pattern { pattern_id, source_offset_ticks, looped } => {
                 ClipContent::Pattern { pattern_id: *pattern_id, source_offset_ticks: Tick(source_offset_ticks.0 + shift), looped: *looped }
             }
+            ClipContent::Automation { curve_id, source_offset_ticks, looped } => {
+                ClipContent::Automation { curve_id: *curve_id, source_offset_ticks: Tick(source_offset_ticks.0 + shift), looped: *looped }
+            }
             other => other.clone(),
         };
+        let left = Clip { length_ticks: Tick(shift), ..c.clone() };
         let right = Clip { id: ClipId::new(), start_tick: Tick(at), length_ticks: Tick(c.end_tick().0 - at), content, ..c.clone() };
+        // an audio clip plays its source range: the two halves divide that range at the split
+        // (in source frames, through the tempo and the playback rate); the fades stay at the
+        // outer ends, none at the cut
+        let (left, right) = match &c.content {
+            ClipContent::Audio { asset_id, source_offset_frames, source_length_frames, gain_db, fade_in_frames, fade_out_frames, playback_rate } => {
+                let cut = (ticks_to_frames(app, c.start_tick.0, shift) * audio_rate_of(app, &c)).round().max(0.0) as u64;
+                if cut >= *source_length_frames {
+                    // the sample ends before the split: nothing to its right but silence
+                    batch.push(Command::UpdateClip { clip: left });
+                    continue;
+                }
+                let audio = |offset: u64, length: u64, fade_in: u64, fade_out: u64| ClipContent::Audio {
+                    asset_id: asset_id.clone(),
+                    source_offset_frames: offset,
+                    source_length_frames: length,
+                    gain_db: *gain_db,
+                    fade_in_frames: fade_in.min(length),
+                    fade_out_frames: fade_out.min(length),
+                    playback_rate: *playback_rate,
+                };
+                let rest = source_length_frames - cut;
+                (
+                    Clip { content: audio(*source_offset_frames, cut, *fade_in_frames, 0), ..left },
+                    Clip { content: audio(source_offset_frames + cut, rest, 0, *fade_out_frames), ..right },
+                )
+            }
+            _ => (left, right),
+        };
         app.playlist.selection.insert(right.id);
         batch.push(Command::UpdateClip { clip: left });
         batch.push(Command::AddClip { clip: right });
