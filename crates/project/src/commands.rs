@@ -713,9 +713,15 @@ impl Command {
                 }
                 let channel = p.mixer.channels.remove(idx);
                 let inserts: Vec<InstanceId> = channel.inserts.iter().map(|i| i.id).collect();
-                let mut cmds = vec![Command::AddMixerChannel { channel, index: Some(idx) }];
+                // each insert's restores snapshot what was left after the previous insert went:
+                // apply the latest first, so the first (complete) MIDI mapping list wins
+                let mut restores = Vec::new();
                 for i in inserts {
-                    cmds.append(&mut orphan_references(p, i));
+                    restores.push(orphan_references(p, i));
+                }
+                let mut cmds = vec![Command::AddMixerChannel { channel, index: Some(idx) }];
+                for mut r in restores.into_iter().rev() {
+                    cmds.append(&mut r);
                 }
                 if cmds.len() == 1 { Ok(cmds.pop().unwrap()) } else { Ok(Command::Batch { commands: cmds }) }
             }
@@ -972,7 +978,21 @@ impl Command {
             Command::RemoveAssetInternal { .. } => "Remove asset",
             Command::SetMidiMappings { .. } => "MIDI mappings",
             Command::ReplaceAsset { .. } => "Relink asset",
-            Command::Batch { .. } => "Edit",
+            // a batch is named by what it does to the arrangement's structure, if anything
+            Command::Batch { commands } => {
+                let has = |f: fn(&Command) -> bool| commands.iter().any(f);
+                if has(|c| matches!(c, Command::RemoveChannel { .. })) {
+                    "Delete channel"
+                } else if has(|c| matches!(c, Command::AddChannel { .. })) {
+                    "Add channel"
+                } else if has(|c| matches!(c, Command::RemoveMixerChannel { .. })) {
+                    "Delete mixer channel"
+                } else if has(|c| matches!(c, Command::AddMixerChannel { .. })) {
+                    "Add mixer channel"
+                } else {
+                    "Edit"
+                }
+            }
         }
     }
 }

@@ -57,8 +57,7 @@ pub(crate) struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        // a different sequence every launch (the status line shows each seed, so a sound can
-        // still be found again)
+        // a different sequence every launch (the status line shows each seed used)
         Self { chaos: 35.0, locks: Locks::default(), seed_counter: launch_entropy(), show_evolve: true, match_levels: true, ..Default::default() }
     }
 }

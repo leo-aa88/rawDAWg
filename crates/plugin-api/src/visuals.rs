@@ -249,43 +249,39 @@ impl EditorVisual for SynthVisual {
         let (fc, q, mode, filter_on) = (v(sp::FILTER_CUTOFF), v(sp::FILTER_RESONANCE), v(sp::FILTER_MODE) as usize, v(sp::FILTER_ENABLED) >= 0.5);
         let width = ui.available_width().max(300.0);
         let half = width * 0.5 - 6.0;
-        let (env_drag, filt_rect) = ui
+        let (env_drag, env_rect, filt_rect) = ui
             .horizontal(|ui| {
                 let adsr = rawdawg_ui::envelope::Adsr { attack_s: a, decay_s: d, sustain: s, release_s: r };
-                let drag = ui
-                    .allocate_ui(egui::vec2(half, 150.0), |ui| {
-                        ui.set_width(half);
-                        rawdawg_ui::envelope::editor(ui, envelope_canvas_id(), &adsr, 150.0)
-                    })
-                    .inner;
+                let env = ui.allocate_ui(egui::vec2(half, 150.0), |ui| {
+                    ui.set_width(half);
+                    rawdawg_ui::envelope::editor(ui, envelope_canvas_id(), &adsr, 150.0)
+                });
                 let (_, filt) = ui.allocate_space(egui::vec2(half, 150.0));
-                (drag, filt)
+                (env.inner, env.response.rect, filt)
             })
             .inner;
         // amp envelope: the dragged point's parameters follow the pointer (one gesture each)
         if let Some(drag) = env_drag {
             use rawdawg_ui::envelope::AdsrPoint;
-            let moves: &[(u32, f32)] = &match drag.point {
-                AdsrPoint::Attack => [(sp::AMP_ATTACK, drag.dx), (0, 0.0)],
-                AdsrPoint::Decay => [(sp::AMP_DECAY, drag.dx), (sp::AMP_SUSTAIN, drag.dy)],
-                AdsrPoint::Sustain => [(sp::AMP_SUSTAIN, drag.dy), (0, 0.0)],
-                AdsrPoint::Release => [(sp::AMP_RELEASE, drag.dx), (0, 0.0)],
+            let v = drag.value;
+            let moves: Vec<(u32, f32)> = match drag.point {
+                AdsrPoint::Attack => vec![(sp::AMP_ATTACK, v.attack_s)],
+                AdsrPoint::Decay => vec![(sp::AMP_DECAY, v.decay_s), (sp::AMP_SUSTAIN, v.sustain)],
+                AdsrPoint::Sustain => vec![(sp::AMP_SUSTAIN, v.sustain)],
+                AdsrPoint::Release => vec![(sp::AMP_RELEASE, v.release_s)],
             };
-            for &(pid, delta) in moves.iter().filter(|(pid, _)| *pid != 0) {
+            for (pid, physical) in moves {
                 let Some(dsc) = descriptor(port, pid) else { continue };
                 if drag.started {
                     out.push(VisualEdit::Begin(dsc.id));
                 }
-                if delta != 0.0
-                    && let Some(n) = port.value(dsc.id)
-                {
-                    out.push(VisualEdit::Set(dsc.id, (n + delta).clamp(0.0, 1.0)));
-                }
+                out.push(VisualEdit::Set(dsc.id, dsc.to_normalized(f64::from(physical)).clamp(0.0, 1.0)));
                 if drag.stopped {
                     out.push(VisualEdit::End(dsc.id));
                 }
             }
         }
+        ui.painter().text(env_rect.left_top() + egui::vec2(16.0, 1.0), egui::Align2::LEFT_TOP, "Amp envelope", egui::FontId::proportional(10.0), theme::TEXT_SECONDARY);
         // filter
         let filt_resp = ui.interact(filt_rect, filter_canvas_id(), egui::Sense::drag());
         let painter = ui.painter_at(filt_rect);

@@ -177,6 +177,38 @@ mod tests {
     }
 
     #[test]
+    fn undo_brings_back_the_midi_mappings_of_every_effect_on_a_deleted_strip() {
+        let mut p = Project::new_default("t", serde_json::json!({}));
+        let mut h = History::new();
+        let mut bus = strip("Bus", Some(p.mixer.master_id));
+        let fx: Vec<Instance> = (0..3).map(|_| Instance::native("native.fx.gain", serde_json::Value::Null)).collect();
+        bus.inserts.extend(fx.iter().cloned());
+        h.apply(&mut p, Command::AddMixerChannel { channel: bus.clone(), index: None }).unwrap();
+        // one mapping per effect, and one elsewhere that must survive anyway
+        let other = p.channels[0].instrument.id;
+        let mapping = |instance_id, cc| MidiMapping {
+            id: MappingId::new(),
+            device: None,
+            channel: None,
+            cc,
+            target: AutomationTarget { instance_id, param_id: 0 },
+            min: 0.0,
+            max: 1.0,
+            invert: false,
+        };
+        let mut mappings: Vec<MidiMapping> = fx.iter().enumerate().map(|(i, f)| mapping(f.id, 20 + i as u8)).collect();
+        mappings.push(mapping(other, 7));
+        h.apply(&mut p, Command::SetMidiMappings { mappings: mappings.clone() }).unwrap();
+        let before = p.clone();
+        let (cmd, _) = remove_mixer_channel(&p, bus.id).unwrap();
+        h.apply(&mut p, cmd).unwrap();
+        assert_eq!(p.midi_mappings.len(), 1, "only the mapping of something else stays");
+        h.undo(&mut p).unwrap();
+        assert_eq!(p.midi_mappings, mappings, "all three effects' mappings are back");
+        assert_eq!(p, before);
+    }
+
+    #[test]
     fn deleting_a_channel_takes_its_own_strip_but_never_a_shared_one() {
         let mut p = Project::new_default("t", serde_json::json!({}));
         let mut h = History::new();

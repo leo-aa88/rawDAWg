@@ -174,11 +174,22 @@ fn the_synth_window_shapes_the_envelope_and_the_filter_and_ends_gestures_on_clos
     let release_handle = point_pos(env, &adsr(&port), AdsrPoint::Release);
     d.drag(release_handle, release_handle + vec2(-40.0, 0.0));
     assert!(port.phys(sp::AMP_RELEASE) < before, "dragging the end left shortens the release: {before} → {}", port.phys(sp::AMP_RELEASE));
-    // attack longer: its peak to the right
+    // attack longer: its peak follows the pointer 30 px to the right
     let before = port.phys(sp::AMP_ATTACK);
     let attack_handle = point_pos(env, &adsr(&port), AdsrPoint::Attack);
     d.drag(attack_handle, attack_handle + vec2(30.0, 0.0));
     assert!(port.phys(sp::AMP_ATTACK) > before, "attack {before} → {}", port.phys(sp::AMP_ATTACK));
+    let now = point_pos(env, &adsr(&port), AdsrPoint::Attack);
+    assert!((now.x - (attack_handle.x + 30.0)).abs() < 1.5, "the peak is where it was dropped: {now:?} vs {attack_handle:?} + 30");
+    assert!(port.gestures_balanced(), "{:?}", port.0.log.borrow());
+    // the decay point moves two parameters in one gesture each, both ended
+    port.0.log.borrow_mut().clear();
+    let decay_handle = point_pos(env, &adsr(&port), AdsrPoint::Decay);
+    d.drag(decay_handle, decay_handle + vec2(25.0, 20.0));
+    let now = point_pos(env, &adsr(&port), AdsrPoint::Decay);
+    assert!(now.distance(decay_handle + vec2(25.0, 20.0)) < 1.5, "{now:?}");
+    let begins = port.0.log.borrow().iter().filter(|(k, _)| *k == 'b').count();
+    assert_eq!(begins, 2, "decay and sustain: {:?}", port.0.log.borrow());
     assert!(port.gestures_balanced(), "{:?}", port.0.log.borrow());
     // the filter handle: left lowers the cutoff
     let filt = d.rect(filter_canvas_id());
@@ -201,4 +212,15 @@ fn the_synth_window_shapes_the_envelope_and_the_filter_and_ends_gestures_on_clos
     assert!(port.0.log.borrow().iter().any(|(k, _)| *k == 'b'), "a gesture is open");
     d.ui = None;
     assert!(port.gestures_balanced(), "closing ended it: {:?}", port.0.log.borrow());
+    // the same for an envelope point holding two parameters (decay and sustain)
+    let mut d = Driver::new("rawdawg.synth", port.clone());
+    let env = curve_rect(d.rect(envelope_canvas_id()));
+    let decay = point_pos(env, &adsr(&port), AdsrPoint::Decay);
+    port.0.log.borrow_mut().clear();
+    d.frame(vec![egui::Event::PointerMoved(decay)]);
+    d.button(decay, egui::PointerButton::Primary, true);
+    d.frame(vec![egui::Event::PointerMoved(decay + vec2(10.0, 5.0))]);
+    assert_eq!(port.0.log.borrow().iter().filter(|(k, _)| *k == 'b').count(), 2, "two gestures open: {:?}", port.0.log.borrow());
+    d.ui = None;
+    assert!(port.gestures_balanced(), "closing ended both: {:?}", port.0.log.borrow());
 }

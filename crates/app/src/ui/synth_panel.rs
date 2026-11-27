@@ -281,6 +281,14 @@ fn generator_name(g: &Generator) -> &'static str {
     }
 }
 
+/// What a readout adds after its value: locked for randomize, its MIDI controller, MIDI learn.
+fn param_badges(app: &App, instance_id: InstanceId, pid: u32) -> String {
+    let locked = app.synth_panel.evolve.locks.params.contains(&pid);
+    let cc = app.midi_mapping_for(instance_id, pid).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
+    let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == pid);
+    format!("{}{cc}{}", if locked { " 🔒" } else { "" }, if learning { " learn…" } else { "" })
+}
+
 /// Level in percent of full scale for a level in dB (−60 dB and below read 0 %).
 fn level_percent(db: f32) -> f32 {
     if db <= -60.0 { 0.0 } else { 100.0 * 10f32.powf(db / 20.0) }
@@ -357,20 +365,20 @@ fn oscillators(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits:
             let coarse = param(app, i, params::L_COARSE).map_or(layer.coarse_semitones, |p| p.2.round() as i32 - 48);
             ui.horizontal(|ui| {
                 let mut step = 0;
-                if ui.small_button("−").on_hover_text("One octave down").clicked() {
+                if ui.add_enabled(coarse - 12 >= -48, egui::Button::new("−").small()).on_hover_text("One octave down").clicked() {
                     step = -12;
                 }
                 let rest = coarse - 12 * (coarse / 12);
                 let text = if rest == 0 { format!("{:+}", coarse / 12) } else { format!("{:+} {rest:+}st", coarse / 12) };
                 ui.label(egui::RichText::new(text.replace("+0", "0")).monospace());
-                if ui.small_button("+").on_hover_text("One octave up").clicked() {
+                if ui.add_enabled(coarse + 12 <= 48, egui::Button::new("+").small()).on_hover_text("One octave up").clicked() {
                     step = 12;
                 }
                 if step != 0
                     && let Some((pid, ..)) = param(app, i, params::L_COARSE)
                 {
                     let d = desc(pid).expect("coarse parameter");
-                    edits.push((ParamId(pid), d.to_normalized(f64::from((coarse + step).clamp(-48, 48) + 48)), true, true));
+                    edits.push((ParamId(pid), d.to_normalized(f64::from(coarse + step + 48)), true, true));
                 }
             });
             // detune in cents
@@ -381,27 +389,25 @@ fn oscillators(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, edits:
                 let d = desc(pid);
                 unit_slider(app, ui, instance_id, &format!("OSC {} Detune", i + 1), pid, cents, -100.0..=100.0, |c| d.map_or(0.5, |d| d.to_normalized(f64::from(c))), edits)
                     .on_hover_text("Fine detune in cents (right-click: reset, automation, MIDI learn)");
-                ui.label(egui::RichText::new(format!("{:+.0} cents", cents)).monospace());
+                ui.label(egui::RichText::new(format!("{:+.0} cents{}", cents, param_badges(app, instance_id, pid))).monospace());
             });
             // level in percent
             ui.horizontal(|ui| {
                 let db = param(app, i, params::L_LEVEL).map_or(layer.level_db, |p| p.2 as f32);
                 let pct = level_percent(db);
+                // up to 100 %, or to the level it has, so a louder layer keeps it when touched;
+                // the range stays as it was until the button is up (no jump mid-drag or on release)
+                let range_id = egui::Id::unique(("osc-level-range", instance_id, i));
+                let top = match ui.ctx().data(|d| d.get_temp::<f32>(range_id)) {
+                    Some(t) if ui.input(|inp| inp.pointer.any_down() || inp.pointer.any_released()) => t,
+                    _ => pct.max(100.0),
+                };
+                ui.ctx().data_mut(|d| d.insert_temp(range_id, top));
                 ui.spacing_mut().slider_width = 90.0;
                 let pid = params::layer_param(i as u32, params::L_LEVEL);
                 let d = desc(pid);
-                unit_slider(
-                    app,
-                    ui,
-                    instance_id,
-                    &format!("OSC {} Level", i + 1),
-                    pid,
-                    pct.min(100.0),
-                    0.0..=100.0,
-                    |p| d.map_or(1.0, |d| d.to_normalized(f64::from(percent_db(p)))),
-                    edits,
-                );
-                ui.label(egui::RichText::new(format!("{pct:.0}%")).monospace());
+                unit_slider(app, ui, instance_id, &format!("OSC {} Level", i + 1), pid, pct, 0.0..=top, |p| d.map_or(1.0, |d| d.to_normalized(f64::from(percent_db(p)))), edits);
+                ui.label(egui::RichText::new(format!("{pct:.0}%{}", param_badges(app, instance_id, pid))).monospace());
             });
             if patch.layers.len() > 1 && ui.small_button("×").on_hover_text("Remove this oscillator").clicked() {
                 let mut p = patch.clone();
@@ -460,13 +466,14 @@ fn envelope_section(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, e
     };
     if let Some(drag) = rawdawg_ui::envelope::editor(ui, envelope_id(instance_id), &v, 150.0) {
         use rawdawg_ui::envelope::AdsrPoint;
+        let w = drag.value;
         let moves: Vec<(u32, f32)> = match drag.point {
-            AdsrPoint::Attack => vec![(params::AMP_ATTACK, drag.dx)],
-            AdsrPoint::Decay => vec![(params::AMP_DECAY, drag.dx), (params::AMP_SUSTAIN, drag.dy)],
-            AdsrPoint::Sustain => vec![(params::AMP_SUSTAIN, drag.dy)],
-            AdsrPoint::Release => vec![(params::AMP_RELEASE, drag.dx)],
+            AdsrPoint::Attack => vec![(params::AMP_ATTACK, w.attack_s)],
+            AdsrPoint::Decay => vec![(params::AMP_DECAY, w.decay_s), (params::AMP_SUSTAIN, w.sustain)],
+            AdsrPoint::Sustain => vec![(params::AMP_SUSTAIN, w.sustain)],
+            AdsrPoint::Release => vec![(params::AMP_RELEASE, w.release_s)],
         };
-        let new: Vec<(ParamId, f32)> = moves.iter().map(|(pid, delta)| (ParamId(*pid), (norm(app, *pid) + delta).clamp(0.0, 1.0))).collect();
+        let new: Vec<(ParamId, f32)> = moves.iter().filter_map(|(pid, phys)| desc(*pid).map(|d| (d.id, d.to_normalized(f64::from(*phys)).clamp(0.0, 1.0)))).collect();
         // every value first, then the ends: the first end commits the whole drag
         edits.extend(new.iter().map(|(id, n)| (*id, *n, drag.started, false)));
         if drag.stopped {
@@ -484,7 +491,7 @@ fn envelope_section(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, e
                         ui.label(d.name);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(12.0);
-                            ui.label(egui::RichText::new(envelope_text(pid, d.to_physical(n))).monospace())
+                            ui.label(egui::RichText::new(format!("{}{}", envelope_text(pid, d.to_physical(n)), param_badges(app, instance_id, pid))).monospace())
                         });
                     });
                     ui.spacing_mut().slider_width = (ui.available_width() - 20.0).max(60.0);
@@ -638,6 +645,11 @@ fn param_menu(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, d: &Par
 pub(crate) fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(ParamId, f32, bool, bool)>) {
     for (id, n, started, stopped) in edits {
         super::automation::capture_edit(app, instance_id, id.0, n, started, stopped);
+        // a gesture still open on another synth (its release was never seen) is committed first,
+        // or this one could not start and its edit would never be saved
+        if started && app.synth_panel.gesture.as_ref().is_some_and(|(i, _)| *i != instance_id) {
+            finish_gesture(app);
+        }
         if started && app.synth_panel.gesture.is_none() {
             let before = app.synth_mirrors[&instance_id].save_state();
             app.synth_panel.gesture = Some((instance_id, before));
@@ -649,7 +661,7 @@ pub(crate) fn apply_edits(app: &mut App, instance_id: InstanceId, edits: Vec<(Pa
             app.send(rawdawg_audio_engine::EngineCommand::Live { channel: ch, event: TimedEvent::new(0, EventSource::Mouse, 0, EventKind::Param { id, value: n }) });
         }
         if stopped {
-            finish_gesture(app, instance_id);
+            finish_gesture(app);
         }
     }
 }
@@ -723,19 +735,25 @@ fn mod_matrix(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, patch: 
 
 /// Commit the current mirror state as one undo entry without rebuilding the plan
 /// (the engine already applied the parameter events).
-fn finish_gesture(app: &mut App, instance_id: InstanceId) {
+/// Commit the open parameter gesture as one undo step, for the synth it belongs to.
+fn finish_gesture(app: &mut App) {
     let Some((gid, before)) = app.synth_panel.gesture.take() else { return };
-    if gid != instance_id {
-        return;
-    }
-    let after = app.synth_mirrors[&instance_id].save_state();
+    let Some(after) = app.synth_mirrors.get(&gid).map(|m| m.save_state()) else { return };
     if after == before {
         return;
     }
     let state: serde_json::Value = serde_json::from_slice(&after).unwrap_or(serde_json::Value::Null);
-    app.mark_live_state(instance_id, rawdawg_synthesizer::TYPE_ID, &state);
-    if let Err(e) = app.history.apply(&mut app.project, Command::SetInstanceState { instance_id, state_version: 1, state }) {
+    app.mark_live_state(gid, rawdawg_synthesizer::TYPE_ID, &state);
+    if let Err(e) = app.history.apply(&mut app.project, Command::SetInstanceState { instance_id: gid, state_version: 1, state }) {
         app.status_line = format!("Edit rejected: {e}");
+    }
+}
+
+/// A gesture whose release no control saw (its panel was hidden mid-drag) is committed once no
+/// pointer button is down, so it neither lingers nor swallows later edits.
+pub(crate) fn finish_abandoned(app: &mut App) {
+    if app.synth_panel.gesture.is_some() {
+        finish_gesture(app);
     }
 }
 

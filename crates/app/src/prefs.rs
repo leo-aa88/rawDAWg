@@ -123,16 +123,22 @@ impl Preferences {
 }
 
 /// `path` as an absolute path (relative to the current folder), with `.` and `..` folded so one
-/// folder has one spelling in the recent list. Symlinks are kept as they are.
+/// folder has one spelling in the recent list. A `..` after a symbolic link is kept (and every
+/// one after it): the system resolves it against the link's target, not the folder holding it.
 pub fn absolute(path: &std::path::Path) -> PathBuf {
     use std::path::Component;
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
+    let mut literal = false;
     for c in abs.components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir => {
+            Component::ParentDir if !literal && !std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) => {
                 out.pop();
+            }
+            Component::ParentDir => {
+                literal = true;
+                out.push("..");
             }
             other => out.push(other.as_os_str()),
         }

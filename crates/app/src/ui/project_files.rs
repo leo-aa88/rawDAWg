@@ -199,7 +199,14 @@ impl App {
     pub(crate) fn save_project_as(&mut self, dst: PathBuf) {
         // an absolute path, so the project (and its recent entry) opens from any folder later
         let dst = crate::prefs::absolute(&dst);
-        let dst = if dst.extension().is_some_and(|e| e == "rawdawg") { dst } else { dst.with_extension("rawdawg") };
+        // "Song v1.2" becomes "Song v1.2.rawdawg" (not "Song v1.rawdawg")
+        let dst = if dst.extension().is_some_and(|e| e == "rawdawg") {
+            dst
+        } else {
+            let mut name = dst.clone().into_os_string();
+            name.push(".rawdawg");
+            PathBuf::from(name)
+        };
         let revision = self.history.revision();
         self.project.revision = revision;
         let src = self.project_path.clone();
@@ -272,6 +279,11 @@ impl App {
 }
 
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
+    // "Save and close" belongs to the Save As it opened: leaving that for another dialog (New,
+    // Open) forgets it, or a later ordinary Save As would quit
+    if app.files.close_after_save && !matches!(app.files.dialog, Some(FileDialog::SaveAs)) {
+        app.files.close_after_save = false;
+    }
     // ---- file dialog (dark, in-app: a path field plus the recent list)
     if let Some(kind) = app.files.dialog {
         let title = match kind {

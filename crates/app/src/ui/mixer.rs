@@ -30,7 +30,8 @@ pub(crate) struct MixerState {
     /// Rack randomisation: chaos 0–100 and locks (mix/safety/routing locked by default).
     pub chaos: f32,
     pub locks: RackLocks,
-    seed: u64,
+    /// Rack randomize seed (0: drawn from launch entropy on first use).
+    pub(crate) seed: u64,
     /// Four morph slots per channel: the chain's parameter snapshot (instance → params).
     pub morph_slots: HashMap<MixerChannelId, [Option<RackSnapshot>; 4]>,
     pub morph_xy: (f32, f32),

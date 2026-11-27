@@ -1,10 +1,14 @@
 //! The ADSR envelope editor: the curve over a grid with its area filled, four points to drag
 //! (attack peak, decay end, sustain end, release end) and the segment names underneath. The
-//! caller owns the values; the widget reports how the dragged point moved, so the caller can
-//! turn it into parameter gestures (live values, one undo step per drag).
+//! caller owns the values; the widget reports the envelope the dragged point asks for, so the
+//! caller can turn it into parameter gestures (live values, one undo step per drag).
+//!
+//! Each time segment has its own share of the width on a fixed time scale (about linear below
+//! 10 ms, logarithmic above, up to [`MAX_TIME_S`]): a point sits where its time puts it and
+//! follows the pointer exactly while it is dragged.
 
 use crate::theme;
-use egui::{Pos2, Rect, Sense, Stroke, pos2, vec2};
+use egui::{Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
 
 /// The envelope as drawn: times in seconds, sustain level 0..1.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,38 +36,63 @@ impl AdsrPoint {
     pub const ALL: [AdsrPoint; 4] = [AdsrPoint::Attack, AdsrPoint::Decay, AdsrPoint::Sustain, AdsrPoint::Release];
 }
 
-/// One frame of a point drag: the pointer's movement as fractions of the curve area (x to the
-/// right, y up), and whether the drag starts or ends in this frame.
+/// One frame of a point drag: the envelope with the dragged point where the pointer is, and
+/// whether the drag starts or ends in this frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdsrDrag {
     pub point: AdsrPoint,
-    pub dx: f32,
-    pub dy: f32,
+    pub value: Adsr,
     pub started: bool,
     pub stopped: bool,
 }
 
-/// Width given to the sustain segment (in the same √seconds units as the others).
-const HOLD: f32 = 0.6;
+/// Longest time a segment shows (the synth's envelope times go up to 30 s).
+pub const MAX_TIME_S: f32 = 30.0;
+/// The time scale's knee: about linear below it, logarithmic above.
+const KNEE_S: f32 = 0.01;
+/// Share of the curve's width of each time segment at [`MAX_TIME_S`].
+const TIME_SHARE: f32 = 0.29;
+/// Share of the sustain segment.
+const SUSTAIN_SHARE: f32 = 1.0 - 3.0 * TIME_SHARE;
 /// Space under the curve for the segment names.
 const LABEL_SPACE: f32 = 20.0;
 /// How close to a point a press must be to pick it up.
 const GRAB: f32 = 16.0;
+
+/// Position along a time segment (0..1) for a time in seconds.
+pub fn time_to_frac(t: f32) -> f32 {
+    let t = if t.is_finite() { t.clamp(0.0, MAX_TIME_S) } else { 0.0 };
+    ((1.0 + t / KNEE_S).ln() / (1.0 + MAX_TIME_S / KNEE_S).ln()).clamp(0.0, 1.0)
+}
+
+/// The time at a position along a time segment.
+pub fn frac_to_time(f: f32) -> f32 {
+    let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+    if f >= 1.0 {
+        return MAX_TIME_S;
+    }
+    (KNEE_S * ((f * (1.0 + MAX_TIME_S / KNEE_S).ln()).exp() - 1.0)).clamp(0.0, MAX_TIME_S)
+}
 
 /// The area the curve is drawn in, inside the widget's rect.
 pub fn curve_rect(rect: Rect) -> Rect {
     Rect::from_min_max(rect.min + vec2(14.0, 12.0), rect.max - vec2(14.0, LABEL_SPACE + 6.0))
 }
 
-/// The curve's corners: start, attack peak, decay end, sustain end, release end. Segment
-/// widths follow the square root of their times, so a 1 ms attack and a 5 s release both stay
-/// visible (illustrative spacing, not a calibrated time axis).
+fn level_y(area: Rect, level: f32) -> f32 {
+    let l = if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 };
+    area.max.y - area.height() * l
+}
+
+/// The curve's corners: start, attack peak, decay end, sustain end, release end.
 pub fn curve_points(area: Rect, v: &Adsr) -> [Pos2; 5] {
-    let w = [v.attack_s.max(0.0).sqrt() + 0.04, v.decay_s.max(0.0).sqrt() + 0.04, HOLD, v.release_s.max(0.0).sqrt() + 0.04];
-    let total: f32 = w.iter().sum::<f32>().max(1e-6);
-    let x = |k: usize| area.min.x + area.width() * w[..k].iter().sum::<f32>() / total;
-    let y = |level: f32| area.max.y - area.height() * level.clamp(0.0, 1.0);
-    [pos2(x(0), y(0.0)), pos2(x(1), y(1.0)), pos2(x(2), y(v.sustain)), pos2(x(3), y(v.sustain)), pos2(x(4), y(0.0))]
+    let seg = area.width() * TIME_SHARE;
+    let x1 = area.min.x + seg * time_to_frac(v.attack_s);
+    let x2 = x1 + seg * time_to_frac(v.decay_s);
+    let x3 = x2 + area.width() * SUSTAIN_SHARE;
+    let x4 = x3 + seg * time_to_frac(v.release_s);
+    let s = level_y(area, v.sustain);
+    [pos2(area.min.x, area.max.y), pos2(x1, area.min.y), pos2(x2, s), pos2(x3, s), pos2(x4, area.max.y)]
 }
 
 /// Where a point is drawn.
@@ -77,6 +106,19 @@ pub fn point_pos(area: Rect, v: &Adsr, point: AdsrPoint) -> Pos2 {
     }
 }
 
+/// The envelope with `point` moved to `target` (as far as its segment allows).
+pub fn dragged(area: Rect, v: &Adsr, point: AdsrPoint, target: Pos2) -> Adsr {
+    let seg = (area.width() * TIME_SHARE).max(1.0);
+    let p = curve_points(area, v);
+    let level = ((area.max.y - target.y) / area.height().max(1.0)).clamp(0.0, 1.0);
+    match point {
+        AdsrPoint::Attack => Adsr { attack_s: frac_to_time((target.x - p[0].x) / seg), ..*v },
+        AdsrPoint::Decay => Adsr { decay_s: frac_to_time((target.x - p[1].x) / seg), sustain: level, ..*v },
+        AdsrPoint::Sustain => Adsr { sustain: level, ..*v },
+        AdsrPoint::Release => Adsr { release_s: frac_to_time((target.x - p[3].x) / seg), ..*v },
+    }
+}
+
 /// The point within reach of `at`, nearest first.
 fn point_at(area: Rect, v: &Adsr, at: Pos2) -> Option<AdsrPoint> {
     AdsrPoint::ALL.into_iter().map(|p| (p, point_pos(area, v, p).distance(at))).filter(|(_, d)| *d <= GRAB).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(p, _)| p)
@@ -85,7 +127,8 @@ fn point_at(area: Rect, v: &Adsr, at: Pos2) -> Option<AdsrPoint> {
 /// Draw the editor (`height` points tall, full width) and report the drag of a point, if any.
 pub fn editor(ui: &mut egui::Ui, id: egui::Id, v: &Adsr, height: f32) -> Option<AdsrDrag> {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(240.0), height), Sense::hover());
-    let resp = ui.interact(rect, id, Sense::click_and_drag());
+    // drag only: the drag starts at the press, so no movement is lost to a click threshold
+    let resp = ui.interact(rect, id, Sense::drag());
     let area = curve_rect(rect);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, theme::BACKGROUND);
@@ -108,13 +151,13 @@ pub fn editor(ui: &mut egui::Ui, id: egui::Id, v: &Adsr, height: f32) -> Option<
         }
     }
     painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(2.0, theme::KEY_HELD)));
-    // which point is under the pointer or being dragged
+    // which point is under the pointer or being dragged (with the grab offset)
     let drag_key = id.with("point");
-    let dragging: Option<AdsrPoint> = ui.data(|d| d.get_temp::<Option<AdsrPoint>>(drag_key)).flatten();
+    let dragging: Option<(AdsrPoint, Vec2)> = ui.data(|d| d.get_temp::<Option<(AdsrPoint, Vec2)>>(drag_key)).flatten();
     let hovered = resp.hover_pos().and_then(|p| point_at(area, v, p));
     for p in AdsrPoint::ALL {
         let at = point_pos(area, v, p);
-        let hot = dragging == Some(p) || (dragging.is_none() && hovered == Some(p));
+        let hot = dragging.is_some_and(|d| d.0 == p) || (dragging.is_none() && hovered == Some(p));
         painter.circle(at, if hot { 7.0 } else { 5.5 }, theme::KEY_HELD, Stroke::new(1.5, theme::BACKGROUND));
     }
     if hovered.is_some() || dragging.is_some() {
@@ -126,42 +169,82 @@ pub fn editor(ui: &mut egui::Ui, id: egui::Id, v: &Adsr, height: f32) -> Option<
         let x = (pts[a].x + pts[b].x) * 0.5;
         painter.text(pos2(x, label_y), egui::Align2::CENTER_TOP, name, egui::FontId::proportional(11.0), theme::TEXT_SECONDARY);
     }
-    // the drag
+    // the drag: the point keeps its offset from the pointer
     if resp.drag_started() {
         let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
-        let picked = origin.and_then(|p| point_at(area, v, p));
+        let picked = origin.and_then(|o| point_at(area, v, o).map(|p| (p, point_pos(area, v, p) - o)));
         ui.data_mut(|d| d.insert_temp(drag_key, picked));
-        return picked.map(|point| AdsrDrag { point, dx: 0.0, dy: 0.0, started: true, stopped: false });
+        let (point, offset) = picked?;
+        let target = resp.interact_pointer_pos().map_or(point_pos(area, v, point), |p| p + offset);
+        return Some(AdsrDrag { point, value: dragged(area, v, point, target), started: true, stopped: false });
     }
-    let point = dragging?;
-    let delta = resp.drag_delta();
-    let (dx, dy) = (delta.x / area.width().max(1.0), -delta.y / area.height().max(1.0));
+    let (point, offset) = dragging?;
+    let target = resp.interact_pointer_pos().map(|p| p + offset);
+    let value = target.map_or(*v, |t| dragged(area, v, point, t));
     if resp.drag_stopped() || !resp.dragged() {
-        ui.data_mut(|d| d.insert_temp::<Option<AdsrPoint>>(drag_key, None));
-        return Some(AdsrDrag { point, dx, dy, started: false, stopped: true });
+        ui.data_mut(|d| d.insert_temp::<Option<(AdsrPoint, Vec2)>>(drag_key, None));
+        return Some(AdsrDrag { point, value, started: false, stopped: true });
     }
-    Some(AdsrDrag { point, dx, dy, started: false, stopped: false })
+    Some(AdsrDrag { point, value, started: false, stopped: false })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn area() -> Rect {
+        Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 100.0))
+    }
+
     #[test]
-    fn the_curve_follows_the_values_and_keeps_tiny_segments_visible() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 100.0));
+    fn the_curve_follows_the_values_on_a_fixed_time_scale() {
         let v = Adsr { attack_s: 0.001, decay_s: 0.2, sustain: 0.65, release_s: 0.4 };
-        let p = curve_points(area, &v);
-        assert_eq!(p[0], pos2(0.0, 100.0));
-        assert_eq!(p[1].y, 0.0, "the attack reaches full level");
-        assert!((p[2].y - 35.0).abs() < 1e-3 && (p[3].y - 35.0).abs() < 1e-3, "sustain at 65 %");
-        assert_eq!(p[4], pos2(400.0, 100.0));
-        assert!(p[1].x - p[0].x > 8.0, "a 1 ms attack is still wide enough to grab");
+        let p = curve_points(area(), &v);
+        assert_eq!(p[0], pos2(10.0, 120.0));
+        assert_eq!(p[1].y, 20.0, "the attack reaches full level");
+        assert!((p[2].y - 55.0).abs() < 1e-3 && (p[3].y - 55.0).abs() < 1e-3, "sustain at 65 %");
         assert!(p.windows(2).all(|w| w[1].x >= w[0].x));
-        // a longer release takes a larger share
-        let longer = curve_points(area, &Adsr { release_s: 4.0, ..v });
-        assert!(longer[4].x - longer[3].x > p[4].x - p[3].x);
-        assert_eq!(point_at(area, &v, p[2] + vec2(3.0, -2.0)), Some(AdsrPoint::Decay));
-        assert_eq!(point_at(area, &v, pos2(200.0, 90.0)), None);
+        assert!(p[4].x < area().max.x - 40.0, "a 0.4 s release ends well before the edge");
+        // a longer release ends further right; the other points stay
+        let longer = curve_points(area(), &Adsr { release_s: 4.0, ..v });
+        assert!(longer[4].x > p[4].x + 50.0);
+        assert_eq!(&longer[..4], &p[..4]);
+        // the longest times fill the width exactly
+        let max = curve_points(area(), &Adsr { attack_s: MAX_TIME_S, decay_s: MAX_TIME_S, sustain: 0.5, release_s: MAX_TIME_S });
+        assert!((max[4].x - area().max.x).abs() < 0.01);
+        // the scale round-trips and refuses nonsense
+        for t in [0.0, 0.001, 0.02, 0.5, 3.0, 30.0] {
+            assert!((frac_to_time(time_to_frac(t)) - t).abs() <= t * 1e-3 + 1e-6, "{t}");
+        }
+        assert_eq!(time_to_frac(f32::NAN), 0.0);
+        assert_eq!(time_to_frac(1e9), 1.0);
+        assert_eq!(point_at(area(), &v, p[2] + vec2(3.0, -2.0)), Some(AdsrPoint::Decay));
+        assert_eq!(point_at(area(), &v, pos2(400.0, 115.0)), None);
+    }
+
+    #[test]
+    fn a_dragged_point_lands_where_the_pointer_is() {
+        let v = Adsr { attack_s: 0.005, decay_s: 0.12, sustain: 0.75, release_s: 0.18 };
+        for point in AdsrPoint::ALL {
+            let from = point_pos(area(), &v, point);
+            for delta in [vec2(60.0, 0.0), vec2(-8.0, 0.0), vec2(30.0, 20.0), vec2(5.0, -10.0)] {
+                let target = from + delta;
+                let moved = dragged(area(), &v, point, target);
+                let at = point_pos(area(), &moved, point);
+                match point {
+                    // the sustain end only moves up and down
+                    AdsrPoint::Sustain => assert!((at.y - target.y).abs() < 0.01 && at.x == from.x, "{point:?} {delta:?}: {at:?}"),
+                    // the attack peak stays at full level, the release end at zero
+                    AdsrPoint::Attack | AdsrPoint::Release => assert!((at.x - target.x).abs() < 0.05 && at.y == from.y, "{point:?} {delta:?}: {at:?} vs {target:?}"),
+                    AdsrPoint::Decay => assert!(at.distance(target) < 0.05, "{point:?} {delta:?}: {at:?} vs {target:?}"),
+                }
+            }
+        }
+        // past the start of its segment a time is zero, past its end the longest
+        let a = dragged(area(), &v, AdsrPoint::Attack, pos2(0.0, 0.0));
+        assert_eq!(a.attack_s, 0.0);
+        let r = dragged(area(), &v, AdsrPoint::Release, pos2(5000.0, 0.0));
+        assert_eq!(r.release_s, MAX_TIME_S);
+        assert_eq!(dragged(area(), &v, AdsrPoint::Sustain, pos2(0.0, -50.0)).sustain, 1.0);
     }
 }

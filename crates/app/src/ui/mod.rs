@@ -811,9 +811,9 @@ impl App {
     pub(crate) fn live(&mut self, event: TimedEvent) {
         #[cfg(test)]
         self.live_log.push(event);
-        if event.source != EventSource::Mouse {
-            self.held_notes.track(&event);
-        }
+        // every key press and release, whether or not a channel plays it (tracking twice
+        // through `send` is harmless: it is idempotent)
+        self.held_notes.track(&event);
         if let Some(channel) = self.selected_channel {
             self.send(EngineCommand::Live { channel, event });
         }
@@ -927,12 +927,14 @@ impl App {
         if text_focused {
             return;
         }
+        // AltGr arrives as Ctrl+Alt on Windows: a Ctrl+Alt chord is typing, not undo/redo
+        let alt = ctx.input(|i| i.modifiers.alt);
         let (redo, undo, space, f6, f7, f8, f9, esc) = ctx.input_mut(|i| {
             (
                 // redo first: egui matches Ctrl+Z "logically", so it also takes Ctrl+Shift+Z
-                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z))
-                    || i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y)),
-                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z)),
+                !alt && (i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z))
+                    || i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y))),
+                !alt && i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z)),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F6),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F7),
@@ -1022,7 +1024,13 @@ impl App {
     }
 
     fn restart_audio_with(&mut self, req: &StreamConfigRequest, persist: bool) {
+        // the old stream's notes end with it: forget the keys (no release will come for them)
         self.held.clear();
+        self.held_notes.clear();
+        // the playhead survives the device change: keep where the old engine was
+        if let AudioState::Running(sys) = &self.audio {
+            self.offline_playhead = sys.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed).max(0);
+        }
         self.audio = AudioState::Disabled; // drops the old stream first
         let input_req = self.prefs.input_enabled.then(|| rawdawg_audio_io::capture::InputConfigRequest {
             device_id: self.prefs.input_device_id.clone(),
@@ -1044,6 +1052,8 @@ impl App {
                     self.save_prefs();
                 }
                 self.recompile();
+                // the new engine starts where the playhead is (set while audio was off, too)
+                self.send(EngineCommand::SeekTick(self.offline_playhead));
             }
             Err(e) => {
                 self.status_line = format!("Audio unavailable: {e:#}");
@@ -1149,14 +1159,9 @@ impl App {
         }
         ui.separator();
         self.tempo_control(ui);
-        let (bar, beat) = match &self.audio {
-            AudioState::Running(s) => {
-                let tick = s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed);
-                let pos = self.project.meter_map().map(|m| m.position(rawdawg_types::units::Tick(tick))).ok();
-                pos.map(|p| (p.bar + 1, p.beat + 1)).unwrap_or((1, 1))
-            }
-            _ => (1, 1),
-        };
+        // the playhead's bar and beat, also with audio off (it moves with ruler clicks then)
+        let (bar, beat) =
+            self.playhead_tick().and_then(|tick| self.project.meter_map().ok().map(|m| m.position(rawdawg_types::units::Tick(tick)))).map_or((1, 1), |p| (p.bar + 1, p.beat + 1));
         ui.label(egui::RichText::new(format!("{bar}:{beat}")).monospace());
         let mut metro = match &self.audio {
             AudioState::Running(s) => s.handle.status.metronome.load(std::sync::atomic::Ordering::Relaxed),
@@ -1655,23 +1660,26 @@ impl App {
                 st.master_peak_r.store(0.0);
                 meter(ui, l);
                 meter(ui, r);
-                let red = st.master_reduction_db.load();
-                if red > 0.1 {
-                    ui.label(egui::RichText::new(format!("limiter −{red:.1} dB")).color(theme::WARNING));
+                // one line cut to the room left (voices first), so counters that appear later
+                // never push it under the unsaved marker; the details are on hover
+                let parts = running_status(
+                    st.active_voices.load(std::sync::atomic::Ordering::Relaxed),
+                    st.master_reduction_db.load(),
+                    st.command_overflows.get() + st.dropped_events.get(),
+                    st.late_events.get(),
+                    self.plan_error.as_deref(),
+                );
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let mut job = egui::text::LayoutJob::default();
+                for (i, (text, color)) in parts.iter().enumerate() {
+                    if i > 0 {
+                        job.append("  ·  ", 0.0, egui::TextFormat::simple(font.clone(), theme::TEXT_SECONDARY));
+                    }
+                    job.append(text, 0.0, egui::TextFormat::simple(font.clone(), *color));
                 }
-                ui.label(format!("voices {}", st.active_voices.load(std::sync::atomic::Ordering::Relaxed)));
-                let overflow = st.command_overflows.get() + st.dropped_events.get();
-                if overflow > 0 {
-                    ui.label(egui::RichText::new(format!("dropped {overflow}")).color(theme::ERROR)).on_hover_text("Control queue overflow or events for unknown channels");
-                }
-                let late = st.late_events.get();
-                if late > 0 {
-                    ui.label(egui::RichText::new(format!("late MIDI {late}")).color(theme::WARNING))
-                        .on_hover_text("MIDI notes that arrived after the moment they should have played (placed at once); a larger audio buffer gives them more room");
-                }
-                if let Some(e) = &self.plan_error {
-                    bounded_label(ui, egui::RichText::new(e).color(theme::ERROR), ui.available_width());
-                }
+                bounded_label(ui, job, ui.available_width()).on_hover_text(
+                    "voices: notes sounding · limiter: master protection at work · dropped: control queue overflow or events for unknown channels · late MIDI: notes that arrived after the moment they should have played (a larger audio buffer gives them more room)",
+                );
             }
             AudioState::Failed(e) => {
                 // the error can be longer than the window: cut it (full text on hover) so
@@ -1804,6 +1812,25 @@ impl App {
 /// Room for the held keys in the toolbar ("C4 Eb4 G4 Bb4 · Cm7" fits).
 const HELD_LABEL_W: f32 = 210.0;
 
+/// The running audio's status, most important first: voices, then the limiter, dropped and
+/// late events, and a plan error, with their colours.
+fn running_status(voices: u64, limiter_db: f32, dropped: u64, late: u64, plan_error: Option<&str>) -> Vec<(String, egui::Color32)> {
+    let mut parts = vec![(format!("voices {voices}"), theme::TEXT)];
+    if limiter_db > 0.1 {
+        parts.push((format!("limiter −{limiter_db:.1} dB"), theme::WARNING));
+    }
+    if dropped > 0 {
+        parts.push((format!("dropped {dropped}"), theme::ERROR));
+    }
+    if late > 0 {
+        parts.push((format!("late MIDI {late}"), theme::WARNING));
+    }
+    if let Some(e) = plan_error {
+        parts.push((e.to_owned(), theme::ERROR));
+    }
+    parts
+}
+
 /// A label cut to at most `max_w` points (egui shows the whole text on hover when it is cut),
 /// so it can never push what follows it out of the row.
 fn bounded_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, max_w: f32) -> egui::Response {
@@ -1917,8 +1944,10 @@ impl App {
             if sys.stream.is_failed() {
                 let msg = sys.stream.status.error_message().unwrap_or_else(|| "stream lost".into());
                 let fixed_buffer = sys.stream.config.requested_buffer_frames;
+                self.offline_playhead = sys.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed).max(0);
                 self.audio = AudioState::Failed(msg.clone());
                 self.held.clear();
+                self.held_notes.clear();
                 if let Some(b) = fixed_buffer
                     && !self.buffer_fallback_tried
                 {
@@ -2006,6 +2035,11 @@ impl App {
                 });
             });
             self.show_help = open;
+        }
+        // a drag whose release no control saw (its panel was hidden mid-drag) is committed now
+        if !ui.ctx().input(|i| i.pointer.any_down()) {
+            synth_panel::finish_abandoned(self);
+            waveform::finish_abandoned(self);
         }
     }
 

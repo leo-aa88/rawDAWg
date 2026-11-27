@@ -981,11 +981,10 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     // clip context menu (right-click without drag): mute / loop / make unique / split / delete
-    if resp.secondary_clicked()
-        && let Some(p) = resp.interact_pointer_pos()
-        && lanes_rect.contains(p)
-    {
-        app.playlist.clip_menu = hit(p).map(|c| (c.id, snap_round(tick_at(p.x), egrid).max(0)));
+    // any right-click on the surface decides the clip menu: a clip under it, or none (the ruler,
+    // the header, an empty lane), so a menu never opens for an earlier clip
+    if resp.secondary_clicked() {
+        app.playlist.clip_menu = resp.interact_pointer_pos().filter(|p| lanes_rect.contains(*p)).and_then(|p| hit(p).map(|c| (c.id, snap_round(tick_at(p.x), egrid).max(0))));
     }
     let clip_menu_tick = app.playlist.clip_menu.map(|(_, t)| t);
     if let Some(c) = app.playlist.clip_menu.and_then(|(id, _)| clips.iter().find(|c| c.id == id).cloned()) {

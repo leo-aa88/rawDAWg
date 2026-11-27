@@ -164,3 +164,24 @@ fn a_pattern_exports_on_its_own_even_when_the_playlist_is_empty() {
     assert_eq!(back.meter.len(), 1);
     assert!(back.tracks.iter().flat_map(|t| &t.controllers).count() >= 2, "its controllers too");
 }
+
+#[test]
+fn a_range_exports_only_what_starts_inside_it_from_tick_zero_at_the_tempo_in_force() {
+    use rawdawg_project::smf::{range_view, song_notes};
+    let p = song();
+    // the second bar only (the loop repeats the pattern there): its notes from 0, 400 000 µs, 3/4
+    let view = range_view(&p, 3840, 7680);
+    let mut notes: Vec<(i64, u8)> = song_notes(&view).into_iter().map(|(_, n)| (n.tick.0, n.pitch)).collect();
+    notes.sort();
+    assert_eq!(notes, vec![(0, 60), (960, 64), (960, 64)], "the bar's notes, shifted to the start");
+    assert_eq!(view.tempo.len(), 1);
+    assert_eq!((view.tempo[0].tick.0, view.tempo[0].us_per_quarter.0), (0, 400_000));
+    assert_eq!((view.meter[0].tick.0, view.meter[0].numerator), (0, 3));
+    // a range starting mid-note leaves that note out; the rest of the bar is in
+    let mid = range_view(&p, 480, 3840);
+    let notes: Vec<i64> = song_notes(&mid).into_iter().map(|(_, n)| n.tick.0).collect();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes.iter().all(|t| *t == 480), "{notes:?}");
+    // it still exports as a file
+    assert!(export_song(&view).is_ok());
+}

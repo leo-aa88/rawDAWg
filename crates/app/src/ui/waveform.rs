@@ -256,16 +256,43 @@ fn frame_strip(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer: us
     }
 }
 
-/// Commit the current mirror patch as one undo entry, keeping the live instance.
+/// The generator kind of every layer of a saved synth state.
+fn layer_kinds(state: &[u8]) -> Option<Vec<usize>> {
+    serde_json::from_slice::<rawdawg_synthesizer::Patch>(state).ok().map(|p| p.layers.iter().map(|l| l.generator.kind_index()).collect())
+}
+
+/// Commit the current mirror patch as one undo entry. The running instance is kept when it
+/// already plays the result (its tables were handed over live); a layer that changed kind (a
+/// basic oscillator turned into a drawn wave) cannot have been: its voices threw the tables
+/// away, so the instance is rebuilt from the committed state.
 fn commit(app: &mut App, instance: InstanceId, before: &[u8]) {
-    let after = app.synth_mirrors[&instance].save_state();
+    let Some(after) = app.synth_mirrors.get(&instance).map(|m| m.save_state()) else { return };
     if after == before {
         return;
     }
+    let restructured = layer_kinds(before) != layer_kinds(&after);
     let state: serde_json::Value = serde_json::from_slice(&after).unwrap_or(serde_json::Value::Null);
-    app.mark_live_state(instance, rawdawg_synthesizer::TYPE_ID, &state);
-    if let Err(e) = app.history.apply(&mut app.project, Command::SetInstanceState { instance_id: instance, state_version: 1, state }) {
-        app.status_line = format!("Edit rejected: {e}");
+    if !restructured {
+        app.mark_live_state(instance, rawdawg_synthesizer::TYPE_ID, &state);
+    }
+    match app.history.apply(&mut app.project, Command::SetInstanceState { instance_id: instance, state_version: 1, state }) {
+        Err(e) => app.status_line = format!("Edit rejected: {e}"),
+        Ok(()) if restructured => app.recompile(),
+        Ok(()) => {}
+    }
+}
+
+/// A brush stroke or harmonic press whose release this editor did not see (it was hidden
+/// mid-drag) is committed once no pointer button is down.
+pub(crate) fn finish_abandoned(app: &mut App) {
+    if let Some(stroke) = app.synth_panel.waveform.stroke.take()
+        && stroke.dirty
+    {
+        commit(app, stroke.instance, &stroke.before);
+    }
+    if let Some((instance, before)) = app.synth_panel.waveform.harmonics.before.take() {
+        app.synth_panel.waveform.harmonics.last = None;
+        commit(app, instance, &before);
     }
 }
 
@@ -529,17 +556,16 @@ fn harmonics_editor(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, laye
                 count += 1;
             }
             ui.add(egui::DragValue::new(&mut count).range(1..=MAX_HARMONICS).suffix(" harmonics"))
-                .on_hover_text(format!("How many harmonics make the wave (1 to {MAX_HARMONICS}); drag or type"));
+                .on_hover_text(format!("How many harmonics to show and edit (1 to {MAX_HARMONICS}; drag or type). The wave changes at your next edit, which keeps only these"));
             if ui.small_button("−").on_hover_text("One harmonic fewer").clicked() {
                 count = count.saturating_sub(1);
             }
         });
     });
+    // how many bars to show and edit: the wave itself changes at the next edit, so looking at
+    // more or fewer bars never rewrites a sound (and a dragged count is not an undo step each)
     let count = count.clamp(1, MAX_HARMONICS);
-    if count != app.synth_panel.waveform.harmonics.count {
-        app.synth_panel.waveform.harmonics.count = count;
-        harmonic_change(app, instance, layer);
-    }
+    app.synth_panel.waveform.harmonics.count = count;
     let above = sculpt::energy_above(&cycle, count);
     if above > 0.001 {
         ui.label(
@@ -617,10 +643,13 @@ fn harmonics_editor(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, laye
             if let Some(l) = hs.levels.get_mut(j)
                 && (*l - v).abs() > 1e-4
             {
-                *l = v;
-                if hs.phases.get(j).is_some_and(|p| *p == 0.0) {
-                    hs.phases[j] = -std::f32::consts::FRAC_PI_2;
+                // a harmonic raised from silence starts as a sine (its old phase was noise)
+                if *l < 1e-4
+                    && let Some(p) = hs.phases.get_mut(j)
+                {
+                    *p = -std::f32::consts::FRAC_PI_2;
                 }
+                *l = v;
                 changed = true;
             }
         }
@@ -629,10 +658,9 @@ fn harmonics_editor(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, laye
             rebuild_harmonics(app, instance, layer);
         }
     } else if let Some((i, before)) = app.synth_panel.waveform.harmonics.before.take() {
+        // the press ended: one undo step, for the synth it was made on
         app.synth_panel.waveform.harmonics.last = None;
-        if i == instance {
-            commit(app, instance, &before);
-        }
+        commit(app, i, &before);
     }
     // readout of the bar under the pointer
     let readout = response.hover_pos().map(|p| bar_at(p).0).map_or_else(

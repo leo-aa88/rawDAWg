@@ -286,13 +286,13 @@ const SINE_PHASE: f32 = -std::f32::consts::FRAC_PI_2;
 pub const HARMONIC_PEAK: f32 = 1.0;
 
 /// A cycle made of exactly harmonics 1..=`levels.len()` at those levels (0..1, relative to each
-/// other) with the given phases (a sine's where none is given), scaled to a peak of
-/// [`HARMONIC_PEAK`]. All levels at zero give silence.
+/// other; above 1 counts as 1, not finite as 0) with the given phases (a sine's where none is
+/// given), scaled to a peak of [`HARMONIC_PEAK`]. All levels at zero give silence.
 pub fn build_harmonics(levels: &[f32], phases: &[f32]) -> Vec<f32> {
     let n = levels.len().min(MAX_HARMONICS).min(CYCLE_LEN / 2 - 1);
     let mut h = Harmonics { magnitude: vec![0.0; CYCLE_LEN / 2 + 1], phase: vec![0.0; CYCLE_LEN / 2 + 1] };
     for k in 1..=n {
-        h.magnitude[k] = levels[k - 1].clamp(0.0, 1.0);
+        h.magnitude[k] = if levels[k - 1].is_finite() { levels[k - 1].clamp(0.0, 1.0) } else { 0.0 };
         h.phase[k] = phases.get(k - 1).copied().filter(|p| p.is_finite()).unwrap_or(SINE_PHASE);
     }
     let mut cycle = synthesize(&h);
@@ -312,15 +312,18 @@ pub fn harmonic_levels(cycle: &[f32], n: usize) -> (Vec<f32>, Vec<f32>) {
     let h = analyze(cycle);
     let n = n.min(h.magnitude.len().saturating_sub(1));
     let strongest = h.magnitude[1..=n].iter().fold(0.0f32, |m, v| m.max(*v));
-    let levels = h.magnitude[1..=n].iter().map(|m| if strongest > 1e-9 { (m / strongest).clamp(0.0, 1.0) } else { 0.0 }).collect();
-    (levels, h.phase[1..=n].to_vec())
+    let levels: Vec<f32> = h.magnitude[1..=n].iter().map(|m| if strongest > 1e-9 { (m / strongest).clamp(0.0, 1.0) } else { 0.0 }).collect();
+    // a silent harmonic's phase is rounding noise (and differs between FFT code paths): call it
+    // a sine, so raising it gives the same wave everywhere
+    let phases = h.phase[1..=n].iter().zip(&levels).map(|(p, l)| if *l < 1e-6 { SINE_PHASE } else { *p }).collect();
+    (levels, phases)
 }
 
 /// How much of `cycle`'s energy lies above harmonic `n` (0 = none, 1 = all of it).
 pub fn energy_above(cycle: &[f32], n: usize) -> f32 {
     let h = analyze(cycle);
     let total: f32 = h.magnitude.iter().skip(1).map(|m| m * m).sum();
-    let above: f32 = h.magnitude.iter().skip(n + 1).map(|m| m * m).sum();
+    let above: f32 = h.magnitude.iter().skip(n.saturating_add(1)).map(|m| m * m).sum();
     if total > 1e-12 { above / total } else { 0.0 }
 }
 
@@ -559,5 +562,34 @@ mod tests {
         assert_eq!(random_harmonics(200, 1).0.len(), MAX_HARMONICS);
         let cycle = build_harmonics(&a, &ph);
         assert!(energy_above(&cycle, 16) < 1e-6);
+    }
+
+    #[test]
+    fn the_shapes_have_the_right_polarity_and_silent_harmonics_read_as_sines() {
+        let n = CYCLE_LEN;
+        // one harmonic is a rising sine: 0 at the start, +1 a quarter in
+        let sine = build_harmonics(&[1.0], &[]);
+        assert!(sine[0].abs() < 1e-3 && sine[n / 4] > 0.999 && sine[3 * n / 4] < -0.999);
+        // the saw rises through zero at the start and jumps at half a cycle
+        let (l, p) = HarmonicShape::Saw.harmonics(32);
+        let saw = build_harmonics(&l, &p);
+        assert!(saw[0].abs() < 0.02 && saw[n / 8] > 0.15 && saw[3 * n / 8] > saw[n / 8] + 0.3, "rising: {} {} {}", saw[0], saw[n / 8], saw[3 * n / 8]);
+        assert!(saw[n / 2 + n / 8] < -0.15, "after the jump it is negative");
+        // the square is high in the first half, the triangle peaks at +1 a quarter in
+        let (l, p) = HarmonicShape::Square.harmonics(32);
+        let sq = build_harmonics(&l, &p);
+        assert!(sq[n / 4] > 0.8 && sq[3 * n / 4] < -0.8);
+        let (l, p) = HarmonicShape::Triangle.harmonics(32);
+        let tri = build_harmonics(&l, &p);
+        assert!(tri[n / 4] > 0.97 && tri[3 * n / 4] < -0.97);
+        // a harmonic a cycle does not have reads as a sine (not FFT rounding noise)
+        let (levels, phases) = harmonic_levels(&rawdawg_dsp::wavetable::cycles::sine(), 8);
+        for k in 1..8 {
+            assert!(levels[k] < 1e-6);
+            assert_eq!(phases[k], SINE_PHASE, "harmonic {}", k + 1);
+        }
+        // nonsense levels count as silence, not as a silent cycle
+        let w = build_harmonics(&[1.0, f32::NAN, f32::INFINITY], &[]);
+        assert!(w.iter().all(|v| v.is_finite()) && w[n / 4] > 0.99, "the fundamental still plays");
     }
 }

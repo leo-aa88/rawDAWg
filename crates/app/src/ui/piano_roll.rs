@@ -258,7 +258,7 @@ pub(crate) struct PianoRollState {
     /// Pitch (fractional) at the top edge of the grid.
     view_top: f32,
     /// First visible tick.
-    scroll_tick: f32,
+    pub(crate) scroll_tick: f32,
     px_per_tick: f32,
     pub(crate) row_h: f32,
     pub selection: HashSet<NoteId>,
@@ -354,9 +354,13 @@ fn audition_on(app: &mut App, pitch: u8, velocity: f32) {
 
 pub(crate) fn audition_off(app: &mut App) {
     let notes = std::mem::take(&mut app.piano_roll.audition);
-    if let Some(ch) = app.piano_roll.channel.or(app.selected_channel) {
-        for (id, pitch) in notes {
-            app.send(EngineCommand::Live { channel: ch, event: TimedEvent::note_off(0, EventSource::Mouse, 0, id, pitch) });
+    let channel = app.piano_roll.channel.or(app.selected_channel);
+    for (id, pitch) in notes {
+        let off = TimedEvent::note_off(0, EventSource::Mouse, 0, id, pitch);
+        // the key is let go even when its channel went away meanwhile
+        app.held_notes.track(&off);
+        if let Some(ch) = channel {
+            app.send(EngineCommand::Live { channel: ch, event: off });
         }
     }
 }
@@ -1050,8 +1054,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             app.status_line = format!("{} note(s) copied", app.piano_roll.clipboard.len());
         }
         if paste && !app.piano_roll.clipboard.is_empty() {
-            // relative to the playhead (snapped), else the view start
-            let at = app.playhead_tick().map(|t| if length.0 > 0 { t.rem_euclid(length.0) } else { t }).unwrap_or(scroll_tick as i64);
+            // at the playhead (snapped) when it is in view, else at the view start
+            let visible = (scroll_tick as i64)..=((scroll_tick + grid_rect.width() / ppt.max(1e-6)) as i64);
+            let at = app.playhead_tick().map(|t| if length.0 > 0 { t.rem_euclid(length.0) } else { t }).filter(|t| visible.contains(t)).unwrap_or(scroll_tick as i64);
             let at = snap_tick(at, grid).max(0);
             let pasted: Vec<Note> = app
                 .piano_roll

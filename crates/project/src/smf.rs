@@ -265,7 +265,7 @@ pub fn song_notes(project: &Project) -> Vec<(rawdawg_types::ChannelId, Note)> {
 
 /// One pattern as the arrangement: the pattern from tick 0 for its length, at the song's
 /// starting tempo and meter (pattern mode plays it so).
-fn pattern_view(project: &Project, pattern_id: rawdawg_types::PatternId) -> Option<Project> {
+pub fn pattern_project(project: &Project, pattern_id: rawdawg_types::PatternId) -> Option<Project> {
     let pat = project.pattern(pattern_id)?;
     let mut view = project.clone();
     view.tempo.truncate(1);
@@ -283,6 +283,50 @@ fn pattern_view(project: &Project, pattern_id: rawdawg_types::PatternId) -> Opti
     Some(view)
 }
 
+/// The arrangement between `start` and `end` (ticks) as its own song from tick 0: clips cut to
+/// the range (their sources offset accordingly), the tempo and meter in force at `start` moved
+/// to tick 0. Notes that start before the range are left out.
+pub fn range_view(project: &Project, start: i64, end: i64) -> Project {
+    let (start, end) = (start.max(0), end.max(start.max(0) + 1));
+    let mut view = project.clone();
+    view.clips = project
+        .clips
+        .iter()
+        .filter_map(|c| {
+            let (s, e) = (c.start_tick.0.max(start), c.end_tick().0.min(end));
+            if e <= s {
+                return None;
+            }
+            let cut = s - c.start_tick.0;
+            let content = match &c.content {
+                ClipContent::Pattern { pattern_id, source_offset_ticks, looped } => {
+                    ClipContent::Pattern { pattern_id: *pattern_id, source_offset_ticks: Tick(source_offset_ticks.0 + cut), looped: *looped }
+                }
+                other => other.clone(),
+            };
+            Some(crate::model::Clip { start_tick: Tick(s - start), length_ticks: Tick(e - s), content, ..c.clone() })
+        })
+        .collect();
+    // the tempo and meter in force at the start, then the changes inside the range
+    let mut tempo: Vec<_> = Vec::new();
+    if let Some(at) = project.tempo.iter().rfind(|t| t.tick.0 <= start) {
+        tempo.push(crate::model::TempoPoint { tick: Tick::ZERO, ..*at });
+    }
+    tempo.extend(project.tempo.iter().filter(|t| t.tick.0 > start && t.tick.0 < end).map(|t| crate::model::TempoPoint { tick: Tick(t.tick.0 - start), ..*t }));
+    if !tempo.is_empty() {
+        view.tempo = tempo;
+    }
+    let mut meter: Vec<_> = Vec::new();
+    if let Some(at) = project.meter.iter().rfind(|m| m.tick.0 <= start) {
+        meter.push(crate::model::MeterPoint { tick: Tick::ZERO, ..*at });
+    }
+    meter.extend(project.meter.iter().filter(|m| m.tick.0 > start && m.tick.0 < end).map(|m| crate::model::MeterPoint { tick: Tick(m.tick.0 - start), ..*m }));
+    if !meter.is_empty() {
+        view.meter = meter;
+    }
+    view
+}
+
 /// Notes the song export would write (muted clips and tracks are skipped).
 pub fn song_note_count(project: &Project) -> usize {
     song_notes(project).len()
@@ -290,12 +334,12 @@ pub fn song_note_count(project: &Project) -> usize {
 
 /// Notes a pattern export would write.
 pub fn pattern_note_count(project: &Project, pattern_id: rawdawg_types::PatternId) -> usize {
-    pattern_view(project, pattern_id).map_or(0, |v| song_notes(&v).len())
+    pattern_project(project, pattern_id).map_or(0, |v| song_notes(&v).len())
 }
 
 /// Export one pattern as SMF type 1, as pattern mode plays it.
 pub fn export_pattern(project: &Project, pattern_id: rawdawg_types::PatternId) -> Result<Vec<u8>, SmfError> {
-    let view = pattern_view(project, pattern_id).ok_or(SmfError::Empty)?;
+    let view = pattern_project(project, pattern_id).ok_or(SmfError::Empty)?;
     // the view lives only for this call: write from it, then hand back owned bytes
     export_song(&view)
 }

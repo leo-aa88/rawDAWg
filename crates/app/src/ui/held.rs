@@ -25,8 +25,15 @@ impl HeldNotes {
                 }
             }
             EventKind::NoteOn { note_id, pitch, .. } | EventKind::NoteOff { note_id, pitch } => {
-                // by id, or by key when a device's release carries another id
-                self.notes.retain(|n| !(n.0 == ev.source && (n.1 == note_id || n.2 == pitch)));
+                // by id; by key only when no note has that id (a release that carries another
+                // id), so the same key held twice from one source loses just one
+                let before = self.notes.len();
+                self.notes.retain(|n| !(n.0 == ev.source && n.1 == note_id));
+                if self.notes.len() == before
+                    && let Some(i) = self.notes.iter().position(|n| n.0 == ev.source && n.2 == pitch)
+                {
+                    self.notes.remove(i);
+                }
             }
             EventKind::AllNotesOff { source: Some(s) } => self.notes.retain(|n| n.0 != s),
             EventKind::AllNotesOff { source: None } | EventKind::Reset => self.notes.clear(),
@@ -66,7 +73,7 @@ const CHORDS: &[(&[i32], &[usize], &str)] = &[
     (&[0, 4, 8], &[0, 2, 4], "aug"),
     (&[0, 2, 7], &[0, 1, 4], "sus2"),
     (&[0, 5, 7], &[0, 3, 4], "sus4"),
-    (&[0, 7], &[0, 4], "5"),
+    (&[0, 7], &[0, 4], " power"),
     (&[0, 4, 7, 10], &[0, 2, 4, 6], "7"),
     (&[0, 4, 7, 11], &[0, 2, 4, 6], "maj7"),
     (&[0, 3, 7, 10], &[0, 2, 4, 6], "m7"),
@@ -105,9 +112,13 @@ fn on_letter(pc: i32, letter: usize) -> Option<(String, i32)> {
     accidental(diff).map(|a| (format!("{l}{a}"), diff))
 }
 
-/// The ways to spell a root: its natural letter, or the sharp below and the flat above.
+/// The ways to spell a root: a white key by its own letter (never B#, E#, Cb or Fb), a black
+/// key as the sharp of the letter below or the flat of the letter above.
 fn root_letters(pc: i32) -> Vec<usize> {
-    (0..7).filter(|&i| on_letter(pc, i).is_some_and(|(_, d)| d.abs() <= 1)).collect()
+    if let Some(natural) = LETTERS.iter().position(|(_, n)| *n == pc.rem_euclid(12)) {
+        return vec![natural];
+    }
+    (0..7).filter(|&i| on_letter(pc, i).is_some_and(|(_, d)| d.abs() == 1)).collect()
 }
 
 /// A recognised chord: its name ("Cm", "C/E") and the spelling of each pitch class in it.
@@ -142,7 +153,8 @@ fn find_chord(pitches: &[u8]) -> Option<Chord> {
             .1;
         let name_of = |pc: i32| best.iter().find(|t| t.0 == pc).map(|t| t.1.clone()).unwrap_or_else(|| PLAIN[pc as usize].to_owned());
         let mut name = format!("{}{suffix}", name_of(root));
-        if bass != root {
+        // a power chord's "inversion" is the same two notes: no slash
+        if bass != root && shape.len() > 2 {
             name += &format!("/{}", name_of(bass));
         }
         return Some(Chord { name, spelled: best });
@@ -191,7 +203,17 @@ mod tests {
         assert_eq!(describe(&[57, 60, 64, 67]), "A3 C4 E4 G4 · Am7");
         assert_eq!(describe(&[60, 64, 67, 69]), "C4 E4 G4 A4 · C6");
         assert_eq!(describe(&[59, 62, 65]), "B3 D4 F4 · Bdim");
-        assert_eq!(describe(&[60, 67]), "C4 G4 · C5");
+        assert_eq!(describe(&[60, 67]), "C4 G4 · C power");
+        assert_eq!(describe(&[55, 60]), "G3 C4 · C power", "the fourth below is the same power chord");
+        // white-key roots keep their letter: Cdim7, Fdim, Bdim, Baug (not B#dim7, E#dim, Cbaug)
+        assert_eq!(describe(&[60, 63, 66, 69]), "C4 Eb4 Gb4 Bbb4 · Cdim7");
+        assert_eq!(describe(&[65, 68, 71]), "F4 Ab4 Cb5 · Fdim");
+        assert_eq!(describe(&[68, 71, 77]), "Ab4 Cb5 F5 · Fdim/Ab");
+        assert_eq!(describe(&[59, 63, 67]), "B3 D#4 F##4 · Baug");
+        assert_eq!(describe(&[65, 68, 71, 75]), "F4 Ab4 Cb5 Eb5 · Fm7b5");
+        // the octave number belongs to the letter: B#4 is the C5 key, Cb5 the B4 key
+        assert_eq!(describe(&[64, 68, 72]), "E4 G#4 B#4 · Eaug");
+        assert_eq!(describe(&[0, 127]), "C-1 G9 · C power");
         assert_eq!(describe(&[48, 60, 63, 67]), "C3 C4 Eb4 G4 · Cm", "doubled root");
         assert_eq!(describe(&[60, 61, 62]), "C4 C#4 D4", "a cluster is just its notes");
     }
@@ -221,5 +243,13 @@ mod tests {
         h.track(&on(EventSource::TypingKeyboard, 4, 62));
         h.clear();
         assert!(h.pitches().is_empty());
+        // the same key held twice from one source (another octave's key, two MIDI channels):
+        // one release leaves the other held
+        h.track(&on(EventSource::TypingKeyboard, 5, 60));
+        h.track(&on(EventSource::TypingKeyboard, 6, 60));
+        h.track(&TimedEvent::note_off(0, EventSource::TypingKeyboard, 0, 6, 60));
+        assert_eq!(h.pitches(), vec![60], "one C4 is still down");
+        h.track(&TimedEvent::note_off(0, EventSource::TypingKeyboard, 0, 99, 60));
+        assert!(h.pitches().is_empty(), "a release with an unknown id lets go of one by key");
     }
 }

@@ -41,6 +41,10 @@ impl Harness {
         };
         let app = App::build(&ctx, opts, Preferences::default(), false);
         let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX, size: egui::vec2(W, H) };
+        // fixed randomize seeds, so a test that randomizes can be reproduced (the app draws
+        // them from launch entropy; `randomize_starts_from_a_different_seed_every_launch` checks that)
+        h.app.synth_panel.evolve.seed_counter = 0x5EED_1234;
+        h.app.mixer.seed = 0x5EED_5678;
         // two warm-up frames so panels and scroll areas settle
         h.frame(vec![]);
         h.frame(vec![]);
@@ -2063,17 +2067,6 @@ fn after_randomize_the_controls_show_the_new_sound_and_a_tweak_keeps_the_rest() 
     let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
     let before = saved(&h);
     // Randomize sound, as a user clicks it
-    let node = |h: &mut Harness, text: &str| h.drawn_nodes().into_iter().filter(|(t, _)| t == text).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()));
-    let into_view = |h: &mut Harness, text: &str| {
-        for _ in 0..40 {
-            match node(h, text) {
-                Some(r) if r.bottom() < H - 80.0 && r.top() > 120.0 => return r,
-                _ => h.scroll(egui::pos2(W * 0.5, H * 0.6), -120.0),
-            }
-        }
-        panic!("{text} never came into view")
-    };
-    let _ = (node, into_view);
     let randomize = h.scroll_into_view("Randomize sound", |h| h.node("Randomize sound"));
     h.click_at(randomize.center(), egui::PointerButton::Primary);
     let randomized = saved(&h);
@@ -2163,8 +2156,8 @@ fn midi_export_follows_the_scope_and_refuses_an_empty_file() {
     h.frame(vec![]);
     h.frame(vec![]);
     assert!(h.app.export.path.ends_with("rec.mid"), "the field is not rewritten while typing: {}", h.app.export.path);
-    assert_eq!(super::export::midi_path(&h.app.export).unwrap(), root.join("rec.mid"));
-    assert_eq!(super::export::audio_path(&h.app.export).unwrap(), root.join("rec.wav"));
+    assert_eq!(super::export::midi_path(&h.app).unwrap(), root.join("rec.mid"));
+    assert_eq!(super::export::audio_path(&h.app).unwrap(), root.join("rec.wav"));
     let click = |h: &mut Harness, text: &str| {
         let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
         h.click_at(r.center(), egui::PointerButton::Primary);
@@ -2332,6 +2325,8 @@ fn randomize_starts_from_a_different_seed_every_launch() {
     project.mixer.channels.iter_mut().find(|m| m.id == master).unwrap().inserts.push(inst);
     let rack_after = || {
         let mut h = Harness::new(None);
+        // as the app starts: no seed yet, drawn from launch entropy on first use
+        h.app.mixer.seed = 0;
         h.app.project = project.clone();
         h.app.rebuild_mirrors();
         super::mixer::randomize_rack(&mut h.app, master);
@@ -2549,8 +2544,12 @@ fn source_symbols() -> std::collections::BTreeMap<char, std::collections::BTreeS
 fn every_symbol_the_code_can_draw_has_a_glyph_in_the_fonts() {
     let mut h = Harness::new(None);
     h.frame(vec![]);
-    let symbols = source_symbols();
+    let mut symbols = source_symbols();
     assert!(symbols.contains_key(&'·'), "the scan sees the UI's strings");
+    // the user guide is shown in Help too
+    for ch in super::USER_GUIDE.chars().filter(|c| !c.is_ascii() && !c.is_whitespace()) {
+        symbols.entry(ch).or_default().insert("docs/USER_GUIDE.md".into());
+    }
     let missing: Vec<String> = h.ctx.fonts_mut(|f| {
         symbols
             .iter()
@@ -2566,12 +2565,14 @@ fn at_the_minimum_window_size_the_toolbar_and_status_bar_keep_every_control_visi
     // UI_UX: responsive down to 1024×720 with no clipped critical controls (issues #12, #21)
     let long_error = "opening audio stream: the audio stream was lost: ALSA function 'snd_pcm_avail_delay' failed with error 'I/O error (5)'; \
                       fallback to device default buffer also failed: opening audio stream: the audio stream was lost: ALSA function 'snd_pcm_avail_delay' failed with error 'I/O error (5)'";
-    for (audio, toolbar_audio, status_audio, button) in [
-        (AudioState::Failed(long_error.into()), "Audio unavailable", "Audio unavailable: opening", "Retry audio"),
-        (AudioState::Disabled, "Audio off", "Audio off —", "Start audio"),
+    for (size, audio, toolbar_audio, status_audio, button) in [
+        (egui::vec2(1024.0, 720.0), AudioState::Failed(long_error.into()), "Audio unavailable", "Audio unavailable: opening", "Retry audio"),
+        (egui::vec2(1024.0, 720.0), AudioState::Disabled, "Audio off", "Audio off —", "Start audio"),
+        // the window's default size
+        (egui::vec2(1440.0, 900.0), AudioState::Failed(long_error.into()), "Audio unavailable", "Audio unavailable: opening", "Retry audio"),
     ] {
         let mut h = Harness::new(None);
-        h.size = egui::vec2(1024.0, 720.0);
+        h.size = size;
         h.app.audio = audio;
         h.app.project_path = Some(PathBuf::from("/home/me/Music/My first song.rawdawg"));
         h.app.apply(Command::RenameProject { name: "edited".into() });
@@ -2664,7 +2665,7 @@ fn held_keys_are_named_in_the_toolbar_and_light_up_in_the_piano_roll() {
     // letting go of Eb leaves C and G, then nothing
     h.key_event(egui::Key::D, false, false, egui::Modifiers::NONE);
     h.frame(vec![]);
-    assert!(toolbar_text(&mut h).iter().any(|t| t == "C4 G4 · C5"));
+    assert!(toolbar_text(&mut h).iter().any(|t| t == "C4 G4 · C power"));
     assert_eq!(lit(&mut h).len(), 2);
     h.key_event(egui::Key::Z, false, false, egui::Modifiers::NONE);
     h.key_event(egui::Key::B, false, false, egui::Modifiers::NONE);
@@ -2728,7 +2729,7 @@ fn the_amplitude_envelope_is_edited_by_dragging_its_points_and_the_values_follow
     };
     let text0 = release_text(&mut h);
     let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Release);
-    let to = from - egui::vec2(120.0, 0.0);
+    let to = from - egui::vec2(50.0, 0.0);
     h.move_to(from);
     h.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
     for i in 1..=4 {
@@ -2748,10 +2749,20 @@ fn the_amplitude_envelope_is_edited_by_dragging_its_points_and_the_values_follow
     let mut only_release = before.clone();
     only_release.amp_env.release_s = after.amp_env.release_s;
     assert_eq!(after, only_release, "nothing else moved");
+    let now = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Release);
+    assert!((now.x - to.x).abs() < 1.5, "the release end is where it was dropped: {now:?} vs {to:?}");
+    // the attack peak follows the pointer too
+    let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Attack);
+    h.drag(from, from + egui::vec2(60.0, 0.0), egui::PointerButton::Primary);
+    let now = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Attack);
+    assert!((now.x - from.x - 60.0).abs() < 1.5 && saved(&h).amp_env.attack_s > after.amp_env.attack_s, "{now:?} vs {from:?}");
+    h.app.undo();
+    assert_eq!(saved(&h), after, "the attack drag is one undo step");
     // the decay point moves decay (left/right) and sustain (up/down) in one step
     let from = point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Decay);
     h.drag(from, from + egui::vec2(40.0, 30.0), egui::PointerButton::Primary);
     let moved = saved(&h);
+    assert!(point_pos(curve_rect(rect), &adsr(&h), AdsrPoint::Decay).distance(from + egui::vec2(40.0, 30.0)) < 1.5);
     assert!(moved.amp_env.decay_s > after.amp_env.decay_s && moved.amp_env.sustain < after.amp_env.sustain, "{:?}", moved.amp_env);
     assert_eq!(h.app.history.undo_len(), depth + 2);
     h.app.undo();
@@ -2806,7 +2817,10 @@ fn oscillators_start_from_templates_and_stack_up_to_three_with_octave_detune_and
     assert_eq!(h.app.history.undo_len(), depth + 4, "one undo step each");
     template(&mut h, "Saw octaves");
     let p = saved(&h);
-    assert_eq!(p.layers.iter().map(|l| (wave(&p, 0) == Some(BasicWave::Saw), l.coarse_semitones)).collect::<Vec<_>>(), vec![(true, 0), (true, 12), (true, 24)]);
+    assert_eq!(
+        (0..3).map(|i| (wave(&p, i), p.layers[i].coarse_semitones)).collect::<Vec<_>>(),
+        vec![(Some(BasicWave::Saw), 0), (Some(BasicWave::Saw), 12), (Some(BasicWave::Saw), 24)]
+    );
     template(&mut h, "Detuned saws + sub");
     let p = saved(&h);
     assert_eq!(p.layers.len(), 3);
@@ -2910,15 +2924,21 @@ fn the_harmonic_editor_builds_the_wave_from_levels_shapes_and_random_harmonics()
     let (levels, _) = sculpt::harmonic_levels(&cycle(&h), 16);
     assert!(levels[4..8].iter().all(|l| *l > 0.95), "{levels:?}");
     assert_eq!(h.app.history.undo_len(), depth + 3, "a drag is one undo step");
-    // fewer harmonics: the wave keeps only the first 8
+    // fewer bars: looking at 8 changes nothing yet (no rewrite, no undo step) ...
     h.app.synth_panel.waveform.harmonics.count = 9;
     let minus = {
         let label = h.scroll_into_view("the count", |h| h.node("9 harmonics"));
         h.drawn_nodes().into_iter().filter(|(t, r)| t == "−" && (r.center().y - label.center().y).abs() < 6.0).map(|(_, r)| r).next().expect("−")
     };
+    let (wave, depth) = (cycle(&h), h.app.history.undo_len());
     h.click_at(minus.center(), egui::PointerButton::Primary);
     assert_eq!(h.app.synth_panel.waveform.harmonics.count, 8);
-    assert!(sculpt::energy_above(&cycle(&h), 8) < 1e-6);
+    assert_eq!(cycle(&h), wave, "changing the count does not rewrite the wave");
+    assert_eq!(h.app.history.undo_len(), depth);
+    assert!(sculpt::energy_above(&cycle(&h), 8) > 1e-4, "the 9th is still in the wave");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("This wave also has harmonics above 8")), "and the editor says so");
+    // ... the next edit keeps the first 8
     // random harmonics: within the count, the fundamental kept, one undo step, new each time
     let before = cycle(&h);
     button(&mut h, "Randomize harmonics");
@@ -2936,4 +2956,333 @@ fn the_harmonic_editor_builds_the_wave_from_levels_shapes_and_random_harmonics()
     let shown = h.app.synth_panel.waveform.harmonics.levels.clone();
     let (levels, _) = sculpt::harmonic_levels(&first, sculpt::MAX_HARMONICS);
     assert!(shown.iter().zip(&levels).all(|(a, b)| (a - b).abs() < 1e-4));
+}
+
+#[test]
+fn the_clip_menu_belongs_to_the_clip_right_clicked_and_the_ruler_opens_none() {
+    let mut h = Harness::new(Some("../../fixtures/demo-song.rawdawg"));
+    h.frame(vec![]);
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let track = h.app.project.tracks[0].id;
+    let clip = h.app.project.clips.iter().filter(|c| c.track_id == track).min_by_key(|c| c.start_tick.0).unwrap().clone();
+    let clips = h.app.project.clips.len();
+    // right-click the clip: its menu
+    let p = super::playlist::lane_point(&h.app.playlist, surface, clip.start_tick.0 + clip.length_ticks.0 / 2, 0);
+    h.click_at(p, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    assert!(h.node("Delete").is_some(), "the clip menu is open");
+    // close it (click elsewhere), then right-click the ruler: no clip menu, nothing deleted
+    let heading = h.node("Playlist").unwrap();
+    h.click_at(heading.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let ruler = egui::pos2(p.x + 40.0, surface.min.y + 6.0);
+    h.click_at(ruler, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    let deletes: Vec<egui::Rect> = h.drawn_nodes().into_iter().filter(|(t, r)| t == "Delete" && r.top() > surface.min.y).map(|(_, r)| r).collect();
+    assert!(deletes.is_empty(), "no clip menu on the ruler: {deletes:?}");
+    assert_eq!(h.app.project.clips.len(), clips);
+}
+
+#[test]
+fn with_audio_off_the_toolbar_shows_the_playhead_and_paste_goes_into_view() {
+    let mut h = Harness::new(None);
+    h.app.seek(2 * 3840 + 960);
+    h.frame(vec![]);
+    let toolbar: Vec<String> = h.drawn_nodes().into_iter().filter(|(_, r)| r.center().y < 100.0).map(|(t, _)| t).collect();
+    assert!(toolbar.iter().any(|t| t == "3:2"), "bar 3, beat 2 with audio off: {toolbar:?}");
+    // a copied note pastes into the visible part of the roll, not at the playhead off-screen
+    h.app.editor_view = EditorView::PianoRoll;
+    h.app.key_target = super::KeyTarget::PianoRoll;
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(Command::SetPatternLength { id: pid, length_ticks: Tick(8 * 3840), steps: 16 * 8, step_ticks: Tick(240) });
+    let note = rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(240), pitch: 60, velocity: 0.8, channel: 0 };
+    h.app.apply(Command::AddNotes { pattern_id: pid, channel_id: cid, notes: vec![note] });
+    h.app.seek(0);
+    h.app.piano_roll.clipboard = vec![rawdawg_project::Note { tick: Tick(0), ..note }];
+    h.app.piano_roll.scroll_tick = 4.0 * 3840.0;
+    h.frame(vec![]);
+    // Ctrl on Linux and Windows: egui's ctrl and command flags both set
+    let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+    h.key_event(egui::Key::V, true, false, ctrl);
+    h.key_event(egui::Key::V, false, false, ctrl);
+    h.frame(vec![]);
+    let ticks: Vec<i64> = h.app.project.pattern(pid).unwrap().lanes.iter().find(|l| l.channel_id == cid).unwrap().notes.iter().map(|n| n.tick.0).collect();
+    assert!(ticks.iter().any(|t| *t >= 4 * 3840), "pasted at the view start: {ticks:?}");
+}
+
+#[test]
+fn save_and_close_is_forgotten_when_its_save_as_is_left_for_another_dialog() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-save-close-left-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    h.app.apply(Command::RenameProject { name: "changed".into() });
+    let click = |h: &mut Harness, text: &str| {
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    h.app.files.close_prompt = true;
+    click(&mut h, "Save and close");
+    assert!(h.app.files.close_after_save, "Save As opened for the close");
+    // the user goes to File › New instead
+    h.app.files.dialog = Some(super::project_files::FileDialog::New);
+    h.frame(vec![]);
+    assert!(!h.app.files.close_after_save, "leaving that Save As forgets the close");
+    h.app.files.dialog = None;
+    // a later ordinary Save As saves and stays open
+    h.app.save_project_checked();
+    h.app.files.path_input = root.join("later").display().to_string();
+    click(&mut h, "Save as");
+    assert!(root.join("later.rawdawg/project.json").is_file());
+    assert!(!h.app.files.closing, "an ordinary Save As does not quit");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn export_replaces_only_what_it_named_and_its_path_follows_the_project() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-export-replace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(240), pitch: 60, velocity: 0.8, channel: 0 }],
+    });
+    h.app.export.song = false;
+    std::fs::write(root.join("a.mid"), b"old a").unwrap();
+    std::fs::write(root.join("precious.mid"), b"precious").unwrap();
+    h.app.export.open = true;
+    h.app.export.path = root.join("a").display().to_string();
+    h.frame(vec![]);
+    super::export::request_midi(&mut h.app);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.contains("a.mid already exists")));
+    // the target changes before Replace (the form is locked; anything else changing it): asked again
+    h.app.export.path = root.join("precious").display().to_string();
+    let replace = h.node("Replace").unwrap();
+    h.click_at(replace.center(), egui::PointerButton::Primary);
+    assert_eq!(std::fs::read(root.join("precious.mid")).unwrap(), b"precious", "never overwritten without being named");
+    assert!(h.drawn_texts().iter().any(|t| t.contains("precious.mid already exists")), "the prompt names the new target");
+    let keep = h.node("Keep the existing file").unwrap();
+    h.click_at(keep.center(), egui::PointerButton::Primary);
+    // relative paths are in the project folder, a folder gets the project's name, names are made safe
+    h.app.project_path = Some(root.clone());
+    h.app.project.name = "Mix: final?".into();
+    h.app.export.path = "rel/mix".into();
+    assert_eq!(super::export::midi_path(&h.app).unwrap(), root.join("rel/mix.mid"));
+    h.app.export.path = format!("{}/", root.display());
+    assert_eq!(super::export::audio_path(&h.app).unwrap(), root.join("Mix_ final_.wav"));
+    h.app.export.path = root.join("Song v1.2").display().to_string();
+    assert_eq!(super::export::midi_path(&h.app).unwrap(), root.join("Song v1.2.mid"), "a dot in the name stays");
+    // a never-saved project's typed path does not follow File › New
+    h.app.project_path = None;
+    h.app.export.path = "/somewhere/mix".into();
+    h.frame(vec![]);
+    h.app.new_project();
+    h.frame(vec![]);
+    assert_eq!(h.app.export.path, "", "a new project starts without the old path");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn oscillator_rows_drive_detune_level_switch_octave_and_waveform() {
+    use rawdawg_dsp::oscillator::BasicWave;
+    use rawdawg_synthesizer::patch::Generator;
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    // Init's custom wave becomes a square from the waveform menu
+    let osc1 = h.scroll_into_view("OSC 1", |h| h.node("OSC 1"));
+    let combo = h.drawn_nodes().into_iter().filter(|(t, r)| t == "Custom wave" && (r.center().y - osc1.center().y).abs() < 6.0).map(|(_, r)| r).next().expect("waveform menu");
+    h.click_at(combo.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let square = h.drawn_nodes().into_iter().filter(|(t, r)| t == "Square" && r.top() > combo.top()).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+    h.click_at(square.center(), egui::PointerButton::Primary);
+    assert!(matches!(saved(&h).layers[0].generator, Generator::Basic { wave: BasicWave::Pulse, .. }), "a basic square now");
+    // detune and level sliders: one undo step per drag, the readouts follow
+    let slider = |h: &mut Harness, name: &str| h.scroll_into_view(name, |h| h.node(name));
+    let depth = h.app.history.undo_len();
+    let detune = slider(&mut h, "OSC 1 Detune");
+    h.drag(detune.center(), detune.center() + egui::vec2(20.0, 0.0), egui::PointerButton::Primary);
+    let cents = saved(&h).layers[0].fine_cents;
+    assert!(cents > 5.0, "detuned up: {cents}");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    assert!(h.drawn_texts().iter().any(|t| *t == format!("{cents:+.0} cents")));
+    let level = slider(&mut h, "OSC 1 Level");
+    h.drag(level.center(), level.left_center() + egui::vec2(2.0, 0.0), egui::PointerButton::Primary);
+    assert!(saved(&h).layers[0].level_db < -20.0, "turned down: {}", saved(&h).layers[0].level_db);
+    // octave − / + move whole octaves; on/off switches the oscillator
+    let osc1 = slider(&mut h, "OSC 1");
+    let minus = h.drawn_nodes().into_iter().filter(|(t, r)| t == "−" && (r.center().y - osc1.center().y).abs() < 6.0 && r.left() > osc1.right()).map(|(_, r)| r).next().unwrap();
+    h.click_at(minus.center(), egui::PointerButton::Primary);
+    assert_eq!(saved(&h).layers[0].coarse_semitones, -12);
+    h.click_at(osc1.center(), egui::PointerButton::Primary);
+    assert!(!saved(&h).layers[0].enabled, "switched off");
+    // a layer louder than 100 % keeps its level when its slider is touched where it stands
+    let mut p = saved(&h);
+    p.layers[0].level_db = 3.0;
+    p.layers[0].enabled = true;
+    super::synth_panel::commit_patch(&mut h.app, instance, p);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("141%")), "+3 dB reads 141 %");
+    let level = slider(&mut h, "OSC 1 Level");
+    let depth = h.app.history.undo_len();
+    // the handle is at the right end (141 % is the top of the scale now); nudge it a little
+    let handle = level.right_center() - egui::vec2(6.0, 0.0);
+    h.drag(handle, handle - egui::vec2(9.0, 0.0), egui::PointerButton::Primary);
+    let db = saved(&h).layers[0].level_db;
+    assert!(db > 1.0 && db < 3.0, "a small step down from +3 dB, not a drop to 100 % or less: {db}");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+}
+
+#[test]
+fn at_1920_the_oscillators_and_envelope_sit_side_by_side_and_both_work() {
+    let mut h = Harness::new(None);
+    h.size = egui::vec2(1920.0, 1036.0);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let env_id = super::synth_panel::envelope_id(instance);
+    let start = h.scroll_into_view("Start from", |h| h.node("Start from"));
+    let saw_square = h.drawn_nodes().into_iter().filter(|(t, r)| t == "Saw + Square" && r.top() > start.top() - 4.0).map(|(_, r)| r).next().unwrap();
+    h.click_at(saw_square.center(), egui::PointerButton::Primary);
+    let env = h.scroll_into_view("the envelope", |h| {
+        h.frame(vec![]);
+        h.ctx.read_response(env_id).map(|r| r.rect)
+    });
+    let osc2 = h.node("OSC 2").unwrap();
+    assert!((env.top() - osc2.top()).abs() < 200.0 && env.left() > osc2.right(), "side by side: {env:?} / {osc2:?}");
+    let x = h.drawn_nodes().into_iter().filter(|(t, r)| t == "×" && (r.center().y - osc2.center().y).abs() < 6.0).map(|(_, r)| r).next().unwrap();
+    assert!(x.right() < env.left(), "the oscillator table stays left of the envelope: {x:?} / {env:?}");
+    h.click_at(x.center(), egui::PointerButton::Primary);
+    let layers = |h: &Harness| -> usize { serde_json::from_value::<rawdawg_synthesizer::Patch>(h.app.project.channels[0].instrument.state.clone()).unwrap().layers.len() };
+    assert_eq!(layers(&h), 1, "× removed the second oscillator");
+}
+
+#[test]
+fn harmonic_edits_on_a_plain_oscillator_rebuild_the_synth_and_the_bars_follow_the_layer() {
+    use rawdawg_synthesizer::sculpt;
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    super::synth_panel::commit_patch(&mut h.app, instance, super::synth_panel::Template::SawOctaves.patch());
+    h.app.synth_panel.waveform.mode = super::waveform::CanvasMode::Harmonics;
+    let bars_rect = |h: &mut Harness| {
+        h.frame(vec![]);
+        h.ctx.read_response(super::waveform::harmonic_bars_id(instance)).map(|r| r.rect)
+    };
+    let shape = |h: &mut Harness, name: &str| {
+        let r = h.scroll_into_view(name, |h| {
+            let bars = bars_rect(h)?;
+            h.drawn_nodes().into_iter().filter(|(t, r)| t == name && r.top() > bars.bottom()).map(|(_, r)| r).next()
+        });
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    shape(&mut h, "Square");
+    let p = saved(&h);
+    let rawdawg_synthesizer::patch::Generator::Wavetable { cycle, .. } = &p.layers[0].generator else { panic!("a drawn wave now") };
+    // the running synth cannot play it (its basic voices drop tables): it is rebuilt, not reused
+    let fp = rawdawg_audio_engine::fingerprint_state(rawdawg_synthesizer::TYPE_ID, &h.app.project.channels[0].instrument.state);
+    assert_ne!(h.app.live_fingerprints.get(&instance), Some(&fp), "the old instance is not claimed to play the new wave");
+    // a bar raised from silence is a sine-phase harmonic
+    let bars = h.scroll_into_view("the bars", bars_rect);
+    let slot = bars.width() / h.app.synth_panel.waveform.harmonics.count as f32;
+    h.click_at(egui::pos2(bars.min.x + slot * 1.5, bars.max.y - bars.height() * 0.5), egui::PointerButton::Primary);
+    let wave = |h: &Harness| match &saved(h).layers[0].generator {
+        rawdawg_synthesizer::patch::Generator::Wavetable { cycle, .. } => cycle.clone(),
+        _ => unreachable!(),
+    };
+    let (levels, phases) = sculpt::harmonic_levels(&wave(&h), 4);
+    assert!((levels[1] - 0.5).abs() < 0.03 && (phases[1] + std::f32::consts::FRAC_PI_2).abs() < 1e-3, "{levels:?} {phases:?}");
+    let _ = cycle;
+    // right-drag turns a bar off
+    h.drag(egui::pos2(bars.min.x + slot * 2.5, bars.min.y + 5.0), egui::pos2(bars.min.x + slot * 2.5, bars.min.y + 8.0), egui::PointerButton::Secondary);
+    let (levels, _) = sculpt::harmonic_levels(&wave(&h), 4);
+    assert!(levels[2] < 1e-3, "harmonic 3 off: {levels:?}");
+    // the bars describe the layer shown: Layer 2 is a plain saw an octave up
+    h.app.synth_panel.waveform.layer = 1;
+    h.frame(vec![]);
+    let shown = h.app.synth_panel.waveform.harmonics.levels.clone();
+    let (want, _) = sculpt::harmonic_levels(&rawdawg_dsp::wavetable::cycles::saw(), sculpt::MAX_HARMONICS);
+    assert!(shown.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-3), "layer 2's harmonics: {:?}", &shown[..4]);
+}
+
+#[test]
+fn a_drag_abandoned_by_switching_views_is_committed_and_does_not_eat_the_next_edit() {
+    use rawdawg_ui::envelope::{Adsr, AdsrPoint, curve_rect, point_pos};
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let a = h.app.project.channels[0].instrument.id;
+    let saved = |h: &Harness, i: usize| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[i].instrument.state.clone()).unwrap() };
+    let rect = h.scroll_into_view("the envelope", |h| {
+        h.frame(vec![]);
+        h.ctx.read_response(super::synth_panel::envelope_id(a)).map(|r| r.rect)
+    });
+    let env = saved(&h, 0).amp_env;
+    let from = point_pos(curve_rect(rect), &Adsr { attack_s: env.attack_s, decay_s: env.decay_s, sustain: env.sustain, release_s: env.release_s }, AdsrPoint::Release);
+    let depth = h.app.history.undo_len();
+    h.move_to(from);
+    h.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![egui::Event::PointerMoved(from + egui::vec2(40.0, 0.0))]);
+    // F6 mid-drag: the envelope is gone when the button comes up
+    h.app.editor_view = EditorView::Rack;
+    h.frame(vec![egui::Event::PointerButton { pos: from + egui::vec2(40.0, 0.0), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![]);
+    assert_eq!(h.app.history.undo_len(), depth + 1, "the drag was committed");
+    assert!(saved(&h, 0).amp_env.release_s > env.release_s, "with its value");
+    assert_eq!(h.app.synth_mirrors[&a].patch(), &saved(&h, 0), "the project holds what the synth plays");
+    // another synth's edit is saved normally
+    h.app.add_synth_channel();
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let attack_slider = |h: &mut Harness| {
+        let l = h.node("Attack")?;
+        h.drawn_nodes().into_iter().filter(|(t, r)| t == "Attack" && r.top() > l.bottom() - 1.0).map(|(_, r)| r).next()
+    };
+    let s = h.scroll_into_view("B's Attack slider", attack_slider);
+    let before = saved(&h, 1).amp_env.attack_s;
+    h.drag(s.center(), s.center() + egui::vec2(30.0, 0.0), egui::PointerButton::Primary);
+    assert_ne!(saved(&h, 1).amp_env.attack_s, before, "B's edit reached the project");
+}
+
+#[test]
+fn the_on_screen_piano_lights_and_names_what_the_mouse_plays() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let hint = h.scroll_into_view("the on-screen piano", |h| h.node("Click or drag to play"));
+    // the keys are just above their hint row
+    let key = egui::pos2(hint.left() + 30.0, hint.top() - 20.0);
+    h.move_to(key);
+    h.frame(vec![egui::Event::PointerButton { pos: key, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![]);
+    let held = h.app.held_notes.pitches();
+    assert_eq!(held.len(), 1, "the mouse holds one key");
+    let name = super::held::describe(&held);
+    let toolbar: Vec<String> = h.drawn_nodes().into_iter().filter(|(_, r)| r.center().y < 100.0).map(|(t, _)| t).collect();
+    assert!(toolbar.contains(&name), "{name} in {toolbar:?}");
+    assert!(filled_rects(&h.shapes()).iter().any(|(c, r)| *c == theme::KEY_HELD && r.contains(key)), "the key is lit");
+    h.frame(vec![egui::Event::PointerButton { pos: key, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+    h.frame(vec![]);
+    assert!(h.app.held_notes.pitches().is_empty());
+}
+
+#[test]
+fn the_running_status_puts_voices_first_and_only_shows_counters_that_matter() {
+    let plain = super::running_status(3, 0.0, 0, 0, None);
+    assert_eq!(plain.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(), ["voices 3"]);
+    let busy = super::running_status(12, 2.5, 4, 2, Some("plan error"));
+    assert_eq!(busy.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(), ["voices 12", "limiter −2.5 dB", "dropped 4", "late MIDI 2", "plan error"]);
+    assert_eq!(busy[2].1, theme::ERROR);
 }
