@@ -9,6 +9,7 @@ pub mod model;
 pub mod persist;
 pub mod plugin_state;
 pub mod preset;
+pub mod routing;
 pub mod smf;
 pub mod validate;
 

@@ -9,6 +9,8 @@ struct Harness {
     app: App,
     pointer: egui::Pos2,
     parts: u8,
+    /// Window size in points (W × H unless a test resizes it).
+    size: egui::Vec2,
 }
 
 const W: f32 = 1400.0;
@@ -38,7 +40,7 @@ impl Harness {
             catalog: None,
         };
         let app = App::build(&ctx, opts, Preferences::default(), false);
-        let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX };
+        let mut h = Self { ctx, app, pointer: egui::pos2(0.0, 0.0), parts: u8::MAX, size: egui::vec2(W, H) };
         // two warm-up frames so panels and scroll areas settle
         h.frame(vec![]);
         h.frame(vec![]);
@@ -46,7 +48,7 @@ impl Harness {
     }
 
     fn frame(&mut self, events: Vec<egui::Event>) {
-        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))), events, ..Default::default() };
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), events, ..Default::default() };
         let app = &mut self.app;
         let parts = self.parts;
         let mut out = self.ctx.run_ui(input, |ui| {
@@ -65,7 +67,7 @@ impl Harness {
     /// Text and on-screen bounds of every labelled widget drawn in one frame.
     fn drawn_nodes(&mut self) -> Vec<(String, egui::Rect)> {
         self.ctx.enable_accesskit();
-        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))), ..Default::default() };
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), ..Default::default() };
         let app = &mut self.app;
         let parts = self.parts;
         let mut out = self.ctx.run_ui(input, |ui| {
@@ -144,7 +146,7 @@ impl Harness {
     /// One frame with the window out of focus (another application took it).
     fn frame_unfocused(&mut self) {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W, H))),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
             focused: false,
             events: vec![egui::Event::WindowFocused(false)],
             ..Default::default()
@@ -2099,4 +2101,481 @@ fn drawing_past_the_end_grows_the_pattern_and_its_menu_opens_on_a_left_click() {
     let four = h.drawn_nodes().into_iter().find(|(t, _)| t == "4").map(|(_, r)| r).expect("the 4 bars choice");
     h.click_at(four.center(), egui::PointerButton::Primary);
     assert_eq!(len(&h), 4 * 3840, "set to 4 bars");
+}
+
+#[test]
+fn midi_export_follows_the_scope_and_refuses_an_empty_file() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-midi-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    // three notes in the pattern, nothing on the playlist
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    let notes = [60u8, 64, 67]
+        .iter()
+        .enumerate()
+        .map(|(i, p)| rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(i as i64 * 480), duration_ticks: Tick(240), pitch: *p, velocity: 0.8, channel: 0 })
+        .collect();
+    h.app.apply(rawdawg_project::Command::AddNotes { pattern_id: pid, channel_id: cid, notes });
+    assert!(h.app.project.clips.is_empty());
+    h.app.export.open = true;
+    // a typed .mid name is kept as typed; the audio and MIDI files are derived from it
+    h.app.export.path = root.join("rec.mid").display().to_string();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.app.export.path.ends_with("rec.mid"), "the field is not rewritten while typing: {}", h.app.export.path);
+    assert_eq!(super::export::midi_path(&h.app.export).unwrap(), root.join("rec.mid"));
+    assert_eq!(super::export::audio_path(&h.app.export).unwrap(), root.join("rec.wav"));
+    let click = |h: &mut Harness, text: &str| {
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    // Song scope: the playlist is empty, so nothing is written and the dialog says why
+    click(&mut h, "Song");
+    click(&mut h, "Export MIDI (type 1)");
+    assert!(h.app.export.last_result.as_deref().is_some_and(|r| r.starts_with("Nothing to export")), "{:?}", h.app.export.last_result);
+    assert!(!root.join("rec.mid").exists(), "no empty file");
+    // Pattern scope: the selected pattern's notes
+    click(&mut h, "Pattern");
+    click(&mut h, "Export MIDI (type 1)");
+    let bytes = std::fs::read(root.join("rec.mid")).expect("written");
+    let back = rawdawg_project::smf::import(&bytes, "rec").unwrap();
+    let pitches: Vec<u8> = back.tracks.iter().flat_map(|t| t.notes.iter().map(|n| n.pitch)).collect();
+    assert_eq!(pitches.len(), 3, "the three notes: {pitches:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn export_asks_before_replacing_and_its_path_belongs_to_the_project() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-export-overwrite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    h.app.save_project_as(root.join("A.rawdawg"));
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(rawdawg_project::Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(240), pitch: 60, velocity: 0.8, channel: 0 }],
+    });
+    h.app.export.open = true;
+    h.app.export.song = false;
+    h.frame(vec![]);
+    let shared = root.join("mix");
+    h.app.export.path = shared.display().to_string();
+    h.frame(vec![]);
+    let click = |h: &mut Harness, text: &str| {
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    click(&mut h, "Export MIDI (type 1)");
+    let first = std::fs::read(root.join("mix.mid")).expect("written");
+    // another project: the dialog proposes that project's own file, not project A's
+    h.app.save_project_checked();
+    h.app.new_project();
+    h.app.save_project_as(root.join("B.rawdawg"));
+    h.frame(vec![]);
+    assert!(h.app.export.path.contains("B.rawdawg"), "the path follows the open project: {}", h.app.export.path);
+    // point it at A's file on purpose: replacing it needs a confirmation
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(rawdawg_project::Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(480), duration_ticks: Tick(960), pitch: 72, velocity: 0.5, channel: 0 }],
+    });
+    h.app.export.path = shared.display().to_string();
+    h.frame(vec![]);
+    click(&mut h, "Export MIDI (type 1)");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.contains("already exists. Replace?")), "it asks");
+    assert_eq!(std::fs::read(root.join("mix.mid")).unwrap(), first, "nothing replaced yet");
+    click(&mut h, "Keep the existing file");
+    assert_eq!(std::fs::read(root.join("mix.mid")).unwrap(), first, "kept");
+    click(&mut h, "Export MIDI (type 1)");
+    click(&mut h, "Replace");
+    assert_ne!(std::fs::read(root.join("mix.mid")).unwrap(), first, "replaced after confirming");
+    // audio export asks the same way
+    std::fs::write(root.join("mix.wav"), b"old").unwrap();
+    // the button (the window title says "Export" too)
+    let button = h.drawn_nodes().into_iter().filter(|(t, _)| t == "Export").map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+    h.click_at(button.center(), egui::PointerButton::Primary);
+    assert!(!h.app.export.running(), "waits for the answer");
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.contains("mix.wav already exists")));
+    click(&mut h, "Keep the existing file");
+    assert_eq!(std::fs::read(root.join("mix.wav")).unwrap(), b"old");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Rack;
+    h.frame(vec![]);
+    let cid = h.app.selected_channel.unwrap();
+    // two separate edits: a sequence where undo and redo give different results
+    for step in [0usize, 4] {
+        let r = h.rect(egui::Id::unique(("step", cid, step)));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    }
+    assert_eq!(h.lane_notes().len(), 2);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.lane_notes().len(), 1, "Ctrl+Z undoes the second note");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
+    assert_eq!(h.lane_notes().len(), 2, "Ctrl+Shift+Z redoes it (undoing again would leave none)");
+    assert!(h.app.status_line.starts_with("Redid"), "{}", h.app.status_line);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    h.key(egui::Key::Y, egui::Modifiers::CTRL);
+    assert_eq!(h.lane_notes().len(), 2, "Ctrl+Y redoes too");
+}
+
+#[test]
+fn projects_saved_under_a_relative_name_are_remembered_by_their_absolute_path() {
+    // the tests run in crates/app: a relative name lands in the workspace's target folder
+    let rel_dir = PathBuf::from(format!("../../target/rawdawg-relative-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&rel_dir);
+    std::fs::create_dir_all(&rel_dir).unwrap();
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    h.app.save_project_as(rel_dir.join("MySong"));
+    let remembered = h.app.prefs.recent_projects[0].clone();
+    assert!(remembered.is_absolute(), "{}", remembered.display());
+    assert!(!remembered.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)), "one spelling: {}", remembered.display());
+    assert!(remembered.join("project.json").is_file(), "it points at the saved project");
+    assert!(h.app.project_path.as_ref().is_some_and(|p| p.is_absolute()));
+    // the same project opened again through a relative path is one entry, not two
+    h.app.open_project(rel_dir.join("MySong.rawdawg"));
+    assert_eq!(h.app.prefs.recent_projects.iter().filter(|p| **p == remembered).count(), 1);
+    assert_eq!(h.app.prefs.recent_projects[0], remembered);
+    // old relative entries: kept (made absolute) when they still resolve, dropped otherwise
+    let mut prefs = crate::prefs::Preferences { recent_projects: vec![rel_dir.join("MySong.rawdawg"), PathBuf::from("Nowhere.rawdawg"), remembered.clone()], ..Default::default() };
+    prefs.normalize_recent();
+    assert_eq!(prefs.recent_projects, vec![remembered.clone()]);
+    let _ = std::fs::remove_dir_all(&rel_dir);
+}
+
+#[test]
+fn a_tempo_change_lands_in_the_bar_that_was_right_clicked() {
+    let mut h = Harness::new(None);
+    h.frame(vec![]);
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    let marker = h.rect(super::playlist::marker_id(true, 0));
+    // just right of the bar 4 line (tick 3 × 3840), on the marker row
+    let x = super::playlist::lane_point(&h.app.playlist, surface, 3 * 3840 + 120, 0).x;
+    let at = egui::pos2(x, marker.center().y);
+    h.click_at(at, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "At bar 4"), "the menu names bar 4");
+    // the entry sits to the right; moving there must not change the bar
+    let entry = h.drawn_nodes().into_iter().find(|(t, _)| t == "Add tempo change here").map(|(_, r)| r).unwrap();
+    h.move_to(egui::pos2(entry.center().x + 80.0, entry.center().y));
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "At bar 4"), "the heading stays at bar 4 while the pointer moves");
+    h.click_at(entry.center(), egui::PointerButton::Primary);
+    let ticks: Vec<i64> = h.app.project.tempo.iter().map(|t| t.tick.0).collect();
+    assert_eq!(ticks, vec![0, 3 * 3840], "the new marker is at bar 4");
+}
+
+#[test]
+fn randomize_starts_from_a_different_seed_every_launch() {
+    // two launches: the first Randomize seeds differ (they were equal on every launch)
+    let firsts: Vec<u64> = (0..2).map(|_| super::evolve::next_seed(&mut super::evolve::EvolveState::new())).collect();
+    assert_ne!(firsts[0], firsts[1], "a new launch is a new sequence");
+    // within one launch the sequence still moves on
+    let mut st = super::evolve::EvolveState::new();
+    let (a, b) = (super::evolve::next_seed(&mut st), super::evolve::next_seed(&mut st));
+    assert_ne!(a, b);
+    // the rack randomizer too: the same project, reopened in two launches, randomizes differently
+    let mut project = Harness::new(None).app.project.clone();
+    let master = project.mixer.master_id;
+    let inst = rawdawg_project::Instance::native("native.fx.delay", serde_json::Value::Null);
+    project.mixer.channels.iter_mut().find(|m| m.id == master).unwrap().inserts.push(inst);
+    let rack_after = || {
+        let mut h = Harness::new(None);
+        h.app.project = project.clone();
+        h.app.rebuild_mirrors();
+        super::mixer::randomize_rack(&mut h.app, master);
+        h.app.project.mixer_channel(master).unwrap().inserts[0].state.clone()
+    };
+    assert_ne!(rack_after(), rack_after(), "Randomize rack differs between launches");
+}
+
+#[test]
+fn drawing_one_note_is_one_undo_step() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::PianoRoll;
+    h.frame(vec![]);
+    let surface = h.rect(egui::Id::unique("piano-roll-surface"));
+    let depth = h.app.history.undo_len();
+    // press and drag right four sixteenths
+    let from = super::piano_roll::grid_point(&h.app.piano_roll, surface, 30, 60.5);
+    let to = super::piano_roll::grid_point(&h.app.piano_roll, surface, 4 * 240 + 30, 60.5);
+    h.drag(from, to, egui::PointerButton::Primary);
+    let n = h.lane_notes();
+    assert_eq!(n.len(), 1);
+    assert!(n[0].duration_ticks.0 >= 3 * 240, "the drag set its length: {:?}", n[0]);
+    assert_eq!(h.app.history.undo_len(), depth + 1, "one undo step for the note");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h.lane_notes().is_empty(), "one Ctrl+Z removes it (it used to shrink it first)");
+    // a plain click draws one note, one step too
+    let p = super::piano_roll::grid_point(&h.app.piano_roll, surface, 960 + 30, 62.5);
+    h.click_at(p, egui::PointerButton::Primary);
+    assert_eq!(h.lane_notes().len(), 1);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!(h.lane_notes().is_empty());
+}
+
+#[test]
+fn save_and_close_on_a_new_project_closes_after_the_save_as() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-save-close-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    let (pid, cid) = (h.app.project.patterns[0].id, h.app.project.channels[0].id);
+    h.app.apply(rawdawg_project::Command::AddNotes {
+        pattern_id: pid,
+        channel_id: cid,
+        notes: vec![rawdawg_project::Note { id: rawdawg_types::NoteId::new(), tick: Tick(0), duration_ticks: Tick(240), pitch: 60, velocity: 0.8, channel: 0 }],
+    });
+    let click = |h: &mut Harness, text: &str| {
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let r = h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+        h.click_at(r.center(), egui::PointerButton::Primary);
+    };
+    // the close request found unsaved changes: Save and close → Save As (cancelled first)
+    h.app.files.close_prompt = true;
+    click(&mut h, "Save and close");
+    assert!(!h.app.files.closing, "not yet: there is no folder to save to");
+    click(&mut h, "Cancel");
+    assert!(!h.app.files.closing && !h.app.files.close_after_save, "cancelled: rawDAWg stays open");
+    // again, and this time save
+    h.app.files.close_prompt = true;
+    click(&mut h, "Save and close");
+    h.app.files.path_input = root.join("closetest").display().to_string();
+    click(&mut h, "Save as");
+    assert!(!h.app.history.is_dirty(), "saved");
+    assert!(root.join("closetest.rawdawg/project.json").is_file());
+    assert!(h.app.files.closing, "and rawDAWg closes, as asked");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn with_audio_off_the_ruler_seeks_and_clips_split_at_the_playhead_or_where_right_clicked() {
+    let mut h = Harness::new(Some("../../fixtures/demo-song.rawdawg"));
+    assert!(!matches!(h.app.audio, super::AudioState::Running(_)), "no engine in this test (like --no-audio)");
+    h.frame(vec![]);
+    let surface = h.rect(egui::Id::unique("playlist-surface"));
+    // the first clip of the first track
+    let track = h.app.project.tracks[0].id;
+    let clip = h.app.project.clips.iter().filter(|c| c.track_id == track).min_by_key(|c| c.start_tick.0).unwrap().clone();
+    let inside = clip.start_tick.0 + clip.length_ticks.0 / 2;
+    // click the ruler above it: the playhead moves there
+    let x = super::playlist::lane_point(&h.app.playlist, surface, inside, 0).x;
+    h.click_at(egui::pos2(x, surface.min.y + 6.0), egui::PointerButton::Primary);
+    let at = h.app.playhead_tick().unwrap();
+    assert!((at - inside).abs() <= 240, "seeked without audio: {at} vs {inside}");
+    // select the clip and split it at the playhead
+    h.app.playlist.selection.clear();
+    h.app.playlist.selection.insert(clip.id);
+    let clips = h.app.project.clips.len();
+    let split = h.drawn_nodes().into_iter().find(|(t, _)| t == "Split at playhead").map(|(_, r)| r).expect("the toolbar button");
+    h.click_at(split.center(), egui::PointerButton::Primary);
+    assert_eq!(h.app.project.clips.len(), clips + 1, "split: {}", h.app.status_line);
+    let left = h.app.project.clips.iter().find(|c| c.id == clip.id).unwrap();
+    assert_eq!(left.end_tick().0, at, "at the playhead");
+    // right-click the right half: "Split here" splits where the right-click was
+    let right = h.app.project.clips.iter().find(|c| c.track_id == track && c.start_tick.0 == at).unwrap().clone();
+    let here = right.start_tick.0 + right.length_ticks.0 / 2;
+    let p = super::playlist::lane_point(&h.app.playlist, surface, here, 0);
+    h.click_at(p, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    let entry = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Split here")).map(|(_, r)| r).expect("Split here is offered");
+    h.click_at(entry.center(), egui::PointerButton::Primary);
+    assert_eq!(h.app.project.clips.len(), clips + 2, "split again: {}", h.app.status_line);
+    let ends: Vec<i64> = h.app.project.clips.iter().filter(|c| c.track_id == track).map(|c| c.end_tick().0).collect();
+    assert!(ends.iter().any(|e| (e - here).abs() <= 240), "split where right-clicked: {ends:?} vs {here}");
+}
+
+#[test]
+fn mixer_strips_are_deleted_from_their_menu_and_a_deleted_channel_takes_its_own_strip() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Mixer;
+    h.frame(vec![]);
+    let node = |h: &mut Harness, text: &str| {
+        h.drawn_nodes().into_iter().filter(|(t, _)| t == text).map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap_or_else(|| panic!("{text:?} not drawn"))
+    };
+    let names = |h: &Harness| h.app.project.mixer.channels.iter().map(|m| m.name.clone()).collect::<Vec<_>>();
+    // + Bus, then the synth plays into it
+    let plus = node(&mut h, "+ Bus");
+    h.click_at(plus.center(), egui::PointerButton::Primary);
+    assert_eq!(names(&h), ["Master", "Insert 1", "Bus 2"]);
+    let bus = h.app.project.mixer.channels[2].id;
+    let cid = h.app.project.channels[0].id;
+    h.app.apply(Command::SetChannelMixer { id: cid, mixer_id: bus });
+    let depth = h.app.history.undo_len();
+    // right-click its name: Delete strip
+    h.frame(vec![]);
+    let name = node(&mut h, "Bus 2");
+    h.click_at(name.center(), egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    let del = node(&mut h, "Delete strip (undoable)");
+    h.click_at(del.center(), egui::PointerButton::Primary);
+    assert_eq!(names(&h), ["Master", "Insert 1"], "the bus is gone");
+    assert_eq!(h.app.project.channel(cid).unwrap().mixer_id, h.app.project.mixer.master_id, "its source plays where it played");
+    assert!(h.app.status_line.contains("Synth now plays into Master"), "{}", h.app.status_line);
+    assert_eq!(h.app.history.undo_len(), depth + 1, "one undo step");
+    h.app.undo();
+    assert_eq!(names(&h), ["Master", "Insert 1", "Bus 2"]);
+    assert_eq!(h.app.project.channel(cid).unwrap().mixer_id, bus);
+    // the master has no delete entry
+    h.frame(vec![]);
+    let master = node(&mut h, "Master");
+    h.click_at(master.center(), egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Rename"));
+    assert!(!h.drawn_texts().iter().any(|t| t == "Delete strip (undoable)"), "never the master");
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    // a channel deleted in the rack takes the strip that only existed for it
+    h.app.apply(Command::SetChannelMixer { id: cid, mixer_id: h.app.project.mixer.channels[1].id });
+    h.app.editor_view = EditorView::Rack;
+    rack_menu(&mut h, 0, "Delete channel (undoable)");
+    assert!(h.app.project.channels.is_empty());
+    assert_eq!(names(&h), ["Master", "Bus 2"], "Insert 1 went with its channel, the bus stays");
+    assert!(h.app.status_line.contains("and its mixer strip Insert 1"), "{}", h.app.status_line);
+    h.app.undo();
+    assert_eq!(names(&h), ["Master", "Insert 1", "Bus 2"], "one undo brings both back");
+    assert_eq!(h.app.project.channels.len(), 1);
+    // a new synth's strip never repeats a name that is taken
+    h.app.add_synth_channel();
+    let last = h.app.project.mixer.channels.last().unwrap().name.clone();
+    assert_eq!(last, "Insert 3");
+    h.app.add_synth_channel();
+    assert_eq!(h.app.project.mixer.channels.last().unwrap().name, "Insert 4");
+    // Master, Insert 1, Insert 3, Insert 4: three strips, but "Insert 4" is taken
+    let (cmd, _) = rawdawg_project::routing::remove_mixer_channel(&h.app.project, bus).unwrap();
+    h.app.apply(cmd);
+    h.app.add_synth_channel();
+    assert_eq!(h.app.project.mixer.channels.last().unwrap().name, "Insert 5");
+}
+
+/// Every non-ASCII character in the code outside comments, by crate source file: what the UI
+/// can draw (labels, parameter names and units, messages).
+fn source_symbols() -> std::collections::BTreeMap<char, std::collections::BTreeSet<String>> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut files = Vec::new();
+    for c in std::fs::read_dir(crates).unwrap().flatten() {
+        walk(&c.path().join("src"), &mut files);
+    }
+    let mut found: std::collections::BTreeMap<char, std::collections::BTreeSet<String>> = Default::default();
+    for f in files {
+        let text = std::fs::read_to_string(&f).unwrap();
+        for line in text.lines() {
+            // drop a line comment (one not inside a string literal)
+            let (mut in_str, mut esc, mut end) = (false, false, line.len());
+            for (i, ch) in line.char_indices() {
+                match ch {
+                    _ if esc => esc = false,
+                    '\\' => esc = true,
+                    '"' => in_str = !in_str,
+                    '/' if !in_str && line[i..].starts_with("//") => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            for ch in line[..end].chars().filter(|c| !c.is_ascii()) {
+                found.entry(ch).or_default().insert(f.strip_prefix(crates).unwrap().display().to_string());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn every_symbol_the_code_can_draw_has_a_glyph_in_the_fonts() {
+    let mut h = Harness::new(None);
+    h.frame(vec![]);
+    let symbols = source_symbols();
+    assert!(symbols.contains_key(&'·'), "the scan sees the UI's strings");
+    let missing: Vec<String> = h.ctx.fonts_mut(|f| {
+        symbols
+            .iter()
+            .filter(|(c, _)| !(f.has_glyph(&egui::FontId::proportional(14.0), **c) && f.has_glyph(&egui::FontId::monospace(14.0), **c)))
+            .map(|(c, files)| format!("{c:?} (U+{:04X}) in {files:?}", *c as u32))
+            .collect()
+    });
+    assert!(missing.is_empty(), "no font draws these (they show as empty boxes):\n{}", missing.join("\n"));
+}
+
+#[test]
+fn at_the_minimum_window_size_the_toolbar_and_status_bar_keep_every_control_visible() {
+    // UI_UX: responsive down to 1024×720 with no clipped critical controls (issues #12, #21)
+    let long_error = "opening audio stream: the audio stream was lost: ALSA function 'snd_pcm_avail_delay' failed with error 'I/O error (5)'; \
+                      fallback to device default buffer also failed: opening audio stream: the audio stream was lost: ALSA function 'snd_pcm_avail_delay' failed with error 'I/O error (5)'";
+    for (audio, toolbar_audio, status_audio, button) in [
+        (AudioState::Failed(long_error.into()), "Audio unavailable", "Audio unavailable: opening", "Retry audio"),
+        (AudioState::Disabled, "Audio off", "Audio off —", "Start audio"),
+    ] {
+        let mut h = Harness::new(None);
+        h.size = egui::vec2(1024.0, 720.0);
+        h.app.audio = audio;
+        h.app.project_path = Some(PathBuf::from("/home/me/Music/My first song.rawdawg"));
+        h.app.apply(Command::RenameProject { name: "edited".into() });
+        h.frame(vec![]);
+        h.frame(vec![]);
+        let nodes = h.drawn_nodes();
+        let (w, ht) = (h.size.x, h.size.y);
+        let find = |pred: &dyn Fn(&str) -> bool, in_status: bool, what: &str| {
+            nodes
+                .iter()
+                .find(|(t, r)| pred(t) && if in_status { r.center().y > ht - 40.0 } else { r.center().y < 100.0 })
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{what} not drawn ({toolbar_audio})"))
+        };
+        let toolbar: Vec<(&str, egui::Rect)> = ["Undo", "Redo", "Settings", "MIDI n/a", toolbar_audio, "Metronome", "Play", "Typing keys", "C4", "Vel"]
+            .into_iter()
+            .map(|t| (t, find(&|x: &str| x == t, false, t)))
+            .collect();
+        let status: Vec<(&str, egui::Rect)> = vec![
+            ("message", find(&|t: &str| t.starts_with("Ready"), true, "message")),
+            ("audio state", find(&|t: &str| t.starts_with(status_audio), true, "audio state")),
+            (button, find(&|t: &str| t == button, true, button)),
+            ("unsaved", find(&|t: &str| t == "unsaved", true, "unsaved")),
+            ("project", find(&|t: &str| t == "My first song.rawdawg", true, "project")),
+            ("brand", find(&|t: &str| t.contains("Less thinking."), true, "brand")),
+        ];
+        for group in [&toolbar, &status] {
+            for (i, (a, ra)) in group.iter().enumerate() {
+                assert!(ra.left() >= 0.0 && ra.right() <= w + 0.5, "{a} {ra:?} leaves the {w} px window ({toolbar_audio})");
+                for (b, rb) in &group[i + 1..] {
+                    assert!(ra.intersect(*rb).area() <= 1.0, "{a} {ra:?} overlaps {b} {rb:?} ({toolbar_audio})");
+                }
+            }
+        }
+        // Undo/Redo stay on the first row with the transport; the typing-keys group moves as one
+        let t = |name: &str| toolbar.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert!((t("Undo").center().y - t("Play").center().y).abs() < 2.0, "Undo is on the transport row");
+        for part in ["C4", "Vel"] {
+            assert!((t(part).center().y - t("Typing keys").center().y).abs() < 6.0, "{part} stays with Typing keys");
+        }
+        // the status bar keeps its reading order
+        let x = |name: &str| status.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert!(x("message").right() <= x("audio state").left() && x("audio state").right() <= x(button).left());
+        assert!(x(button).right() <= x("unsaved").left() && x("unsaved").right() <= x("project").left() && x("project").right() <= x("brand").left());
+    }
 }

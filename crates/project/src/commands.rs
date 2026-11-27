@@ -705,11 +705,19 @@ impl Command {
                     return Err(CommandError::Invalid("the master channel cannot be removed".into()));
                 }
                 let idx = p.mixer.channels.iter().position(|c| c.id == id).ok_or_else(|| unknown("mixer channel", id))?;
-                if p.channels.iter().any(|c| c.mixer_id == id) || p.mixer.channels.iter().any(|m| m.output_id == Some(id) || m.sends.iter().any(|s| s.target_id == id)) {
+                if p.channels.iter().any(|c| c.mixer_id == id)
+                    || p.tracks.iter().any(|t| t.mixer_id == Some(id))
+                    || p.mixer.channels.iter().any(|m| m.output_id == Some(id) || m.sends.iter().any(|s| s.target_id == id))
+                {
                     return Err(CommandError::Invalid("mixer channel is still a routing target; reroute first".into()));
                 }
                 let channel = p.mixer.channels.remove(idx);
-                Ok(Command::AddMixerChannel { channel, index: Some(idx) })
+                let inserts: Vec<InstanceId> = channel.inserts.iter().map(|i| i.id).collect();
+                let mut cmds = vec![Command::AddMixerChannel { channel, index: Some(idx) }];
+                for i in inserts {
+                    cmds.append(&mut orphan_references(p, i));
+                }
+                if cmds.len() == 1 { Ok(cmds.pop().unwrap()) } else { Ok(Command::Batch { commands: cmds }) }
             }
             Command::SetMixerGain { id, gain_db } => {
                 if !gain_db.is_valid() {

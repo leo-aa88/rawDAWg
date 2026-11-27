@@ -189,7 +189,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.heading("Mixer");
         if ui.button("+ Bus").on_hover_text("New mixer channel routed to the master").clicked() {
-            let n = app.project.mixer.channels.len();
+            let taken = |n: &usize| app.project.mixer.channels.iter().any(|m| m.name == format!("Bus {n}"));
+            let n = (app.project.mixer.channels.len()..).find(|n| !taken(n)).unwrap_or_default();
             let master = app.project.mixer.master_id;
             cmds.push(Command::AddMixerChannel {
                 channel: MixerChannel {
@@ -219,7 +220,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 .on_hover_text("Longest insert-chain latency compensated at the master");
         }
         ui.label(
-            egui::RichText::new("Double-click a fader or pan to reset · double-click a name to rename · select a strip for inserts and sends").color(theme::TEXT_SECONDARY).small(),
+            egui::RichText::new("Double-click a fader or pan to reset · right-click a name to rename or delete · select a strip for inserts and sends")
+                .color(theme::TEXT_SECONDARY)
+                .small(),
         );
     });
     let channels = app.project.mixer.channels.clone();
@@ -281,6 +284,19 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
                 if r.double_clicked() {
                     app.mixer.rename = Some((m.id, m.name.clone()));
                 }
+                r.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        app.mixer.rename = Some((m.id, m.name.clone()));
+                        ui.close();
+                    }
+                    if !is_master && ui.button("Delete strip (undoable)").on_hover_text("What plays into it is rerouted to where it plays; sends to it are removed").clicked() {
+                        if let Ok((cmd, rerouted)) = rawdawg_project::routing::remove_mixer_channel(&app.project, m.id) {
+                            app.status_line = deleted_strip_message(&m.name, &rerouted);
+                            cmds.push(cmd);
+                        }
+                        ui.close();
+                    }
+                });
             }
             ui.horizontal(|ui| {
                 let mut mute = m.mute;
@@ -339,6 +355,19 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
             }
         });
     });
+}
+
+/// What deleting a strip did, in one line.
+fn deleted_strip_message(name: &str, r: &rawdawg_project::routing::Rerouted) -> String {
+    let mut msg = format!("Deleted mixer strip {name}");
+    if !r.sources.is_empty() {
+        let verb = if r.sources.len() == 1 { "plays" } else { "play" };
+        msg += &format!("; {} now {verb} into {}", r.sources.join(", "), r.to);
+    }
+    if !r.sends_dropped.is_empty() {
+        msg += &format!("; removed the send from {}", r.sends_dropped.join(", "));
+    }
+    msg + " (Undo brings it back)"
 }
 
 /// Fader/pan gesture: live preview through the history gesture, one undo entry on release.
@@ -703,6 +732,10 @@ pub(crate) fn randomize_rack(app: &mut App, id: MixerChannelId) -> usize {
     ensure_rack_mirrors(app, &m);
     let before = chain_states(app, &m);
     let snap = rack_snapshot(app, &m);
+    // a different sequence every launch (seeded on first use)
+    if app.mixer.seed == 0 {
+        app.mixer.seed = super::evolve::launch_entropy();
+    }
     app.mixer.seed = app.mixer.seed.wrapping_add(1);
     let mut rng = rawdawg_dsp::rng::DeterministicRng::new(app.mixer.seed ^ 0x7ac4, id.0.as_u128() as u64);
     let mut values = Vec::new();
@@ -723,7 +756,7 @@ pub(crate) fn randomize_rack(app: &mut App, id: MixerChannelId) -> usize {
 pub(crate) fn add_parallel_branch(m: &MixerChannel, cmds: &mut Vec<Command>) -> MixerChannelId {
     let bus = MixerChannel {
         id: MixerChannelId::new(),
-        name: format!("{} ∥", m.name),
+        name: format!("{} parallel", m.name),
         color: m.color,
         gain_db: Db(0.0),
         pan: Pan(0.0),

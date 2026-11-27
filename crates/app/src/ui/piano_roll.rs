@@ -827,15 +827,23 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     st.selection = new_notes.iter().map(|n| n.id).collect();
                     let pitches: Vec<u8> = new_notes.iter().map(|n| n.pitch).collect();
                     let add = Command::AddNotes { pattern_id: pid, channel_id: cid, notes: new_notes.clone() };
-                    match grow {
+                    let insert = match grow {
                         Some(g) => {
                             if let Command::SetPatternLength { length_ticks, .. } = &g {
                                 let bar = app.project.meter_map().ok().map(|m| m.bar_start_tick(1).0).filter(|t| *t > 0).unwrap_or(PPQ * 4);
                                 app.status_line = format!("The pattern grew to {} bars", length_ticks.0 / bar);
                             }
-                            cmds.push(Command::Batch { commands: vec![g, add] });
+                            Command::Batch { commands: vec![g, add] }
                         }
-                        None => cmds.push(add),
+                        None => add,
+                    };
+                    // the insertion opens the gesture its length drag continues: one drawn note
+                    // is one undo step (committed on release)
+                    if !app.history.gesture_active() {
+                        let _ = app.history.begin_gesture();
+                    }
+                    if let Err(e) = app.history.preview(&mut app.project, insert) {
+                        app.status_line = format!("Edit rejected: {e}");
                     }
                     // dragging right after insertion resizes the new notes
                     app.piano_roll.gesture_target = Some((pid, cid));

@@ -194,6 +194,8 @@ pub(crate) struct App {
     /// Per MIDI device: its clock mapped onto the process clock, and its latency (timestamped
     /// input, `rawdawg_audio_engine::timing`).
     midi_clocks: HashMap<u16, (rawdawg_midi::MidiClock, rawdawg_audio_engine::timing::JitterBuffer)>,
+    /// The playhead while no engine runs (set by seeking).
+    offline_playhead: i64,
     /// Deterministic tests only: every live event sent to the engine.
     #[cfg(test)]
     pub live_log: Vec<TimedEvent>,
@@ -216,7 +218,7 @@ impl App {
         let mut prefs = prefs;
         // a preset file opens the default project and is imported once the app is built
         let preset_to_import = opts.open.clone().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rawdawgpreset")));
-        let project_to_open = opts.open.clone().filter(|_| preset_to_import.is_none());
+        let project_to_open = opts.open.clone().filter(|_| preset_to_import.is_none()).map(|p| crate::prefs::absolute(&p));
         let (project, project_path, mut status_line) = match &project_to_open {
             Some(p) => match rawdawg_project::load_project_dir(p) {
                 Ok(proj) => {
@@ -305,6 +307,7 @@ impl App {
             settings: settings::SettingsState::from_request(&req),
             midi_rescan_counter: 0,
             midi_clocks: HashMap::new(),
+            offline_playhead: 0,
             #[cfg(test)]
             live_log: Vec::new(),
             buffer_fallback_tried: false,
@@ -906,11 +909,12 @@ impl App {
         if text_focused {
             return;
         }
-        let (undo, redo, space, f6, f7, f8, f9, esc) = ctx.input_mut(|i| {
+        let (redo, undo, space, f6, f7, f8, f9, esc) = ctx.input_mut(|i| {
             (
-                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z)),
+                // redo first: egui matches Ctrl+Z "logically", so it also takes Ctrl+Shift+Z
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z))
                     || i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y)),
+                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z)),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F6),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::F7),
@@ -977,12 +981,19 @@ impl App {
         }
     }
 
-    /// Engine playhead in project ticks (None without a running engine).
+    /// The playhead in project ticks: the engine's, or (no engine running) the position set by
+    /// the last seek, so seeking and "at the playhead" edits work with audio off too.
     pub(crate) fn playhead_tick(&self) -> Option<i64> {
         match &self.audio {
             AudioState::Running(s) => Some(s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed)),
-            _ => None,
+            _ => Some(self.offline_playhead),
         }
+    }
+
+    /// Move the playhead (the engine's when it runs; ours either way).
+    pub(crate) fn seek(&mut self, tick: i64) {
+        self.offline_playhead = tick.max(0);
+        self.send(EngineCommand::SeekTick(tick.max(0)));
     }
 
     /// Restart audio with the given request (settings Apply / retry). Persists the
@@ -1024,89 +1035,13 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        // the status on the right takes its place first; the controls fill what is left and wrap
+        // onto a second line in a narrow window instead of running under it (UI_UX: 1024×720)
         ui.horizontal(|ui| {
-            rawdawg_ui::params::wordmark(ui, 18.0);
-            ui.separator();
-            let playing = self.is_playing();
-            if ui.add_enabled(!playing, egui::Button::new("Play")).on_hover_text("Space").clicked() {
-                self.play_pressed();
-            }
-            if ui.add_enabled(playing, egui::Button::new("Stop")).on_hover_text("Space").clicked() {
-                self.send(EngineCommand::Stop);
-            }
-            if ui.button("Panic").on_hover_text("All notes off (Esc)").clicked() {
-                self.send(EngineCommand::Panic { source: None });
-            }
-            ui.separator();
-            self.tempo_control(ui);
-            let (bar, beat) = match &self.audio {
-                AudioState::Running(s) => {
-                    let tick = s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed);
-                    let pos = self.project.meter_map().map(|m| m.position(rawdawg_types::units::Tick(tick))).ok();
-                    pos.map(|p| (p.bar + 1, p.beat + 1)).unwrap_or((1, 1))
-                }
-                _ => (1, 1),
-            };
-            ui.label(egui::RichText::new(format!("{bar}:{beat}")).monospace());
-            let mut metro = match &self.audio {
-                AudioState::Running(s) => s.handle.status.metronome.load(std::sync::atomic::Ordering::Relaxed),
-                _ => false,
-            };
-            if ui.toggle_value(&mut metro, "Metronome").changed() {
-                self.send(EngineCommand::SetMetronome(metro));
-            }
-            ui.separator();
-            ui.checkbox(&mut self.typing_enabled, "Typing keys").on_hover_text("Z S X D C V G B H N J M , L . ; /  play notes on the selected channel");
-            if ui.button("−").on_hover_text("Octave down").clicked() {
-                self.prefs.typing_octave = (self.prefs.typing_octave - 1).max(-4);
-            }
-            ui.label(format!("C{}", 4 + self.prefs.typing_octave));
-            if ui.button("+").on_hover_text("Octave up").clicked() {
-                self.prefs.typing_octave = (self.prefs.typing_octave + 1).min(4);
-            }
-            ui.add(rawdawg_ui::params::slider(ui, &mut self.prefs.typing_velocity, 0.05..=1.0).text("Vel").fixed_decimals(2));
-            ui.separator();
-            let undo_label = self.history.undo_label();
-            if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).on_hover_text(undo_label.unwrap_or("Nothing to undo")).clicked() {
-                self.undo();
-            }
-            let redo_label = self.history.redo_label();
-            if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).on_hover_text(redo_label.unwrap_or("Nothing to redo")).clicked() {
-                self.redo();
-            }
-            ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Settings").clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-                match &self.audio {
-                    AudioState::Running(sys) => {
-                        let st = &sys.stream.status;
-                        let load = st.last_load(sys.stream.config.sample_rate_hz) * 100.0;
-                        ui.label(egui::RichText::new(format!("CPU {load:.0}%")).color(if load > 80.0 { theme::WARNING } else { theme::TEXT_SECONDARY }));
-                        let xruns = st.xruns.get();
-                        if xruns > 0 {
-                            ui.label(egui::RichText::new(format!("xruns {xruns}")).color(theme::WARNING));
-                        }
-                        let frames = st.last_callback_frames.load(std::sync::atomic::Ordering::Relaxed);
-                        ui.label(
-                            egui::RichText::new(format!("{} · {} Hz · {} frames", sys.stream.config.device_name, sys.stream.config.sample_rate_hz, frames))
-                                .color(theme::TEXT_SECONDARY),
-                        )
-                        .on_hover_text("Actual device callback size");
-                    }
-                    AudioState::Disabled => {
-                        ui.label(egui::RichText::new("Audio off").color(theme::WARNING));
-                    }
-                    AudioState::Failed(_) => {
-                        ui.label(egui::RichText::new("Audio unavailable").color(theme::ERROR));
-                    }
-                }
-                let midi_label = if self.midi.is_available() { format!("MIDI {}", self.midi.enabled_ids().len()) } else { "MIDI n/a".to_owned() };
-                ui.label(egui::RichText::new(midi_label).color(theme::TEXT_SECONDARY)).on_hover_text(format!("{} messages received", self.midi_activity));
-                if self.safe_mode {
-                    ui.label(egui::RichText::new("Safe mode").color(theme::WARNING));
-                }
+                self.toolbar_status(ui);
+                ui.separator();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true), |ui| self.toolbar_controls(ui));
             });
         });
         ui.horizontal(|ui| {
@@ -1177,6 +1112,102 @@ impl App {
             self.preview_held.remove(0);
         }
         self.send(EngineCommand::PreviewSample { asset, gain: rawdawg_dsp::math::db_to_lin(-12.0) });
+    }
+
+    /// The toolbar's controls, most important first (transport, tempo, undo), so a narrow
+    /// window wraps the typing-keys group, not Undo/Redo.
+    fn toolbar_controls(&mut self, ui: &mut egui::Ui) {
+        rawdawg_ui::params::wordmark(ui, 18.0);
+        ui.separator();
+        let playing = self.is_playing();
+        if ui.add_enabled(!playing, egui::Button::new("Play")).on_hover_text("Space").clicked() {
+            self.play_pressed();
+        }
+        if ui.add_enabled(playing, egui::Button::new("Stop")).on_hover_text("Space").clicked() {
+            self.send(EngineCommand::Stop);
+        }
+        if ui.button("Panic").on_hover_text("All notes off (Esc)").clicked() {
+            self.send(EngineCommand::Panic { source: None });
+        }
+        ui.separator();
+        self.tempo_control(ui);
+        let (bar, beat) = match &self.audio {
+            AudioState::Running(s) => {
+                let tick = s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed);
+                let pos = self.project.meter_map().map(|m| m.position(rawdawg_types::units::Tick(tick))).ok();
+                pos.map(|p| (p.bar + 1, p.beat + 1)).unwrap_or((1, 1))
+            }
+            _ => (1, 1),
+        };
+        ui.label(egui::RichText::new(format!("{bar}:{beat}")).monospace());
+        let mut metro = match &self.audio {
+            AudioState::Running(s) => s.handle.status.metronome.load(std::sync::atomic::Ordering::Relaxed),
+            _ => false,
+        };
+        if ui.toggle_value(&mut metro, "Metronome").changed() {
+            self.send(EngineCommand::SetMetronome(metro));
+        }
+        ui.separator();
+        let undo_label = self.history.undo_label();
+        if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).on_hover_text(undo_label.unwrap_or("Nothing to undo")).clicked() {
+            self.undo();
+        }
+        let redo_label = self.history.redo_label();
+        if ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo")).on_hover_text(redo_label.unwrap_or("Nothing to redo")).clicked() {
+            self.redo();
+        }
+        ui.separator();
+        // the typing-keys group wraps as one piece (its width is known from the last frame)
+        let group = ui.scope_id().with("typing-keys-group");
+        if ui.available_size_before_wrap().x < ui.data(|d| d.get_temp::<f32>(group).unwrap_or(0.0)) {
+            ui.end_row();
+        }
+        let r = ui.horizontal(|ui| {
+            ui.checkbox(&mut self.typing_enabled, "Typing keys").on_hover_text("Z S X D C V G B H N J M , L . ; /  play notes on the selected channel");
+            if ui.button("−").on_hover_text("Octave down").clicked() {
+                self.prefs.typing_octave = (self.prefs.typing_octave - 1).max(-4);
+            }
+            ui.label(format!("C{}", 4 + self.prefs.typing_octave));
+            if ui.button("+").on_hover_text("Octave up").clicked() {
+                self.prefs.typing_octave = (self.prefs.typing_octave + 1).min(4);
+            }
+            ui.add(rawdawg_ui::params::slider(ui, &mut self.prefs.typing_velocity, 0.05..=1.0).text("Vel").fixed_decimals(2));
+        });
+        ui.data_mut(|d| d.insert_temp(group, r.response.rect.width()));
+    }
+
+    /// The toolbar's right end, drawn right to left: Settings, the audio device, MIDI.
+    fn toolbar_status(&mut self, ui: &mut egui::Ui) {
+        let full = ui.available_width();
+        if ui.button("Settings").clicked() {
+            self.show_settings = !self.show_settings;
+        }
+        match &self.audio {
+            AudioState::Running(sys) => {
+                let st = &sys.stream.status;
+                let load = st.last_load(sys.stream.config.sample_rate_hz) * 100.0;
+                ui.label(egui::RichText::new(format!("CPU {load:.0}%")).color(if load > 80.0 { theme::WARNING } else { theme::TEXT_SECONDARY }));
+                let xruns = st.xruns.get();
+                if xruns > 0 {
+                    ui.label(egui::RichText::new(format!("xruns {xruns}")).color(theme::WARNING));
+                }
+                let frames = st.last_callback_frames.load(std::sync::atomic::Ordering::Relaxed);
+                // a long device name is cut (it is on hover), so it never runs under the controls
+                let text = format!("{} · {} Hz · {} frames", sys.stream.config.device_name, sys.stream.config.sample_rate_hz, frames);
+                bounded_label(ui, egui::RichText::new(&text).color(theme::TEXT_SECONDARY), full * 0.22).on_hover_text(format!("{text}\nActual device callback size"));
+            }
+            AudioState::Disabled => {
+                ui.label(egui::RichText::new("Audio off").color(theme::WARNING));
+            }
+            AudioState::Failed(_) => {
+                ui.label(egui::RichText::new("Audio unavailable").color(theme::ERROR));
+            }
+        }
+        let midi_label = if self.midi.is_available() { format!("MIDI {}", self.midi.enabled_ids().len()) } else { "MIDI n/a".to_owned() };
+        ui.label(egui::RichText::new(midi_label).color(theme::TEXT_SECONDARY)).on_hover_text(format!("{} messages received", self.midi_activity));
+        if self.safe_mode {
+            ui.label(egui::RichText::new("Safe mode").color(theme::WARNING));
+        }
     }
 
     fn browser(&mut self, ui: &mut egui::Ui) {
@@ -1316,6 +1347,7 @@ impl App {
     }
 
     pub(crate) fn open_project(&mut self, path: PathBuf) {
+        let path = crate::prefs::absolute(&path);
         match rawdawg_project::load_project_dir(&path) {
             Ok(p) => {
                 self.send(EngineCommand::Panic { source: None });
@@ -1414,8 +1446,13 @@ impl App {
                         cmds.push(Command::MoveChannel { id: ch.id, to_index: ci + 1 });
                         ui.close();
                     }
-                    if ui.button("Delete channel (undoable)").clicked() {
-                        cmds.push(Command::RemoveChannel { id: ch.id });
+                    if ui.button("Delete channel (undoable)").on_hover_text("Its mixer strip goes too when nothing else plays into it and it holds no effects").clicked() {
+                        let (cmd, strip) = rawdawg_project::routing::remove_channel(&self.project, ch.id);
+                        self.status_line = match strip.and_then(|s| self.project.mixer_channel(s)) {
+                            Some(s) => format!("Deleted {} and its mixer strip {} (Undo brings both back)", ch.name, s.name),
+                            None => format!("Deleted {}", ch.name),
+                        };
+                        cmds.push(cmd);
                         ui.close();
                     }
                 });
@@ -1553,71 +1590,84 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        // right group first: the unsaved marker always shows, the project name and the version
+        // get a bounded width and are cut (full text on hover); the left group fills the rest
         ui.horizontal(|ui| {
-            // the message gets at most part of the row and is cut with an ellipsis (full text on
-            // hover), so a long path never runs under the audio status and the version label
-            let max = (ui.available_width() * 0.45).max(160.0);
-            ui.allocate_ui_with_layout(egui::vec2(max, ui.available_height()), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(&self.status_line).truncate());
-            });
-            ui.separator();
-            let mut retry = false;
-            match &self.audio {
-                AudioState::Running(sys) => {
-                    let st = &sys.handle.status;
-                    let l = st.master_peak_l.load();
-                    let r = st.master_peak_r.load();
-                    st.master_peak_l.store(0.0);
-                    st.master_peak_r.store(0.0);
-                    meter(ui, l);
-                    meter(ui, r);
-                    let red = st.master_reduction_db.load();
-                    if red > 0.1 {
-                        ui.label(egui::RichText::new(format!("limiter −{red:.1} dB")).color(theme::WARNING));
-                    }
-                    ui.label(format!("voices {}", st.active_voices.load(std::sync::atomic::Ordering::Relaxed)));
-                    let overflow = st.command_overflows.get() + st.dropped_events.get();
-                    if overflow > 0 {
-                        ui.label(egui::RichText::new(format!("dropped {overflow}")).color(theme::ERROR)).on_hover_text("Control queue overflow or events for unknown channels");
-                    }
-                    let late = st.late_events.get();
-                    if late > 0 {
-                        ui.label(egui::RichText::new(format!("late MIDI {late}")).color(theme::WARNING))
-                            .on_hover_text("MIDI notes that arrived after the moment they should have played (placed at once); a larger audio buffer gives them more room");
-                    }
-                    if let Some(e) = &self.plan_error {
-                        ui.label(egui::RichText::new(e).color(theme::ERROR));
-                    }
-                }
-                AudioState::Failed(e) => {
-                    ui.label(egui::RichText::new(format!("Audio unavailable: {e}")).color(theme::ERROR));
-                    if ui.button("Retry audio").clicked() {
-                        retry = true;
-                    }
-                }
-                AudioState::Disabled => {
-                    ui.label(egui::RichText::new("Audio off — editing and offline render available").color(theme::WARNING));
-                    if ui.button("Start audio").clicked() {
-                        retry = true;
-                    }
-                }
-            }
-            if retry {
-                let req = self.settings.request();
-                self.restart_audio(&req);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(format!("{PRODUCT_NAME} {VERSION} — {TAGLINE}")).color(theme::TEXT_SECONDARY)).truncate());
+                let full = ui.available_width();
+                bounded_label(ui, egui::RichText::new(format!("{PRODUCT_NAME} {VERSION} — {TAGLINE}")).color(theme::TEXT_SECONDARY), full * 0.2);
                 if let Some(p) = &self.project_path {
                     // the folder name says which project; the whole path is on hover
                     let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
-                    ui.add(egui::Label::new(egui::RichText::new(name).color(theme::TEXT_SECONDARY)).truncate()).on_hover_text(p.display().to_string());
+                    bounded_label(ui, egui::RichText::new(name).color(theme::TEXT_SECONDARY), full * 0.15).on_hover_text(p.display().to_string());
                 }
                 if self.history.is_dirty() {
                     ui.label(egui::RichText::new("unsaved").color(theme::WARNING));
                 }
+                ui.separator();
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| self.status_left(ui));
             });
         });
+    }
+
+    /// The status bar's message and the audio state, in the space the right group leaves.
+    fn status_left(&mut self, ui: &mut egui::Ui) {
+        // the message gets at most part of the row and is cut with an ellipsis (full text on
+        // hover), so a long path never runs under the audio status and the version label
+        let max = (ui.available_width() * 0.45).max(160.0);
+        ui.allocate_ui_with_layout(egui::vec2(max, ui.available_height()), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(&self.status_line).truncate());
+        });
+        ui.separator();
+        let mut retry = false;
+        match &self.audio {
+            AudioState::Running(sys) => {
+                let st = &sys.handle.status;
+                let l = st.master_peak_l.load();
+                let r = st.master_peak_r.load();
+                st.master_peak_l.store(0.0);
+                st.master_peak_r.store(0.0);
+                meter(ui, l);
+                meter(ui, r);
+                let red = st.master_reduction_db.load();
+                if red > 0.1 {
+                    ui.label(egui::RichText::new(format!("limiter −{red:.1} dB")).color(theme::WARNING));
+                }
+                ui.label(format!("voices {}", st.active_voices.load(std::sync::atomic::Ordering::Relaxed)));
+                let overflow = st.command_overflows.get() + st.dropped_events.get();
+                if overflow > 0 {
+                    ui.label(egui::RichText::new(format!("dropped {overflow}")).color(theme::ERROR)).on_hover_text("Control queue overflow or events for unknown channels");
+                }
+                let late = st.late_events.get();
+                if late > 0 {
+                    ui.label(egui::RichText::new(format!("late MIDI {late}")).color(theme::WARNING))
+                        .on_hover_text("MIDI notes that arrived after the moment they should have played (placed at once); a larger audio buffer gives them more room");
+                }
+                if let Some(e) = &self.plan_error {
+                    bounded_label(ui, egui::RichText::new(e).color(theme::ERROR), ui.available_width());
+                }
+            }
+            AudioState::Failed(e) => {
+                // the error can be longer than the window: cut it (full text on hover) so
+                // the Retry button always stays in reach
+                let room = ui.available_width() - button_width(ui, "Retry audio");
+                bounded_label(ui, egui::RichText::new(format!("Audio unavailable: {e}")).color(theme::ERROR), room);
+                if ui.button("Retry audio").clicked() {
+                    retry = true;
+                }
+            }
+            AudioState::Disabled => {
+                let room = ui.available_width() - button_width(ui, "Start audio");
+                bounded_label(ui, egui::RichText::new("Audio off — editing and offline render available").color(theme::WARNING), room);
+                if ui.button("Start audio").clicked() {
+                    retry = true;
+                }
+            }
+        }
+        if retry {
+            let req = self.settings.request();
+            self.restart_audio(&req);
+        }
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -1723,6 +1773,20 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+/// A label cut to at most `max_w` points (egui shows the whole text on hover when it is cut),
+/// so it can never push what follows it out of the row.
+fn bounded_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, max_w: f32) -> egui::Response {
+    let max_w = max_w.max(40.0);
+    ui.allocate_ui(egui::vec2(max_w, ui.available_height()), |ui| ui.add(egui::Label::new(text).truncate())).inner
+}
+
+/// Width a button with `text` takes in `ui`, spacing included.
+fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let w = ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE).size().x);
+    w + 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x
 }
 
 pub(crate) fn meter(ui: &mut egui::Ui, peak: f32) {

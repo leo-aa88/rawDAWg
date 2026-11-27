@@ -55,9 +55,28 @@ pub fn visuals() -> Visuals {
     v
 }
 
+/// egui's fonts with its emoji fonts (stars, play arrows, the lock) and, last in the
+/// proportional fallback chain, the monospace font for the arrows and symbols the proportional
+/// font lacks (→, ●, ⁻), so no label shows an empty box.
+pub fn font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    let mono = fonts.families.get(&egui::FontFamily::Monospace).and_then(|f| f.first().cloned());
+    if let (Some(mono), Some(prop)) = (mono, fonts.families.get_mut(&egui::FontFamily::Proportional))
+        && !prop.contains(&mono)
+    {
+        prop.push(mono);
+    }
+    fonts
+}
+
 /// Apply dark-only styling to a context (called every frame start to defeat any
-/// system theme following).
+/// system theme following). The fonts are installed once per context.
 pub fn apply(ctx: &egui::Context) {
+    let installed = egui::Id::unique("rawdawg-fonts-installed");
+    if !ctx.data(|d| d.get_temp::<bool>(installed).unwrap_or(false)) {
+        ctx.set_fonts(font_definitions());
+        ctx.data_mut(|d| d.insert_temp(installed, true));
+    }
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.set_visuals_of(egui::Theme::Dark, visuals());
     ctx.set_visuals_of(egui::Theme::Light, visuals());

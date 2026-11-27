@@ -52,10 +52,12 @@ pub(crate) fn duplicate_channel(project: &Project, id: ChannelId, with_notes: bo
 pub(crate) fn new_synth_channel(project: &Project, after: Option<ChannelId>) -> (Command, ChannelId) {
     use rawdawg_types::units::{Db, Pan};
     let name = if project.channels.iter().any(|c| c.name == "Synth") { duplicate_name(project, "Synth") } else { "Synth".to_owned() };
+    // the next free "Insert n" (strips can be deleted, so the count alone may repeat a name)
     let inserts = project.mixer.channels.iter().filter(|m| m.id != project.mixer.master_id).count();
+    let n = (inserts + 1..).find(|n| !project.mixer.channels.iter().any(|m| m.name == format!("Insert {n}"))).unwrap_or(inserts + 1);
     let mixer = rawdawg_project::MixerChannel {
         id: rawdawg_types::MixerChannelId::new(),
-        name: format!("Insert {}", inserts + 1),
+        name: format!("Insert {n}"),
         color: None,
         gain_db: Db::UNITY,
         pan: Pan::CENTER,

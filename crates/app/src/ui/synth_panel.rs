@@ -353,7 +353,7 @@ fn mod_matrix(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, patch: 
             if resp.drag_stopped() {
                 dirty = true;
             }
-            if ui.small_button("✕").on_hover_text("Remove route").clicked() {
+            if ui.small_button("×").on_hover_text("Remove route").clicked() {
                 let mut p = patch.clone();
                 p.mod_routes.remove(i);
                 changed = Some(p);

@@ -31,6 +31,10 @@ pub(crate) struct ProjectFilesState {
     /// Another process holds the lock: edits allowed, saving refused until taken over.
     pub read_only: Option<String>,
     pub close_prompt: bool,
+    /// "Save and close" opened Save As: close once that save succeeds.
+    pub close_after_save: bool,
+    /// The window is asked to close (set when rawDAWg sends the close request; tests read it).
+    pub closing: bool,
     pub last_autosave: Option<Instant>,
     pub last_autosave_note: Option<String>,
     /// Relink: asset id → path typed by the user.
@@ -193,6 +197,8 @@ impl App {
 
     /// Save As into a new folder (assets copied); the new folder becomes the project path.
     pub(crate) fn save_project_as(&mut self, dst: PathBuf) {
+        // an absolute path, so the project (and its recent entry) opens from any folder later
+        let dst = crate::prefs::absolute(&dst);
         let dst = if dst.extension().is_some_and(|e| e == "rawdawg") { dst } else { dst.with_extension("rawdawg") };
         let revision = self.history.revision();
         self.project.revision = revision;
@@ -300,11 +306,20 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                             let p = PathBuf::from(app.files.path_input.trim());
                             match kind {
                                 FileDialog::Open => app.open_project_checked(p),
-                                _ => app.save_project_as(p),
+                                _ => {
+                                    app.save_project_as(p);
+                                    if app.files.close_after_save && !app.history.is_dirty() {
+                                        app.files.close_after_save = false;
+                                        app.files.closing = true;
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    }
+                                }
                             }
                         }
                         if ui.button("Cancel").clicked() {
                             app.files.dialog = None;
+                            // the save was cancelled: rawDAWg stays open
+                            app.files.close_after_save = false;
                         }
                     });
                     if kind == FileDialog::Open && !app.prefs.recent_projects.is_empty() {
@@ -325,6 +340,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         });
         if !open {
             app.files.dialog = None;
+            app.files.close_after_save = false;
         }
     }
     // ---- recovery offer
@@ -433,13 +449,18 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 if ui.button("Save and close").clicked() {
                     app.save_project_checked();
                     if !app.history.is_dirty() {
+                        app.files.closing = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else if app.files.dialog == Some(FileDialog::SaveAs) {
+                        // a never-saved project: close once Save As succeeds
+                        app.files.close_after_save = true;
                     }
                     app.files.close_prompt = false;
                 }
                 if ui.button("Discard and close").clicked() {
                     app.history.mark_saved();
                     app.files.close_prompt = false;
+                    app.files.closing = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Cancel").clicked() {

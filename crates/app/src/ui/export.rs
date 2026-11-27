@@ -27,9 +27,21 @@ pub(crate) struct ExportState {
     pub tail_seconds: f64,
     pub stems: bool,
     pub unprotected: bool,
+    /// What the user typed; the extension follows the format when writing (see [`audio_path`]).
     pub path: String,
+    /// The project folder `path` belongs to: another project gets its own default path.
+    path_for: Option<Option<PathBuf>>,
+    /// An export waiting for "Replace" because its files exist.
+    confirm: Option<(Pending, Vec<PathBuf>)>,
     job: Option<Job>,
     pub last_result: Option<String>,
+}
+
+/// What waits for the overwrite confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pending {
+    Audio,
+    Midi,
 }
 
 impl ExportState {
@@ -50,6 +62,8 @@ impl Default for ExportState {
             stems: false,
             unprotected: false,
             path: String::new(),
+            path_for: None,
+            confirm: None,
             job: None,
             last_result: None,
         }
@@ -86,13 +100,112 @@ pub(crate) fn options_for(app: &App, st: &ExportState) -> OfflineOptions {
     }
 }
 
-/// Start the export on a worker thread (the project is snapshotted; the UI stays live).
-pub(crate) fn start(app: &mut App) {
-    let path = PathBuf::from(app.export.path.trim());
-    if path.as_os_str().is_empty() {
+/// The typed path without a known export extension (`mix.wav`, `mix.mid` → `mix`).
+fn stem(typed: &str) -> Option<PathBuf> {
+    let t = typed.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    let known = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).is_some_and(|e| matches!(e.as_str(), "wav" | "flac" | "mid" | "midi"));
+    Some(if known { p.with_extension("") } else { p })
+}
+
+fn with_ext(stem: &std::path::Path, ext: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{ext}", stem.display()))
+}
+
+/// The audio file an export writes: the typed path with the format's extension.
+pub(crate) fn audio_path(st: &ExportState) -> Option<PathBuf> {
+    stem(&st.path).map(|s| with_ext(&s, st.format.extension()))
+}
+
+/// The MIDI file "Export MIDI" writes: the typed path with `.mid`.
+pub(crate) fn midi_path(st: &ExportState) -> Option<PathBuf> {
+    stem(&st.path).map(|s| with_ext(&s, "mid"))
+}
+
+/// The stems folder next to the audio file.
+fn stems_dir(audio: &std::path::Path) -> PathBuf {
+    audio
+        .parent()
+        .map(|d| d.join(format!("{}-stems", audio.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "export".into()))))
+        .unwrap_or_else(|| PathBuf::from("stems"))
+}
+
+/// The export path proposed for the open project (empty for an unsaved one).
+fn default_path(app: &App) -> String {
+    app.project_path.as_ref().map(|dir| dir.join(format!("{}.{}", app.project.name.replace('/', "_"), app.export.format.extension())).display().to_string()).unwrap_or_default()
+}
+
+/// Export audio, asking first when it would replace files.
+pub(crate) fn request_audio(app: &mut App) {
+    let Some(audio) = audio_path(&app.export) else {
         app.export.last_result = Some("Choose an output path first".into());
         return;
+    };
+    let mut existing: Vec<PathBuf> = vec![audio.clone()];
+    if app.export.stems {
+        existing.push(stems_dir(&audio));
     }
+    existing.retain(|p| p.exists());
+    if existing.is_empty() {
+        start(app);
+    } else {
+        app.export.confirm = Some((Pending::Audio, existing));
+    }
+}
+
+/// Export MIDI for the chosen scope, refusing an empty result and asking before replacing.
+pub(crate) fn request_midi(app: &mut App) {
+    let Some(path) = midi_path(&app.export) else {
+        app.export.last_result = Some("Choose an output path first".into());
+        return;
+    };
+    let notes = if app.export.song {
+        rawdawg_project::smf::song_note_count(&app.project)
+    } else {
+        app.project.selected_pattern.map_or(0, |p| rawdawg_project::smf::pattern_note_count(&app.project, p))
+    };
+    if notes == 0 {
+        app.export.last_result = Some(if app.export.song {
+            "Nothing to export: no pattern on the playlist has notes. Choose Scope Pattern to export the selected pattern.".into()
+        } else {
+            "Nothing to export: the selected pattern has no notes.".into()
+        });
+        return;
+    }
+    if path.exists() {
+        app.export.confirm = Some((Pending::Midi, vec![path]));
+    } else {
+        write_midi(app, &path);
+    }
+}
+
+fn write_midi(app: &mut App, path: &std::path::Path) {
+    let bytes = if app.export.song {
+        rawdawg_project::smf::export_song(&app.project)
+    } else {
+        match app.project.selected_pattern {
+            Some(p) => rawdawg_project::smf::export_pattern(&app.project, p),
+            None => Err(rawdawg_project::smf::SmfError::Empty),
+        }
+    };
+    app.export.last_result = Some(match bytes {
+        Ok(bytes) => match std::fs::write(path, bytes) {
+            Ok(()) => format!("Wrote {}", path.display()),
+            Err(e) => format!("Could not write {}: {e}", path.display()),
+        },
+        Err(e) => format!("MIDI export failed: {e}"),
+    });
+}
+
+/// Start the export on a worker thread (the project is snapshotted; the UI stays live).
+pub(crate) fn start(app: &mut App) {
+    let Some(path) = audio_path(&app.export) else {
+        app.export.last_result = Some("Choose an output path first".into());
+        return;
+    };
     let project: Project = app.project.clone();
     let opts = options_for(app, &app.export);
     let format = app.export.format;
@@ -111,10 +224,7 @@ pub(crate) fn start(app: &mut App) {
                 !c2.load(Ordering::Relaxed)
             };
             let out = if stems {
-                let dir = p2
-                    .parent()
-                    .map(|d| d.join(format!("{}-stems", p2.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "export".into()))))
-                    .unwrap_or_else(|| PathBuf::from("stems"));
+                let dir = stems_dir(&p2);
                 export_project(&project, &opts, format, &p2, &mut progress)
                     .and_then(|stats| export_stems(&project, &opts, format, &dir, &mut |_, _| !c2.load(Ordering::Relaxed)).map(|(files, _)| (stats, files)))
             } else {
@@ -203,20 +313,27 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     .on_hover_text("Written next to the main file in a “<name>-stems” folder; stems of channels that share sends need not sum to the master");
             });
             ui.checkbox(&mut app.export.unprotected, "Unprotected (bypass the master limiter; float output recommended)");
+            // the path belongs to the open project: another project starts from its own default
+            match &app.export.path_for {
+                Some(owner) if *owner == app.project_path => {}
+                Some(_) => {
+                    app.export.path = default_path(app);
+                    app.export.confirm = None;
+                }
+                None => {}
+            }
+            app.export.path_for = Some(app.project_path.clone());
+            if app.export.path.trim().is_empty() {
+                app.export.path = default_path(app);
+            }
             ui.horizontal(|ui| {
                 ui.label("File");
-                ui.add(egui::TextEdit::singleline(&mut app.export.path).hint_text("/path/to/mix.wav").desired_width(f32::INFINITY));
+                ui.add(egui::TextEdit::singleline(&mut app.export.path).hint_text("/path/to/mix").desired_width(f32::INFINITY));
             });
-            // keep the extension in step with the format
-            let ext = app.export.format.extension();
-            if !app.export.path.trim().is_empty() && !app.export.path.to_lowercase().ends_with(&format!(".{ext}")) {
-                let p = PathBuf::from(app.export.path.trim()).with_extension(ext);
-                app.export.path = p.display().to_string();
-            }
-            if app.export.path.trim().is_empty()
-                && let Some(dir) = &app.project_path
-            {
-                app.export.path = dir.join(format!("{}.{ext}", app.project.name.replace('/', "_"))).display().to_string();
+            // what will be written (the extension follows the format; MIDI gets .mid)
+            if let (Some(a), Some(m)) = (audio_path(&app.export), midi_path(&app.export)) {
+                let stems = if app.export.stems { format!(" + {}", stems_dir(&a).display()) } else { String::new() };
+                ui.label(egui::RichText::new(format!("Audio: {}{stems} · MIDI: {}", a.display(), m.display())).small().color(theme::TEXT_SECONDARY));
             }
         });
         ui.separator();
@@ -228,24 +345,47 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 job.cancel.store(true, Ordering::Relaxed);
             }
         } else {
-            ui.horizontal(|ui| {
-                if ui.button("Export").clicked() {
-                    start(app);
-                }
-                if ui.button("Export MIDI (type 1)").on_hover_text("The arrangement as a Standard MIDI File next to the audio path").clicked() {
-                    let p = PathBuf::from(app.export.path.trim()).with_extension("mid");
-                    app.export.last_result = Some(match rawdawg_project::smf::export_song(&app.project) {
-                        Ok(bytes) => match std::fs::write(&p, bytes) {
-                            Ok(()) => format!("Wrote {}", p.display()),
-                            Err(e) => format!("Could not write {}: {e}", p.display()),
-                        },
-                        Err(e) => format!("MIDI export failed: {e}"),
+            match app.export.confirm.clone() {
+                Some((pending, existing)) => {
+                    let names: Vec<String> = existing.iter().map(|p| p.display().to_string()).collect();
+                    ui.colored_label(theme::WARNING, format!("{} already exist{}. Replace?", names.join(" and "), if names.len() == 1 { "s" } else { "" }));
+                    ui.horizontal(|ui| {
+                        if ui.button("Replace").clicked() {
+                            app.export.confirm = None;
+                            match pending {
+                                Pending::Audio => start(app),
+                                Pending::Midi => {
+                                    if let Some(p) = midi_path(&app.export) {
+                                        write_midi(app, &p);
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("Keep the existing file").clicked() {
+                            app.export.confirm = None;
+                            app.export.last_result = Some("Nothing written: choose another file name".into());
+                        }
                     });
                 }
-            });
+                None => {
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            request_audio(app);
+                        }
+                        let what = if app.export.song { "The song (pattern clips on the playlist)" } else { "The selected pattern" };
+                        if ui.button("Export MIDI (type 1)").on_hover_text(format!("{what} as a Standard MIDI File")).clicked() {
+                            request_midi(app);
+                        }
+                    });
+                }
+            }
         }
         if let Some(r) = &app.export.last_result {
-            ui.label(egui::RichText::new(r).color(if r.starts_with("Export failed") || r.starts_with("Could not") { theme::ERROR } else { theme::TEXT_SECONDARY }));
+            ui.label(egui::RichText::new(r).color(if r.starts_with("Export failed") || r.starts_with("Could not") || r.starts_with("Nothing") {
+                theme::ERROR
+            } else {
+                theme::TEXT_SECONDARY
+            }));
         }
     });
     app.export.open = open;

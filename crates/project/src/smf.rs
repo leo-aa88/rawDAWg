@@ -263,6 +263,43 @@ pub fn song_notes(project: &Project) -> Vec<(rawdawg_types::ChannelId, Note)> {
     out
 }
 
+/// One pattern as the arrangement: the pattern from tick 0 for its length, at the song's
+/// starting tempo and meter (pattern mode plays it so).
+fn pattern_view(project: &Project, pattern_id: rawdawg_types::PatternId) -> Option<Project> {
+    let pat = project.pattern(pattern_id)?;
+    let mut view = project.clone();
+    view.tempo.truncate(1);
+    view.meter.truncate(1);
+    let track = crate::model::Track { id: rawdawg_types::TrackId::new(), name: pat.name.clone(), color: None, mute: false, solo: false, height: None, mixer_id: None };
+    view.clips = vec![crate::model::Clip {
+        id: rawdawg_types::ClipId::new(),
+        track_id: track.id,
+        start_tick: Tick::ZERO,
+        length_ticks: pat.length_ticks,
+        muted: false,
+        content: ClipContent::Pattern { pattern_id, source_offset_ticks: Tick::ZERO, looped: false },
+    }];
+    view.tracks = vec![track];
+    Some(view)
+}
+
+/// Notes the song export would write (muted clips and tracks are skipped).
+pub fn song_note_count(project: &Project) -> usize {
+    song_notes(project).len()
+}
+
+/// Notes a pattern export would write.
+pub fn pattern_note_count(project: &Project, pattern_id: rawdawg_types::PatternId) -> usize {
+    pattern_view(project, pattern_id).map_or(0, |v| song_notes(&v).len())
+}
+
+/// Export one pattern as SMF type 1, as pattern mode plays it.
+pub fn export_pattern(project: &Project, pattern_id: rawdawg_types::PatternId) -> Result<Vec<u8>, SmfError> {
+    let view = pattern_view(project, pattern_id).ok_or(SmfError::Empty)?;
+    // the view lives only for this call: write from it, then hand back owned bytes
+    export_song(&view)
+}
+
 /// Export the song as SMF type 1 (conductor track + one track per channel, PPQ 960).
 pub fn export_song<'a>(project: &'a Project) -> Result<Vec<u8>, SmfError> {
     let mut smf = Smf::new(Header::new(Format::Parallel, Timing::Metrical(u15::new(PPQ as u16))));

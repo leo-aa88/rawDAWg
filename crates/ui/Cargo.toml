@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 rawdawg-types = { path = "../types" }
-egui = { workspace = true, features = ["default_fonts"] }
+egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { workspace = true }

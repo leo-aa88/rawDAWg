@@ -72,13 +72,15 @@ impl Preferences {
 
     pub fn load() -> Self {
         let Some(p) = Self::path() else { return Self::default() };
-        match std::fs::read(&p) {
+        let mut prefs: Self = match std::fs::read(&p) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 log::warn!("preferences unreadable ({e}); using defaults");
                 Self::default()
             }),
             Err(_) => Self::default(),
-        }
+        };
+        prefs.normalize_recent();
+        prefs
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -91,9 +93,49 @@ impl Preferences {
         std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
     }
 
+    /// Put a project first in the recent list, as an absolute path (a relative one would only
+    /// open again from the folder rawDAWg was started in).
     pub fn remember_project(&mut self, path: PathBuf) {
+        let path = absolute(&path);
         self.recent_projects.retain(|p| p != &path);
         self.recent_projects.insert(0, path);
         self.recent_projects.truncate(10);
     }
+
+    /// Entries saved before paths were made absolute: keep the ones that still resolve from here
+    /// (as absolute paths), drop the ones that cannot be found.
+    pub fn normalize_recent(&mut self) {
+        let mut seen = Vec::new();
+        for p in std::mem::take(&mut self.recent_projects) {
+            let p = if p.is_absolute() {
+                p
+            } else if p.exists() {
+                absolute(&p)
+            } else {
+                continue;
+            };
+            if !seen.contains(&p) {
+                seen.push(p);
+            }
+        }
+        self.recent_projects = seen;
+    }
+}
+
+/// `path` as an absolute path (relative to the current folder), with `.` and `..` folded so one
+/// folder has one spelling in the recent list. Symlinks are kept as they are.
+pub fn absolute(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }

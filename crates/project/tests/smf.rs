@@ -144,3 +144,23 @@ fn smpte_timing_is_rejected_and_odd_meter_positions_are_snapped_with_warnings() 
     assert!(imp.warnings.iter().any(|w| w.contains("120 BPM assumed")));
     assert_eq!(imp.tracks[0].notes[0].duration_ticks, Tick(9600));
 }
+
+#[test]
+fn a_pattern_exports_on_its_own_even_when_the_playlist_is_empty() {
+    use rawdawg_project::smf::{export_pattern, pattern_note_count, song_note_count};
+    let mut p = song();
+    p.clips.clear();
+    let pid = p.patterns[0].id;
+    // nothing is arranged: the song has no notes, the pattern has three
+    assert_eq!(song_note_count(&p), 0);
+    assert_eq!(pattern_note_count(&p, pid), 3);
+    let back = import(&export_pattern(&p, pid).unwrap(), "pat").unwrap();
+    let notes: Vec<(i64, u8)> = back.tracks.iter().flat_map(|t| t.notes.iter().map(|n| (n.tick.0, n.pitch))).collect();
+    assert_eq!(notes.len(), 3, "every note of the pattern: {notes:?}");
+    assert!(notes.contains(&(0, 60)) && notes.contains(&(960, 64)));
+    // the pattern plays at the song's starting tempo and meter (the later change is not part of it)
+    assert_eq!(back.tempo.len(), 1);
+    assert_eq!(back.tempo[0].us_per_quarter, UsPerQuarter(500_000));
+    assert_eq!(back.meter.len(), 1);
+    assert!(back.tracks.iter().flat_map(|t| &t.controllers).count() >= 2, "its controllers too");
+}

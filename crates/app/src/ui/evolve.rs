@@ -57,7 +57,9 @@ pub(crate) struct EvolveState {
 
 impl EvolveState {
     pub fn new() -> Self {
-        Self { chaos: 35.0, locks: Locks::default(), seed_counter: 1, show_evolve: true, match_levels: true, ..Default::default() }
+        // a different sequence every launch (the status line shows each seed, so a sound can
+        // still be found again)
+        Self { chaos: 35.0, locks: Locks::default(), seed_counter: launch_entropy(), show_evolve: true, match_levels: true, ..Default::default() }
     }
 }
 
@@ -117,7 +119,15 @@ fn refresh_trim(app: &mut App, instance: InstanceId) {
     }
 }
 
-fn next_seed(st: &mut EvolveState) -> u64 {
+/// 64 bits from the operating system's randomness (the keys `RandomState` draws per process).
+pub(crate) fn launch_entropy() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.finish() | 1
+}
+
+pub(crate) fn next_seed(st: &mut EvolveState) -> u64 {
     st.seed_counter = st.seed_counter.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     st.seed_counter
 }
@@ -242,7 +252,7 @@ fn locks_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.label("Parameters:");
                 for id in locked {
                     let name = params::DESCRIPTORS.iter().find(|d| d.id.0 == id).map(|d| d.name).unwrap_or("?");
-                    if ui.small_button(format!("{name} ✕")).clicked() {
+                    if ui.small_button(format!("{name} ×")).clicked() {
                         app.synth_panel.evolve.locks.set_param(id, false);
                     }
                 }

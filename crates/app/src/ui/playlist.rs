@@ -4,7 +4,7 @@
 //! playhead and click-to-seek. Audio clips are shown but play back in M5.
 
 use super::piano_roll::Snap;
-use super::{App, EngineCommand, PointerState, TransportMode};
+use super::{App, PointerState, TransportMode};
 use crate::theme;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use rawdawg_audio_engine::AssetResolver;
@@ -43,6 +43,11 @@ pub(crate) struct PlaylistState {
     gesture: Option<Gesture>,
     /// Marker editor: (kind, index) with its working values.
     marker_edit: Option<MarkerEdit>,
+    /// Tick where the marker row was right-clicked: the menu's "At bar" and what it adds.
+    pub marker_menu_tick: Option<i64>,
+    /// The clip that was right-clicked and the tick of the click ("Split here"): its menu stays
+    /// with that clip while the pointer moves over the menu.
+    pub clip_menu: Option<(ClipId, i64)>,
     rename: Option<(TrackId, String)>,
     pub hover: String,
     /// Audio asset armed in the browser: the next click in a lane places it as a clip.
@@ -72,6 +77,8 @@ impl Default for PlaylistState {
             selection: HashSet::new(),
             gesture: None,
             marker_edit: None,
+            marker_menu_tick: None,
+            clip_menu: None,
             rename: None,
             hover: String::new(),
             place_asset: None,
@@ -431,9 +438,16 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         };
         app.playlist.marker_edit = Some(MarkerEdit { tempo, index, bpm, numerator, denominator, tick });
     }
-    // marker row right-click: add markers at the pointer
+    // marker row right-click: add markers where the right-click happened (not where the
+    // pointer is when an entry is clicked, which is to the right of it)
+    if marker_resp.secondary_clicked()
+        && let Some(p) = marker_resp.interact_pointer_pos()
+    {
+        app.playlist.marker_menu_tick = Some(snap_round(tick_at(p.x), Some(bar_t)).max(0));
+    }
+    let menu_tick = app.playlist.marker_menu_tick;
     marker_resp.context_menu(|ui| {
-        let at = ui.ctx().pointer_latest_pos().map(|p| snap_round(tick_at(p.x), Some(bar_t)).max(0)).unwrap_or(0);
+        let at = menu_tick.unwrap_or(0);
         ui.label(format!("At bar {}", at / bar_t + 1));
         if ui.button("Add tempo change here").clicked() {
             let mut tempo = app.project.tempo.clone();
@@ -940,7 +954,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     let t = snap_round(tick_at(p.x), egrid).max(0);
                     if t == start_tick {
                         // plain click: seek
-                        app.send(EngineCommand::SeekTick(start_tick));
+                        app.seek(start_tick);
                     } else {
                         cmds.push(Command::SetLoop { range: Some(LoopRange { start_tick: Tick(start_tick.min(t)), end_tick: Tick(start_tick.max(t)), enabled: true }) });
                     }
@@ -966,11 +980,15 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             None => {}
         }
     }
-    // clip context menu (right-click without drag): mute / loop / make unique / delete
-    if let Some(p) = resp.hover_pos()
+    // clip context menu (right-click without drag): mute / loop / make unique / split / delete
+    if resp.secondary_clicked()
+        && let Some(p) = resp.interact_pointer_pos()
         && lanes_rect.contains(p)
-        && let Some(c) = hit(p)
     {
+        app.playlist.clip_menu = hit(p).map(|c| (c.id, snap_round(tick_at(p.x), egrid).max(0)));
+    }
+    let clip_menu_tick = app.playlist.clip_menu.map(|(_, t)| t);
+    if let Some(c) = app.playlist.clip_menu.and_then(|(id, _)| clips.iter().find(|c| c.id == id).cloned()) {
         resp.clone().context_menu(|ui| {
             ui.label(egui::RichText::new("Clip").strong());
             let mut muted = c.muted;
@@ -1033,6 +1051,12 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                         },
                     });
                 }
+            }
+            if let Some(at) = clip_menu_tick.filter(|t| *t > c.start_tick.0 && *t < c.end_tick().0)
+                && ui.button(format!("Split here (bar {})", fmt_bar(at, bar_ticks(app)))).on_hover_text("Split this clip where you right-clicked").clicked()
+            {
+                split_clips_at(app, &mut cmds, std::slice::from_ref(&c), at);
+                ui.close();
             }
             if ui.button("Split at playhead").clicked() {
                 app.playlist.selection.clear();
@@ -1119,13 +1143,19 @@ fn fmt_bar(tick: i64, bar_ticks: i64) -> String {
 
 /// Split selected clips at the playhead (song position); pattern clips keep their source offset.
 fn split_selected(app: &mut App, cmds: &mut Vec<Command>) {
-    let Some(at) = app.playhead_tick() else {
-        app.status_line = "Start audio to use the playhead for splitting".into();
-        return;
-    };
+    let Some(at) = app.playhead_tick() else { return };
     let sel: Vec<Clip> = app.project.clips.iter().filter(|c| app.playlist.selection.contains(&c.id)).cloned().collect();
+    if !sel.iter().any(|c| at > c.start_tick.0 && at < c.end_tick().0) {
+        app.status_line = "Put the playhead inside the clip (click the ruler there) to split it".into();
+        return;
+    }
+    split_clips_at(app, cmds, &sel, at);
+}
+
+/// Split `clips` at tick `at` (clips that do not span it are left alone; one undo step).
+fn split_clips_at(app: &mut App, cmds: &mut Vec<Command>, clips: &[Clip], at: i64) {
     let mut batch = Vec::new();
-    for c in sel {
+    for c in clips.iter().cloned() {
         if at <= c.start_tick.0 || at >= c.end_tick().0 {
             continue;
         }
