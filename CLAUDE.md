@@ -1,29 +1,15 @@
-# rawDAWg — Repository instructions for Claude Code
+# rawDAWg — Claude Code instructions
 
-## Product identity
+The repository's instructions for coding agents live in `AGENTS.md`, shared with other tools so
+there is one copy to keep current. Edit the rules there, not here.
 
-Product name and display brand: **rawDAWg** (case-sensitive); tagline: **Less thinking. More noise.** Repository name: `rawDAWg`; executable/Cargo binary and Ubuntu package: `rawdawg` (`rawdawg.exe` on Windows); project directory suffix: `.rawdawg`; preset exchange suffix: `.rawdawgpreset`. Use these names consistently; do not invent an alternative brand or rename the project. Legal publisher identity and license remain owner decisions.
+@AGENTS.md
 
-## Mission
+## Claude Code specifics
 
-Implement rawDAWg, the native experimental DAW specified here, not merely a demo, UI mockup, architecture skeleton, or conventional synthesizer. Product north star: maximum expressiveness, minimum cognitive overhead. The owner wants to experiment with sounds, not reason about how to generate them. Build for Windows and Ubuntu concurrently. Native Rust, egui/wgpu, custom DSP, dark only; never introduce JUCE, Electron, webviews, web/WASM delivery, AppImage, Snap or Flatpak.
-
-## Read first
-
-Read `SPECIFICATION.md`, `ARCHITECTURE.md`, `DSP.md`, `UI_UX.md`, `PLUGIN_API.md`, `PROJECT_FORMAT.md`, `TESTING.md`, `ROADMAP.md`, and `REFERENCES.md`. Inspect the repository, current branch, working tree and any existing `PROGRESS.md`. Requirement IDs in the specification are authoritative; detailed contracts in other docs refine them. If a contract conflicts, log it and use the least surprising choice consistent with product requirements. Do not silently remove or weaken requirements, change the stack, or redefine “done.” If a documented default is technically untenable, record an ADR with evidence, alternatives and compatibility impact. Ask the owner only for genuinely irreversible or product-level decisions; continue independent work in the meantime.
-
-## Execution protocol
-
-- Initialize `PROGRESS.md` if absent: milestone, requirement IDs, tasks, checkboxes, decisions, evidence paths, exact commands and exit statuses, outstanding manual/platform gates, blockers, and next action. Keep it factual and current. Create `docs/adr/` and `docs/verification/` for decisions and evidence. Preserve these specification files; propose explicit amendments rather than rewriting requirements to fit the code.
-- Follow the dependency order in `ROADMAP.md`. Work in small vertical slices: implement the behavior, test it, connect it to real UI/CLI flows, update user-facing help and evidence, then proceed. Never build all empty crates first. Each milestone has a usable checkpoint, even on a headless machine.
-- Inspect upstream documentation and actual dependency APIs before coding. Pin a compatible stable Rust toolchain, compatible dependencies, and Cargo.lock; avoid unpinned Git dependencies. Record exact licenses and SDK versions. Use libraries for infrastructure, codecs, FFT, MIDI, OS bindings and plugin ABI where useful, but implement the musical processing, synth model and engine in this repository; no external DAW engine. Do not introduce copyleft or commercially restricted dependencies without owner review where distribution obligations could change. Do not invent an application license.
-- Run formatting, linting, unit/integration tests, headless audio renders and appropriate platform/build checks continuously. Use the commands defined in `TESTING.md`; provide the documented `xtask` interface. Tests must exercise actual behavior, not hard-coded success, fake sample buffers, skipped assertions or mocked features presented as working. A mock hardware backend is appropriate only for deterministic tests and explicitly labeled demo/headless operation.
-- No heap allocation/deallocation, mutex acquisition, blocking, file/network I/O, formatting/logging, thread creation, FFI initialization, or panic unwinding on our real-time audio path. Prepare everything off-thread. Document every `unsafe` and its invariants; bound the execution of graphs, queues, events, voices, and expressions. No silent clipping/NaN propagation, silent queue loss, or hidden audio routing. Third-party plugins are untrusted native code: document their separate limitations.
-- Keep the project model independent from GUI and platform I/O. Keep the real-time renderer independent from editor, file parsing, plugin scanning and OS devices. Never pass a UI mutex to the audio thread. Share the same DSP implementation between standalone app, offline renderer, and exported instruments/effects.
-- UI is for musicians: common actions visible, drag and drop, real audible previews, waveform under the pointer, understandable labels, undo/redo, no compulsory setup beyond choosing device when needed. Dark only, including dialogs and plugin editors we own. Do not claim we can recolor third-party plugin GUIs or OS-owned dialogs.
-- Preserve user modifications. Do not reset or force-push, delete user projects, access secrets, publish packages, push remote commits, install system-wide or run elevated commands without permission. Local milestone commits are appropriate only if the repo/workflow permits; otherwise leave a clean diff and checkpoint in PROGRESS.md. Never fabricate test or platform evidence.
-- Do not stop at a plan: implement. Continue subsequent milestones while tools/time/context permit. If the environment cannot run GUI, actual audio devices, Windows, external hosts, or packaging, perform available headless tests and CI setup, explicitly mark missing checks BLOCKED/NOT RUN, and continue independent tasks. Never declare these gates passed. Before context exhaustion, persist exact status and next concrete action.
-
-## Definition of done
-
-A feature is complete only when its implementation is reachable from the intended user workflow, behavior matches the spec, failure handling works, tests and relevant evidence pass, and requirement IDs are linked to results. A milestone is complete only when its applicable gates pass; blocked gates may allow independent later engineering but remain open. V1 is complete only at the release gate in `TESTING.md`, including real device and cross-host tests on both OSs. Report what passed, what failed, what was not run and what remains, without vague completion percentages or TODOs disguised as finished functionality.
+- Keep the session's task list current and end multi-step turns with the wrap-up, as the app
+  expects; the user follows progress there.
+- For broad reviews ("double check everything", adversarial review), independent reviewer agents
+  that get the code rather than your conclusions find more. Verify each finding yourself before
+  reporting it.
+- Commits end with the attribution trailer the harness specifies.
