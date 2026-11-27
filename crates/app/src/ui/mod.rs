@@ -939,6 +939,12 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Escape cancels the frontmost dialog first (also while its text field has the focus);
+        // with no dialog open it is the panic key below
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.close_top_dialog() {
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            return;
+        }
         let text_focused = ctx.memory(|m| m.focused().is_some());
         if text_focused {
             return;
@@ -1413,6 +1419,8 @@ impl App {
                 self.recover_takes();
                 // the next autosave is due a full interval after opening
                 self.files.last_autosave = Some(std::time::Instant::now());
+                // a song opens at its start, not where the previous one's playhead was
+                self.seek(0);
                 true
             }
             Err(e) => {
@@ -1739,6 +1747,7 @@ impl App {
                 if ui.button("Open…").clicked() {
                     self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                     self.files.dialog = Some(project_files::FileDialog::Open);
+                    self.files.focus_field = true;
                     ui.close();
                 }
                 if ui.add_enabled(self.files.read_only.is_none(), egui::Button::new("Save (Ctrl+S)")).clicked() {
@@ -1748,16 +1757,24 @@ impl App {
                 if ui.button("Save As…").clicked() {
                     self.files.path_input = self.project_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                     self.files.dialog = Some(project_files::FileDialog::SaveAs);
+                    self.files.focus_field = true;
                     ui.close();
                 }
-                if let Some(n) = &self.files.last_autosave_note {
-                    ui.label(egui::RichText::new(n).color(theme::TEXT_SECONDARY).small());
+                if ui.button(format!("Rename project ({})…", self.project.name)).on_hover_text("The name proposes export file names").clicked() {
+                    self.files.rename = Some(self.project.name.clone());
+                    self.files.focus_field = true;
+                    ui.close();
+                }
+                // one short line (a wrapped label in a menu is justified letter by letter)
+                if let Some((line, detail)) = self.autosave_summary() {
+                    ui.add(egui::Label::new(egui::RichText::new(line).color(theme::TEXT_SECONDARY).small()).truncate()).on_hover_text(detail);
                 }
                 if ui.button("Export…").on_hover_text("Render to WAV/FLAC (and stems) or a MIDI file with the playback engine").clicked() {
                     self.export.open = true;
                     ui.close();
                 }
-                ui.label(egui::RichText::new("Projects are folders ending in .rawdawg; autosaves every 2 min while unsaved").color(theme::TEXT_SECONDARY).small());
+                ui.add(egui::Label::new(egui::RichText::new("Projects are .rawdawg folders · autosave every 2 min").color(theme::TEXT_SECONDARY).small()).truncate())
+                    .on_hover_text("A project is a folder ending in .rawdawg; while it has unsaved changes rawDAWg autosaves it every two minutes");
             });
             ui.menu_button("Edit", |ui| {
                 let undo_label = self.history.undo_label().unwrap_or("Undo");

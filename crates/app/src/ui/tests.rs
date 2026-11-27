@@ -722,7 +722,7 @@ fn projects_save_as_autosave_recover_lock_and_relink() {
     });
     assert!(h.app.history.is_dirty());
     h.app.autosave_now(&dir);
-    assert!(h.app.files.last_autosave_note.as_deref().is_some_and(|n| n.starts_with("Autosaved revision")), "{:?}", h.app.files.last_autosave_note);
+    assert!(h.app.files.last_autosave_note.as_ref().is_some_and(|n| n.is_ok()), "{:?}", h.app.files.last_autosave_note);
     assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().patterns[0].lanes[0].notes.len(), 0, "saved manifest unchanged by the autosave");
     // "crash": a second app opens the folder → the lock from the first instance is ours (same pid → not live), recovery offered
     drop(h);
@@ -749,7 +749,7 @@ fn projects_save_as_autosave_recover_lock_and_relink() {
     h3.app.apply(Command::RenameProject { name: "renamed".into() });
     h3.app.save_project_checked();
     assert!(h3.app.status_line.starts_with("Read-only"), "{}", h3.app.status_line);
-    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().name, "Untitled", "not written while read-only");
+    assert_eq!(rawdawg_project::load_project_dir(&dir).unwrap().name, "Song", "not written while read-only (named after its folder at Save As)");
     h3.app.take_over_lock();
     assert!(h3.app.files.read_only.is_none());
     h3.app.save_project_checked();
@@ -3622,5 +3622,155 @@ fn export_creates_a_folder_typed_with_the_name() {
     let wav = root.join("mixes/bounces/final.wav");
     assert!(wav.is_file(), "{:?}", h.app.export.last_result);
     assert!(h.app.export.last_result.as_deref().is_some_and(|r| !r.starts_with("Export failed")), "{:?}", h.app.export.last_result);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_project_takes_its_folder_name_and_can_be_renamed() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    add_note(&mut h, 0);
+    assert_eq!(h.app.project.name, "Untitled");
+    // Save As names an untitled project after its folder; exports follow
+    h.app.save_project_as(root.join("RandA"));
+    assert_eq!(h.app.project.name, "RandA");
+    assert_eq!(rawdawg_project::load_project_dir(&root.join("RandA.rawdawg")).unwrap().name, "RandA", "saved with the name");
+    h.app.export.open = true;
+    h.frame(vec![]);
+    assert!(h.app.export.path.ends_with("RandA.wav"), "{}", h.app.export.path);
+    // Save As again: a name that matched its folder follows the new folder
+    h.app.save_project_as(root.join("RandB"));
+    assert_eq!(h.app.project.name, "RandB");
+    // File › Rename project…: type, Enter; one undo step
+    h.app.export.open = false;
+    h.frame(vec![]);
+    let file = h.node("File").unwrap();
+    h.click_at(file.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let item = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Rename project")).map(|(_, r)| r).expect("the menu item");
+    h.click_at(item.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+    h.key_event(egui::Key::A, true, false, ctrl);
+    h.key_event(egui::Key::A, false, false, ctrl);
+    h.frame(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE), egui::Event::Text("Night Drive".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(h.app.project.name, "Night Drive");
+    assert!(h.app.files.rename.is_none(), "the window closed");
+    // a name the user chose stays through Save As
+    h.app.save_project_as(root.join("Elsewhere"));
+    assert_eq!(h.app.project.name, "Night Drive");
+    h.app.undo();
+    assert_eq!(h.app.project.name, "RandB", "the rename is one undo step");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_a_song_starts_it_at_bar_one() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-playhead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let a = saved_song(&root, "A", 1, 1);
+    let mut h = Harness::new(None);
+    h.app.request_open(a.clone());
+    h.app.seek(3 * 3840);
+    h.frame(vec![]);
+    assert_eq!(h.app.playhead_tick(), Some(3 * 3840));
+    h.app.request_open(PathBuf::from("../../fixtures/demo-song.rawdawg"));
+    assert_eq!(h.app.playhead_tick(), Some(0), "the new song starts at its beginning");
+    h.frame(vec![]);
+    let toolbar: Vec<String> = h.drawn_nodes().into_iter().filter(|(_, r)| r.center().y < 100.0).map(|(t, _)| t).collect();
+    assert!(toolbar.iter().any(|t| t == "1:1"), "{toolbar:?}");
+    h.app.seek(3840);
+    h.app.new_project();
+    assert_eq!(h.app.playhead_tick(), Some(0), "so does a new project");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn enter_confirms_and_escape_cancels_dialogs_and_the_effect_search() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-enter-esc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut h = Harness::new(None);
+    add_note(&mut h, 0);
+    // Ctrl+S on a new project: type a path, Enter saves
+    h.key_event(egui::Key::S, true, false, egui::Modifiers { ctrl: true, command: true, ..Default::default() });
+    h.key_event(egui::Key::S, false, false, egui::Modifiers::NONE);
+    h.frame(vec![]);
+    assert_eq!(h.app.files.dialog, Some(super::project_files::FileDialog::SaveAs));
+    h.frame(vec![]);
+    h.frame(vec![egui::Event::Text(root.join("EnterTest").display().to_string())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!(root.join("EnterTest.rawdawg/project.json").is_file(), "{:?} {:?}", h.app.files.path_input, h.app.files.error);
+    assert!(h.app.files.dialog.is_none() && !h.app.history.is_dirty());
+    // File › Open…: Escape closes it, also with the field unfocused (and it is not a panic)
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.app.files.focus_field = true;
+    h.frame(vec![]);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.app.files.dialog.is_none(), "Escape cancelled Open");
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.frame(vec![]);
+    let heading = h.node("Playlist").unwrap();
+    h.click_at(heading.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.app.files.dialog.is_none(), "also when the field has no focus");
+    // Enter in Open opens
+    h.app.files.dialog = Some(super::project_files::FileDialog::Open);
+    h.app.files.focus_field = true;
+    h.app.files.path_input = String::new();
+    h.frame(vec![]);
+    h.frame(vec![egui::Event::Text("../../fixtures/demo-song.rawdawg".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!(h.app.project_path.as_ref().is_some_and(|p| p.ends_with("demo-song.rawdawg")), "{:?}", h.app.project_path);
+    // Settings closes on Escape
+    h.app.show_settings = true;
+    h.frame(vec![]);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.show_settings);
+    // the mixer's effect search: Enter adds the only match; it starts empty when reopened
+    h.app.editor_view = EditorView::Mixer;
+    h.app.mixer.selected = Some(h.app.project.mixer.master_id);
+    h.frame(vec![]);
+    let add = h.scroll_into_view("+ Add effect", |h| h.node("+ Add effect"));
+    h.click_at(add.center(), egui::PointerButton::Primary);
+    h.frame(vec![egui::Event::Text("Delay".into())]);
+    let inserts = |h: &Harness| h.app.project.mixer_channel(h.app.project.mixer.master_id).unwrap().inserts.len();
+    let before = inserts(&h);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(inserts(&h), before + 1, "Enter added the Delay");
+    assert!(!h.app.mixer.add_open);
+    h.app.editor_view = EditorView::Mixer;
+    h.frame(vec![]);
+    let add = h.scroll_into_view("+ Add effect", |h| h.node("+ Add effect"));
+    h.click_at(add.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    assert_eq!(h.app.mixer.add_search_text(), "", "a fresh search, not \"DelayDelay\"");
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.mixer.add_open, "Escape closes the search");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_file_menus_autosave_line_is_short_and_fits() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-autosave-line-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = saved_song(&root, "Long project folder name for the autosave line", 1, 1);
+    let mut h = Harness::new(None);
+    h.app.request_open(dir.clone());
+    add_note(&mut h, 240);
+    h.app.autosave_now(&dir);
+    let file = h.node("File").unwrap();
+    h.click_at(file.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    let nodes = h.drawn_nodes();
+    let line = nodes.iter().find(|(t, _)| t.starts_with("Autosaved")).expect("the autosave line");
+    assert!(line.0.ends_with(" ago"), "{:?}", line.0);
+    assert!(!line.0.contains(std::path::MAIN_SEPARATOR), "no path in the line: {:?}", line.0);
+    let export = nodes.iter().find(|(t, _)| t == "Export…").map(|(_, r)| *r).unwrap();
+    assert!(line.1.right() <= export.right() + 1.0 && line.1.height() < 20.0, "one line inside the menu: {:?} vs {export:?}", line.1);
     let _ = std::fs::remove_dir_all(&root);
 }

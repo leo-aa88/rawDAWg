@@ -88,6 +88,12 @@ pub(crate) fn insert_drop_index(rows: &[egui::Rect], from: usize, pointer_y: f32
 pub(crate) type RackSnapshot = Vec<(InstanceId, Vec<(ParamId, f32)>)>;
 
 impl MixerState {
+    /// What the effect search holds (tests).
+    #[cfg(test)]
+    pub(crate) fn add_search_text(&self) -> &str {
+        &self.add_search
+    }
+
     pub(crate) fn new() -> Self {
         Self { chaos: 35.0, ..Default::default() }
     }
@@ -401,45 +407,71 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
                 ui.interact(hdr.rect, egui::Id::unique("mixer-inserts-header"), Sense::hover());
                 if ui.button("+ Add effect").clicked() {
                     app.mixer.add_open = !app.mixer.add_open;
+                    // a new search each time it opens
+                    app.mixer.add_search.clear();
                 }
             });
             if app.mixer.add_open {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     let r = ui.add(egui::TextEdit::singleline(&mut app.mixer.add_search).hint_text("search effects…").desired_width(180.0));
-                    r.request_focus();
+                    // Enter adds the first match (Escape closes, as every dialog)
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if !enter {
+                        r.request_focus();
+                    }
                     let needle = app.mixer.add_search.to_lowercase();
+                    let native: Vec<&rawdawg_effects::EffectInfo> = rawdawg_effects::CATALOG
+                        .iter()
+                        .filter(|f| f.listed && (needle.is_empty() || f.name.to_lowercase().contains(&needle) || f.family.to_lowercase().contains(&needle)))
+                        .collect();
+                    let hosted: Vec<(rawdawg_plugin_host::PluginDescription, std::path::PathBuf)> = app
+                        .plugin_host
+                        .catalog
+                        .plugins()
+                        .filter(|(_, p)| p.is_effect && (needle.is_empty() || p.name.to_lowercase().contains(&needle) || p.vendor.to_lowercase().contains(&needle)))
+                        .map(|(l, p)| (p.clone(), l.path.clone()))
+                        .collect();
+                    let mut pick_native: Option<&rawdawg_effects::EffectInfo> = None;
+                    let mut pick_hosted: Option<(rawdawg_plugin_host::PluginDescription, std::path::PathBuf)> = None;
                     ui.horizontal_wrapped(|ui| {
-                        for fx in rawdawg_effects::CATALOG.iter().filter(|f| f.listed) {
-                            if !needle.is_empty() && !fx.name.to_lowercase().contains(&needle) && !fx.family.to_lowercase().contains(&needle) {
-                                continue;
-                            }
+                        for fx in &native {
                             if ui.button(fx.name).on_hover_text(fx.description).clicked() {
-                                let mut inst = Instance::native(fx.type_id, serde_json::Value::Null);
-                                inst.display_name = fx.name.to_owned();
-                                let iid = inst.id;
-                                cmds.push(Command::AddInsert { mixer_id: id, instance: inst, index: None });
-                                app.mixer.add_open = false;
-                                app.effect_editor = Some(iid);
-                                app.editor_view = EditorView::Effect;
+                                pick_native = Some(fx);
                             }
                         }
                         // hosted effects from the catalog
-                        let hosted: Vec<(rawdawg_plugin_host::PluginDescription, std::path::PathBuf)> =
-                            app.plugin_host.catalog.plugins().filter(|(_, p)| p.is_effect).map(|(l, p)| (p.clone(), l.path.clone())).collect();
-                        for (desc, path) in hosted {
-                            if !needle.is_empty() && !desc.name.to_lowercase().contains(&needle) && !desc.vendor.to_lowercase().contains(&needle) {
-                                continue;
-                            }
+                        for (desc, path) in &hosted {
                             if ui
                                 .button(format!("{} ({})", desc.name, desc.format.label()))
                                 .on_hover_text(format!("{} — {}\n{}", desc.plugin_id, desc.vendor, path.display()))
                                 .clicked()
                             {
-                                app.mixer.add_open = false;
-                                app.add_catalog_plugin(&desc, &path, id);
+                                pick_hosted = Some((desc.clone(), path.clone()));
                             }
                         }
+                        if native.is_empty() && hosted.is_empty() {
+                            ui.label(egui::RichText::new("No effect matches").color(theme::TEXT_SECONDARY));
+                        }
                     });
+                    if enter && pick_native.is_none() && pick_hosted.is_none() {
+                        if let Some(fx) = native.first() {
+                            pick_native = Some(fx);
+                        } else if let Some(h) = hosted.first() {
+                            pick_hosted = Some(h.clone());
+                        }
+                    }
+                    if let Some(fx) = pick_native {
+                        let mut inst = Instance::native(fx.type_id, serde_json::Value::Null);
+                        inst.display_name = fx.name.to_owned();
+                        let iid = inst.id;
+                        cmds.push(Command::AddInsert { mixer_id: id, instance: inst, index: None });
+                        app.mixer.add_open = false;
+                        app.effect_editor = Some(iid);
+                        app.editor_view = EditorView::Effect;
+                    } else if let Some((desc, path)) = pick_hosted {
+                        app.mixer.add_open = false;
+                        app.add_catalog_plugin(&desc, &path, id);
+                    }
                     if ui.small_button("Close").clicked() {
                         app.mixer.add_open = false;
                     }

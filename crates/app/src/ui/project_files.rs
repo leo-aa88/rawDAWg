@@ -42,7 +42,12 @@ pub(crate) struct ProjectFilesState {
     /// The window is asked to close (set when rawDAWg sends the close request; tests read it).
     pub closing: bool,
     pub last_autosave: Option<Instant>,
-    pub last_autosave_note: Option<String>,
+    /// The last autosave: when (unix ms) and where, or why it failed.
+    pub last_autosave_note: Option<Result<(u64, PathBuf), String>>,
+    /// The Rename project window, with the name being typed.
+    pub rename: Option<String>,
+    /// Give the open dialog's text field the keyboard focus (once, when it opens).
+    pub focus_field: bool,
     /// Relink: asset id → path typed by the user.
     pub relink: Option<(rawdawg_types::AssetId, String)>,
     /// The recovery offer's Compare view: the chosen autosave, what it changes, and which
@@ -269,6 +274,7 @@ impl App {
         self.files.compare = None;
         self.rebuild_mirrors();
         self.recompile();
+        self.seek(0);
         self.status_line = "New project (unsaved — File › Save As… to choose a folder)".into();
     }
 
@@ -281,6 +287,7 @@ impl App {
         // a never-saved project (also one with media in its per-user folder) asks where to go
         let Some(path) = self.project_path.clone().filter(|_| !self.is_never_saved()) else {
             self.files.dialog = Some(FileDialog::SaveAs);
+            self.files.focus_field = true;
             return;
         };
         let revision = self.history.revision();
@@ -311,6 +318,15 @@ impl App {
         self.project.revision = revision;
         let src = self.project_path.clone();
         let unsaved_before = self.is_never_saved().then(|| self.project_path.clone().or_else(|| self.unsaved_dir())).flatten();
+        // a project still called "Untitled" (or after its old folder) takes the new folder's name
+        let old_name = self.project.name.clone();
+        let old_folder = src.as_ref().filter(|_| !self.is_never_saved()).and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+        if let Some(stem) = dst.file_stem().map(|s| s.to_string_lossy().into_owned())
+            && (old_name == "Untitled" || old_folder.as_deref() == Some(old_name.as_str()))
+            && !stem.trim().is_empty()
+        {
+            self.project.name = stem;
+        }
         match rawdawg_project::save_as(src.as_deref(), &dst, &self.project) {
             Ok(()) => {
                 // saved for real now: the per-user autosaves of the never-saved project are not a crash
@@ -328,7 +344,10 @@ impl App {
                 self.files.dialog = None;
                 self.status_line = format!("Saved as {}", dst.display());
             }
-            Err(e) => self.files.error = Some(e.to_string()),
+            Err(e) => {
+                self.project.name = old_name;
+                self.files.error = Some(e.to_string());
+            }
         }
     }
 
@@ -350,10 +369,60 @@ impl App {
     pub(crate) fn autosave_now(&mut self, dir: &Path) {
         self.project.revision = self.history.revision();
         self.files.last_autosave = Some(Instant::now());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         self.files.last_autosave_note = Some(match rawdawg_project::autosave(dir, &self.project) {
-            Ok(p) => format!("Autosaved revision {} to {}", self.project.revision, p.display()),
-            Err(e) => format!("Autosave failed: {e}"),
+            Ok(p) => Ok((now, p)),
+            Err(e) => Err(e.to_string()),
         });
+    }
+
+    /// The File menu's autosave line: short ("Autosaved 2 min ago"), the file on hover.
+    pub(crate) fn autosave_summary(&self) -> Option<(String, String)> {
+        self.files.last_autosave_note.as_ref().map(|n| match n {
+            Ok((at, path)) => (format!("Autosaved {}", ago(*at)), path.display().to_string()),
+            Err(e) => ("Autosave failed".to_owned(), e.clone()),
+        })
+    }
+
+    /// Rename the project (one undo step); the name proposes export file names and titles MIDI files.
+    pub(crate) fn rename_project(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && name != self.project.name {
+            self.apply(Command::RenameProject { name: name.to_owned() });
+        }
+    }
+
+    /// Close the frontmost dialog (Escape): prompts first, then file dialogs, Settings, the
+    /// add-effect search and Export. Whether one was open.
+    pub(crate) fn close_top_dialog(&mut self) -> bool {
+        if self.files.open_prompt.take().is_some() {
+            return true;
+        }
+        if self.files.close_prompt {
+            self.files.close_prompt = false;
+            return true;
+        }
+        if self.files.rename.take().is_some() {
+            return true;
+        }
+        if self.files.dialog.take().is_some() {
+            self.files.close_after_save = false;
+            self.files.open_after_save = None;
+            return true;
+        }
+        if self.show_settings {
+            self.show_settings = false;
+            return true;
+        }
+        if self.mixer.add_open {
+            self.mixer.add_open = false;
+            return true;
+        }
+        if self.export.open && !self.export.running() {
+            self.export.open = false;
+            return true;
+        }
+        false
     }
 
     /// Relink a missing asset: same content restores the file; different content replaces
@@ -403,8 +472,9 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             match kind {
                 FileDialog::New => {
                     ui.label("Start a new empty project? Unsaved changes in the current project will be lost.");
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.horizontal(|ui| {
-                        if ui.button("New project").clicked() {
+                        if ui.button("New project").clicked() || enter {
                             app.new_project();
                             app.files.dialog = None;
                         }
@@ -419,9 +489,14 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     } else {
                         "New folder for the project (…/Song.rawdawg); assets are copied, the current folder is left as is:"
                     });
-                    ui.add(egui::TextEdit::singleline(&mut app.files.path_input).hint_text("/path/to/Song.rawdawg").desired_width(f32::INFINITY));
+                    let field = ui.add(egui::TextEdit::singleline(&mut app.files.path_input).hint_text("/path/to/Song.rawdawg").desired_width(f32::INFINITY));
+                    if std::mem::take(&mut app.files.focus_field) {
+                        field.request_focus();
+                    }
+                    // Enter confirms (in the field, or with no other field focused); Escape cancels
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus() || ui.memory(|m| m.focused().is_none()));
                     ui.horizontal(|ui| {
-                        if ui.button(if kind == FileDialog::Open { "Open" } else { "Save as" }).clicked() && !app.files.path_input.trim().is_empty() {
+                        if (ui.button(if kind == FileDialog::Open { "Open" } else { "Save as" }).clicked() || enter) && !app.files.path_input.trim().is_empty() {
                             let p = PathBuf::from(app.files.path_input.trim());
                             match kind {
                                 FileDialog::Open => app.request_open(p),
@@ -633,6 +708,29 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                 }
             });
         });
+    }
+    // ---- rename the project
+    if let Some(mut name) = app.files.rename.clone() {
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new("Rename project").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label("The name proposes export file names and titles exported MIDI files.");
+            let field = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
+            if std::mem::take(&mut app.files.focus_field) {
+                field.request_focus();
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (field.lost_focus() || field.has_focus() || ui.memory(|m| m.focused().is_none()));
+            ui.horizontal(|ui| {
+                if ui.button("Rename").clicked() || enter {
+                    app.rename_project(&name);
+                    done = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    done = true;
+                }
+            });
+        });
+        app.files.rename = if done || !open { None } else { Some(name) };
     }
     // ---- relink
     if let Some((id, mut path)) = app.files.relink.clone() {
