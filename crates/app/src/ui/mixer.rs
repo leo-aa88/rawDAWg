@@ -299,7 +299,7 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
             // pan
             let mut pan = m.pan.0;
             ui.spacing_mut().slider_width = STRIP_W - 30.0;
-            let pr = ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).show_value(false)).on_hover_text(format!("Pan {:+.2} (double-click resets)", m.pan.0));
+            let pr = ui.add(rawdawg_ui::params::slider(ui, &mut pan, -1.0..=1.0).show_value(false)).on_hover_text(format!("Pan {:+.2} (double-click resets)", m.pan.0));
             if pr.double_clicked() {
                 cmds.push(Command::SetMixerPan { id: m.id, pan: Pan::CENTER });
             } else {
@@ -310,7 +310,7 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
             ui.horizontal(|ui| {
                 let mut gain = m.gain_db.0;
                 let fr = ui
-                    .add(egui::Slider::new(&mut gain, -60.0..=12.0).vertical().show_value(false).custom_formatter(|v, _| format!("{v:.1} dB")))
+                    .add(rawdawg_ui::params::slider(ui, &mut gain, -60.0..=12.0).vertical().show_value(false).custom_formatter(|v, _| format!("{v:.1} dB")))
                     .on_hover_text("Fader (double-click resets to 0 dB)");
                 if fr.double_clicked() {
                     cmds.push(Command::SetMixerGain { id: m.id, gain_db: Db::UNITY });
@@ -443,7 +443,7 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
                     }
                     if rawdawg_effects::info(ins.type_id.as_str()).is_some_and(|f| f.has_mix) {
                         let mut mix = ins.mix;
-                        let r = ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).show_value(false).text("mix"));
+                        let r = ui.add(rawdawg_ui::params::slider(ui, &mut mix, 0.0..=1.0).show_value(false).text("mix"));
                         if r.changed() {
                             cmds.push(Command::SetInstanceMix { instance_id: ins.id, mix });
                         }
@@ -514,7 +514,7 @@ fn inserts_and_sends(app: &mut App, ui: &mut egui::Ui, id: MixerChannelId, all: 
                     let tname = all.iter().find(|c| c.id == s.target_id).map(|c| c.name.clone()).unwrap_or_else(|| "?".into());
                     ui.label(format!("to {tname}"));
                     let mut level = s.level_db.0;
-                    if ui.add(egui::Slider::new(&mut level, -60.0..=12.0).suffix(" dB").show_value(true)).changed() {
+                    if ui.add(rawdawg_ui::params::slider(ui, &mut level, -60.0..=12.0).suffix(" dB").show_value(true)).changed() {
                         let mut sends = m.sends.clone();
                         sends[si].level_db = Db(level);
                         cmds.push(Command::SetMixerSends { id, sends });
@@ -569,7 +569,7 @@ fn rack_tools(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, cmds: &mut Vec
             let changed = randomize_rack(app, id);
             app.status_line = format!("Rack randomized ({changed} effects changed)");
         }
-        ui.add(egui::Slider::new(&mut app.mixer.chaos, 0.0..=100.0).text("Chaos").show_value(true));
+        ui.add(rawdawg_ui::params::slider(ui, &mut app.mixer.chaos, 0.0..=100.0).text("Chaos").show_value(true));
         ui.menu_button("Locks", |ui| {
             for (c, label) in [
                 (ParamCategory::Mix, "Mix / output levels"),

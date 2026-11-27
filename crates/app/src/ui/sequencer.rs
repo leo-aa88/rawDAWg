@@ -42,8 +42,10 @@ pub(crate) fn pattern_selector(app: &mut App, ui: &mut egui::Ui, cmds: &mut Vec<
         cmds.push(Command::Batch { commands: vec![Command::AddPattern { pattern }, Command::SelectPattern { id: Some(id) }] });
     }
     if let Some(id) = selected {
-        let r = ui.small_button("…").on_hover_text("Rename / length / delete");
-        r.context_menu(|ui| {
+        let r = ui.small_button("…").on_hover_text("Rename, length, step size or delete this pattern");
+        // left or right click opens it; it stays open while typing a name (entries close it)
+        let toggle = (r.clicked() || r.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
+        egui::Popup::menu(&r).open_memory(toggle).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             let Some(pat) = app.project.pattern(id).cloned() else { return };
             ui.label("Rename");
             if app.sequencer.new_name.is_empty() {
@@ -185,11 +187,11 @@ pub(crate) fn step_row(app: &mut App, ui: &mut egui::Ui, channel_id: ChannelId, 
                 resp.context_menu(|ui| {
                     ui.label(format!("Step {}", i + 1));
                     let mut vel = step_notes[0].velocity;
-                    if ui.add(egui::Slider::new(&mut vel, 0.05..=1.0).text("Velocity")).changed() {
+                    if ui.add(rawdawg_ui::params::slider(ui, &mut vel, 0.05..=1.0).text("Velocity")).changed() {
                         cmds.push(Command::UpdateNotes { pattern_id: pid, channel_id, notes: step_notes.iter().map(|n| Note { velocity: vel, ..*n }).collect() });
                     }
                     let mut pitch = step_notes[0].pitch as i32;
-                    if ui.add(egui::Slider::new(&mut pitch, 0..=127).text("Pitch").custom_formatter(|v, _| super::piano_roll::pitch_name(v as u8))).changed() {
+                    if ui.add(rawdawg_ui::params::slider(ui, &mut pitch, 0..=127).text("Pitch").custom_formatter(|v, _| super::piano_roll::pitch_name(v as u8))).changed() {
                         cmds.push(Command::UpdateNotes { pattern_id: pid, channel_id, notes: step_notes.iter().map(|n| Note { pitch: pitch as u8, ..*n }).collect() });
                     }
                     if ui.button("Open in piano roll").clicked() {

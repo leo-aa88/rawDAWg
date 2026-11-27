@@ -126,31 +126,30 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
             n = changed;
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
-            let resp = resp
-                .context_menu(|ui| {
-                    if ui.button("MIDI learn (then move a controller)").clicked() {
-                        app.arm_midi_learn(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
-                        app.remove_midi_mapping(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
-                        super::automation::create_clip_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Automate in this pattern")
-                        .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
-                        .clicked()
-                    {
-                        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                })
-                .map(|r| r.response)
-                .unwrap_or(resp);
+            let resp = rawdawg_ui::params::context_menu(&resp, |ui| {
+                if ui.button("MIDI learn (then move a controller)").clicked() {
+                    app.arm_midi_learn(instance_id, d.id.0);
+                    ui.close();
+                }
+                if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+                    app.remove_midi_mapping(instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
+                    super::automation::create_clip_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui
+                    .button("Automate in this pattern")
+                    .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
+                    .clicked()
+                {
+                    super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+            })
+            .map(|r| r.response)
+            .unwrap_or(resp);
             let readout = rawdawg_dsp::processor::display_value(&*app.other_mirrors[&instance_id], d, n);
             ui.label(egui::RichText::new(format!("{readout}{cc}{}", if learning { " learn…" } else { "" })).monospace().color(if learning {
                 theme::WARNING

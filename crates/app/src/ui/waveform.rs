@@ -208,8 +208,9 @@ fn frame_strip(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer: us
             let id = ParamId(rawdawg_synthesizer::params::layer_param(layer as u32, rawdawg_synthesizer::params::L_WT_POSITION));
             let current = app.synth_mirrors[&instance].param(id).unwrap_or(*position);
             let mut n = current;
-            let resp =
-                ui.add(egui::Slider::new(&mut n, 0.0..=1.0).text("Position").show_value(false)).on_hover_text("Where playback sits between the frames (live; drag to scrub)");
+            let resp = ui
+                .add(rawdawg_ui::params::slider(ui, &mut n, 0.0..=1.0).text("Position").show_value(false))
+                .on_hover_text("Where playback sits between the frames (live; drag to scrub)");
             let playing = n * (count - 1) as f32;
             ui.label(egui::RichText::new(format!("{:.2} → frame {:.1}", n, playing + 1.0)).monospace().color(theme::TEXT_SECONDARY));
             if resp.changed() && (n - current).abs() > 1e-7 {
@@ -287,9 +288,9 @@ fn waveform_canvas(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer
             }
         }
         ui.separator();
-        ui.add(egui::Slider::new(&mut app.synth_panel.waveform.settings.radius, 0.01..=0.5).text("Size").logarithmic(true).show_value(false))
+        ui.add(rawdawg_ui::params::slider(ui, &mut app.synth_panel.waveform.settings.radius, 0.01..=0.5).text("Size").logarithmic(true).show_value(false))
             .on_hover_text("Brush size (mouse wheel over the wave)");
-        ui.add(egui::Slider::new(&mut app.synth_panel.waveform.settings.strength, 0.0..=1.0).text("Strength").show_value(false));
+        ui.add(rawdawg_ui::params::slider(ui, &mut app.synth_panel.waveform.settings.strength, 0.0..=1.0).text("Strength").show_value(false));
     });
     let Some((cycle, _)) = layer_cycle(app, instance, layer) else { return };
     let height = 180.0;
@@ -384,7 +385,7 @@ fn spectrum_canvas(app: &mut App, ui: &mut egui::Ui, instance: InstanceId, layer
     ui.horizontal(|ui| {
         ui.label("Drag to paint harmonic levels; right-drag to erase.");
         ui.checkbox(&mut app.synth_panel.waveform.spectrum_db, "dB view");
-        ui.add(egui::Slider::new(&mut app.synth_panel.waveform.settings.strength, 0.0..=1.0).text("Strength").show_value(false));
+        ui.add(rawdawg_ui::params::slider(ui, &mut app.synth_panel.waveform.settings.strength, 0.0..=1.0).text("Strength").show_value(false));
     });
     let Some((cycle, _)) = layer_cycle(app, instance, layer) else { return };
     let shown: Vec<f32> = match &app.synth_panel.waveform.stroke {

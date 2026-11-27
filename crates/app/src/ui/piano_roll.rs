@@ -386,9 +386,36 @@ fn preview_update(app: &mut App, pid: PatternId, cid: ChannelId, notes: Vec<Note
     if !app.history.gesture_active() {
         let _ = app.history.begin_gesture();
     }
+    // notes stretched past the end grow the pattern, in the same gesture (one undo step)
+    let end = notes.iter().map(|n| n.end_tick().0).max().unwrap_or(0);
+    if let Some(grow) = grown_length(&app.project, pid, end)
+        && let Err(e) = app.history.preview(&mut app.project, grow)
+    {
+        app.status_line = format!("Edit rejected: {e}");
+    }
     if let Err(e) = app.history.preview(&mut app.project, Command::UpdateNotes { pattern_id: pid, channel_id: cid, notes }) {
         app.status_line = format!("Edit rejected: {e}");
     }
+}
+
+/// Patterns grow by themselves up to this many bars.
+pub(crate) const MAX_GROWN_BARS: i64 = 128;
+
+/// The command that makes pattern `pid` long enough for a note ending at `end` (whole bars,
+/// steps kept at their size), or `None` when it already is (or would pass the limit).
+pub(crate) fn grown_length(project: &rawdawg_project::Project, pid: PatternId, end: i64) -> Option<Command> {
+    let pat = project.pattern(pid)?;
+    if end <= pat.length_ticks.0 {
+        return None;
+    }
+    let bar = project.meter_map().ok().map(|m| m.bar_start_tick(1).0).filter(|t| *t > 0).unwrap_or(PPQ * 4);
+    let bars = (end + bar - 1) / bar;
+    if bars > MAX_GROWN_BARS {
+        return None;
+    }
+    let length = Tick(bars * bar);
+    let steps = (length.0 / pat.step_ticks.0.max(1)).clamp(1, 1024) as u16;
+    Some(Command::SetPatternLength { id: pid, length_ticks: length, steps, step_ticks: pat.step_ticks })
 }
 
 fn commit_gesture(app: &mut App) {
@@ -782,8 +809,14 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                 if st.scale_snap {
                     root = snap_to_scale(root, st.scale_root, st.scale_mode);
                 }
-                let len = st.last_len.max(1).min((length.0 - tick).max(1));
-                if tick < length.0 {
+                // past the end (or across it): the pattern grows to the bar the note ends in
+                let len = st.last_len.max(1);
+                let grow = grown_length(&app.project, pid, tick + len);
+                let fits = tick + len <= length.0 || grow.is_some();
+                if !fits {
+                    app.status_line = format!("Patterns grow to at most {MAX_GROWN_BARS} bars by drawing; set a length in the pattern's … menu");
+                }
+                if fits {
                     let mut new_notes = Vec::new();
                     for iv in st.chord.intervals() {
                         let pitch = root + iv;
@@ -793,7 +826,17 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     }
                     st.selection = new_notes.iter().map(|n| n.id).collect();
                     let pitches: Vec<u8> = new_notes.iter().map(|n| n.pitch).collect();
-                    cmds.push(Command::AddNotes { pattern_id: pid, channel_id: cid, notes: new_notes.clone() });
+                    let add = Command::AddNotes { pattern_id: pid, channel_id: cid, notes: new_notes.clone() };
+                    match grow {
+                        Some(g) => {
+                            if let Command::SetPatternLength { length_ticks, .. } = &g {
+                                let bar = app.project.meter_map().ok().map(|m| m.bar_start_tick(1).0).filter(|t| *t > 0).unwrap_or(PPQ * 4);
+                                app.status_line = format!("The pattern grew to {} bars", length_ticks.0 / bar);
+                            }
+                            cmds.push(Command::Batch { commands: vec![g, add] });
+                        }
+                        None => cmds.push(add),
+                    }
                     // dragging right after insertion resizes the new notes
                     app.piano_roll.gesture_target = Some((pid, cid));
                     app.piano_roll.gesture = Some(Gesture::Resize { orig: new_notes, anchor_tick: tick });
@@ -875,7 +918,8 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
                     .iter()
                     .map(|n| {
                         let end = snap_round(n.end_tick().0 + dt, effective_grid).max(n.tick.0 + effective_grid.unwrap_or(PPQ / 32).max(1));
-                        let end = end.min(length.0.max(n.tick.0 + 1));
+                        // stretching past the end grows the pattern (see preview_update)
+                        let end = end.min(MAX_GROWN_BARS * PPQ * 4).max(n.tick.0 + 1);
                         Note { duration_ticks: Tick(end - n.tick.0), ..*n }
                     })
                     .collect();
@@ -1077,7 +1121,7 @@ fn quantize_dialog(app: &mut App, ui: &mut egui::Ui, pid: PatternId, cid: Channe
     let mut cancel = false;
     egui::Window::new("Quantize").collapsible(false).resizable(false).open(&mut open).show(ui.ctx(), |ui| {
         ui.label(format!("Grid: {} · {}", app.piano_roll.snap.label(), if app.piano_roll.selection.is_empty() { "all notes in the lane" } else { "selected notes" }));
-        let changed = ui.add(egui::Slider::new(&mut q.strength, 0.0..=1.0).text("Strength").custom_formatter(|v, _| format!("{:.0} %", v * 100.0))).changed();
+        let changed = ui.add(rawdawg_ui::params::slider(ui, &mut q.strength, 0.0..=1.0).text("Strength").custom_formatter(|v, _| format!("{:.0} %", v * 100.0))).changed();
         let toggled = ui.checkbox(&mut q.preview, "Preview (hear it before applying)").changed();
         ui.horizontal(|ui| {
             if ui.button("Apply").clicked() {

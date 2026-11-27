@@ -1810,3 +1810,293 @@ fn an_evolve_level_match_never_applies_to_another_sound() {
     h.key(egui::Key::Z, egui::Modifiers::CTRL);
     assert_eq!(gain(&h), h.app.project.channels[0].gain_db.0, "undo ends the match");
 }
+
+#[test]
+fn tempo_is_edited_in_the_toolbar_and_through_its_markers() {
+    let mut h = Harness::new(None);
+    let bpm = |h: &Harness| h.app.project.tempo[0].us_per_quarter.bpm().0;
+    let node = |h: &mut Harness, text: &str| h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+    // the toolbar tempo: click, type 140, Enter (stored as whole µs per quarter: ±0.001 BPM)
+    let field = node(&mut h, "120.00 BPM");
+    let depth = h.app.history.undo_len();
+    h.click_at(field.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("140".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert!((bpm(&h) - 140.0).abs() < 1e-3, "typed tempo: {}", bpm(&h));
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // dragging it is one undo step too
+    let field = node(&mut h, "140.00 BPM");
+    h.drag(field.center(), field.center() + egui::vec2(60.0, 0.0), egui::PointerButton::Primary);
+    assert!(bpm(&h) > 140.5, "dragged faster: {}", bpm(&h));
+    assert_eq!(h.app.history.undo_len(), depth + 2, "one undo step per drag");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert!((bpm(&h) - 140.0).abs() < 1e-3);
+    // the tempo marker above the playlist opens its editor (the marker row no longer takes the click)
+    h.frame(vec![]);
+    let marker = h.rect(super::playlist::marker_id(true, 0));
+    h.click_at(marker.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Tempo change"), "the Tempo change window opens");
+    // the window's field (one decimal; the toolbar's has two)
+    let field = node(&mut h, "140.0 BPM");
+    h.click_at(field.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("96".into())]);
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    let apply = node(&mut h, "Apply");
+    h.click_at(apply.center(), egui::PointerButton::Primary);
+    assert!((bpm(&h) - 96.0).abs() < 1e-3, "set through the marker: {}", bpm(&h));
+    // the time-signature marker opens its editor as well
+    h.frame(vec![]);
+    let meter = h.rect(super::playlist::marker_id(false, 0));
+    h.click_at(meter.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Time signature"), "the Time signature window opens");
+}
+
+#[test]
+fn right_clicking_a_slider_opens_its_menu_and_keeps_the_value() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let cutoff = rawdawg_types::ParamId(rawdawg_synthesizer::params::FILTER_CUTOFF);
+    let value = |h: &Harness| h.app.synth_mirrors[&instance].param(cutoff).unwrap();
+    // bring the basic controls into view
+    let label = |h: &mut Harness| h.drawn_nodes().into_iter().filter(|(t, _)| t == "Cutoff").map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()));
+    let into_view = |h: &mut Harness| {
+        for _ in 0..40 {
+            match label(h) {
+                Some(r) if r.bottom() < H - 80.0 && r.top() > 120.0 => return r,
+                _ => h.scroll(egui::pos2(W * 0.5, H * 0.6), -120.0),
+            }
+        }
+        panic!("Cutoff never came into view")
+    };
+    let l = into_view(&mut h);
+    // the slider sits between its label and its readout in the grid row
+    let readout = |h: &mut Harness, l: egui::Rect| {
+        h.drawn_nodes()
+            .into_iter()
+            .filter(|(t, r)| t != "Cutoff" && (r.center().y - l.center().y).abs() < 4.0 && r.left() > l.right())
+            .map(|(_, r)| r)
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the readout")
+    };
+    let rd = readout(&mut h, l);
+    let on_slider = egui::pos2((l.right() + rd.left()) * 0.5, l.center().y);
+    // (sanity: a left click there does move it, so the right-click below hits the slider)
+    let original = value(&h);
+    h.click_at(on_slider, egui::PointerButton::Primary);
+    assert_ne!(value(&h), original, "the point is on the Cutoff slider");
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(value(&h), original);
+    let before = value(&h);
+    let depth = h.app.history.undo_len();
+    h.click_at(on_slider, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    assert_eq!(value(&h), before, "a right-click does not move the slider");
+    assert_eq!(h.app.history.undo_len(), depth, "and adds no undo step");
+    let texts = h.drawn_texts();
+    for entry in ["Create automation clip", "MIDI learn (then move a controller)", "Reset to default"] {
+        assert!(texts.iter().any(|t| t == entry), "the menu offers {entry:?}");
+    }
+    // the menu works: an automation clip for Cutoff
+    let create = h.drawn_nodes().into_iter().find(|(t, _)| t == "Create automation clip").map(|(_, r)| r).unwrap();
+    h.click_at(create.center(), egui::PointerButton::Primary);
+    assert!(h.app.project.automation.iter().any(|c| c.target.instance_id == instance && c.target.param_id == cutoff.0), "Cutoff curve created");
+    // a left drag still moves it
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let l = into_view(&mut h);
+    let rd = readout(&mut h, l);
+    let start = egui::pos2((l.right() + rd.left()) * 0.5, l.center().y);
+    let v0 = value(&h);
+    h.drag(start, start + egui::vec2(-30.0, 0.0), egui::PointerButton::Primary);
+    assert!(value(&h) < v0, "the primary button still drags it");
+}
+
+#[test]
+fn effect_sliders_and_dropdowns_open_their_menu_on_right_click_without_changing() {
+    let mut h = Harness::new(None);
+    let master = h.app.project.mixer.master_id;
+    let mut inst = rawdawg_project::Instance::native("native.fx.delay", serde_json::Value::Null);
+    inst.display_name = "Delay".into();
+    let id = inst.id;
+    h.app.apply(rawdawg_project::Command::AddInsert { mixer_id: master, instance: inst, index: None });
+    h.app.editor_view = EditorView::Effect;
+    h.app.effect_editor = Some(id);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let state = |h: &Harness| h.app.project.mixer_channel(master).unwrap().inserts[0].state.clone();
+    let node = |h: &mut Harness, text: &str| h.drawn_nodes().into_iter().filter(|(t, _)| t == text).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()));
+    let into_view = |h: &mut Harness, text: &str| {
+        for _ in 0..40 {
+            match node(h, text) {
+                Some(r) if r.bottom() < H - 80.0 && r.top() > 120.0 => return r,
+                _ => h.scroll(egui::pos2(W * 0.5, H * 0.6), -120.0),
+            }
+        }
+        panic!("{text} never came into view")
+    };
+    // Feedback: the slider between its label and its readout
+    let l = into_view(&mut h, "Feedback");
+    let rd = h
+        .drawn_nodes()
+        .into_iter()
+        .filter(|(t, r)| t != "Feedback" && (r.center().y - l.center().y).abs() < 4.0 && r.left() > l.right() + 30.0)
+        .map(|(_, r)| r)
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("readout");
+    let on_slider = egui::pos2((l.right() + rd.left()) * 0.5, l.center().y);
+    let before = state(&h);
+    let depth = h.app.history.undo_len();
+    h.click_at(on_slider, egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    assert_eq!(state(&h), before, "Feedback keeps its value");
+    assert_eq!(h.app.history.undo_len(), depth);
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t == "Create automation clip") && texts.iter().any(|t| t == "Modulate with an LFO clip"), "the menu is open");
+    // close it (Escape), then the Mode dropdown: its menu, not its list
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    let mode = into_view(&mut h, "Mode");
+    let combo = h
+        .drawn_nodes()
+        .into_iter()
+        .filter(|(t, r)| t != "Mode" && (r.center().y - mode.center().y).abs() < 6.0 && r.left() > mode.right())
+        .map(|(_, r)| r)
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("the Mode dropdown");
+    h.click_at(combo.center(), egui::PointerButton::Secondary);
+    h.frame(vec![]);
+    let texts = h.drawn_texts();
+    assert!(texts.iter().any(|t| t == "Create automation clip"), "the dropdown's menu opens");
+    let choices = ["Stereo", "Ping-pong", "Tape", "Multitap", "Reverse"];
+    let listed = choices.iter().filter(|c| texts.iter().any(|t| t == **c)).count();
+    assert!(listed <= 1, "its list of choices does not open as well ({listed} choices drawn)");
+    assert_eq!(state(&h), before);
+}
+
+#[test]
+fn a_synth_channel_can_be_added_from_the_rack_and_the_browser_even_after_deleting_the_last() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Rack;
+    h.frame(vec![]);
+    let node = |h: &mut Harness, text: &str| h.drawn_nodes().into_iter().find(|(t, _)| t == text).map(|(_, r)| r).unwrap_or_else(|| panic!("{text:?} not drawn"));
+    // delete the only synth: the rack is empty and says how to add one
+    rack_menu(&mut h, 0, "Delete channel (undoable)");
+    assert!(h.app.project.channels.is_empty());
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t.starts_with("No channels yet")), "the empty rack says what to do");
+    // + Synth brings one back, selected and playable
+    let plus = node(&mut h, "+ Synth");
+    h.click_at(plus.center(), egui::PointerButton::Primary);
+    assert_eq!(h.app.project.channels.len(), 1);
+    let ch = h.app.project.channels[0].clone();
+    assert_eq!(ch.instrument.type_id.as_str(), rawdawg_types::ids::native_types::SYNTH);
+    assert_eq!(h.app.selected_channel, Some(ch.id), "the new channel is selected");
+    h.app.typing_enabled = true;
+    h.key_event(egui::Key::Z, true, false, egui::Modifiers::NONE);
+    h.key_event(egui::Key::Z, false, false, egui::Modifiers::NONE);
+    assert!(!h.app.live_log.is_empty(), "the keys play it");
+    // its Synth view opens (a mirror exists for the new instrument)
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == &format!("rawDAWg Synth — {}", ch.name)), "the synth panel shows the new channel");
+    // the browser entry adds another one, below the selected channel
+    let entry = node(&mut h, "rawDAWg Synth");
+    h.click_at(entry.center(), egui::PointerButton::Primary);
+    assert_eq!(h.app.project.channels.len(), 2);
+    assert_eq!(h.app.project.channels[1].name, "Synth 2");
+    assert_eq!(h.app.selected_channel, Some(h.app.project.channels[1].id));
+    // each add is one undo step
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(h.app.project.channels.len(), 1);
+    assert!(h.app.plan_error.is_none(), "{:?}", h.app.plan_error);
+}
+
+#[test]
+fn after_randomize_the_controls_show_the_new_sound_and_a_tweak_keeps_the_rest() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Synth;
+    h.frame(vec![]);
+    let instance = h.app.project.channels[0].instrument.id;
+    let saved = |h: &Harness| -> rawdawg_synthesizer::Patch { serde_json::from_value(h.app.project.channels[0].instrument.state.clone()).unwrap() };
+    let before = saved(&h);
+    // Randomize sound, as a user clicks it
+    let node = |h: &mut Harness, text: &str| h.drawn_nodes().into_iter().filter(|(t, _)| t == text).map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top()));
+    let into_view = |h: &mut Harness, text: &str| {
+        for _ in 0..40 {
+            match node(h, text) {
+                Some(r) if r.bottom() < H - 80.0 && r.top() > 120.0 => return r,
+                _ => h.scroll(egui::pos2(W * 0.5, H * 0.6), -120.0),
+            }
+        }
+        panic!("{text} never came into view")
+    };
+    let randomize = into_view(&mut h, "Randomize sound");
+    h.click_at(randomize.center(), egui::PointerButton::Primary);
+    let randomized = saved(&h);
+    assert_ne!(randomized, before, "Randomize changed the sound");
+    // the panel shows the new sound: its mirror is the saved patch
+    assert_eq!(h.app.synth_mirrors[&instance].patch(), &randomized, "the controls show the randomized values");
+    // touch only Attack: everything else stays as randomized
+    let l = into_view(&mut h, "Attack");
+    let rd = h
+        .drawn_nodes()
+        .into_iter()
+        .filter(|(t, r)| t != "Attack" && (r.center().y - l.center().y).abs() < 4.0 && r.left() > l.right())
+        .map(|(_, r)| r)
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("readout");
+    let p = egui::pos2((l.right() + rd.left()) * 0.5, l.center().y);
+    h.drag(p, p + egui::vec2(15.0, 0.0), egui::PointerButton::Primary);
+    let after = saved(&h);
+    assert_ne!(after.amp_env.attack_s, randomized.amp_env.attack_s, "Attack changed");
+    let mut expected = randomized.clone();
+    expected.amp_env.attack_s = after.amp_env.attack_s;
+    assert_eq!(after, expected, "nothing but Attack changed; resonance stays {}", randomized.filter.resonance);
+}
+
+#[test]
+fn drawing_past_the_end_grows_the_pattern_and_its_menu_opens_on_a_left_click() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::PianoRoll;
+    h.frame(vec![]);
+    let pid = h.app.project.selected_pattern.unwrap();
+    let len = |h: &Harness| h.app.project.pattern(pid).unwrap().length_ticks.0;
+    assert_eq!(len(&h), 3840, "a new pattern is one bar");
+    let surface = h.rect(egui::Id::unique("piano-roll-surface"));
+    // a click in bar 3: a note there, and the pattern grows to three bars (one undo step)
+    let depth = h.app.history.undo_len();
+    let p = super::piano_roll::grid_point(&h.app.piano_roll, surface, 2 * 3840 + 60, 60.5);
+    h.click_at(p, egui::PointerButton::Primary);
+    assert_eq!(len(&h), 3 * 3840, "grew to 3 bars");
+    assert!(h.lane_notes().iter().any(|n| n.tick.0 >= 2 * 3840 && n.pitch == 60), "the note is in bar 3");
+    assert!(h.app.status_line.contains("3 bars"), "{}", h.app.status_line);
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    h.key(egui::Key::Z, egui::Modifiers::CTRL);
+    assert_eq!(len(&h), 3840, "undo takes note and length back together");
+    assert!(h.lane_notes().is_empty());
+    // stretching a note across the end grows it too, instead of clipping the note
+    let surface = h.rect(egui::Id::unique("piano-roll-surface"));
+    let start = super::piano_roll::grid_point(&h.app.piano_roll, surface, 3840 - 480 + 30, 62.5);
+    let end = super::piano_roll::grid_point(&h.app.piano_roll, surface, 3840 + 960, 62.5);
+    h.drag(start, end, egui::PointerButton::Primary);
+    let n = h.lane_notes();
+    assert_eq!(n.len(), 1);
+    assert!(n[0].end_tick().0 > 3840, "the note crosses the old end: {:?}", n[0]);
+    assert_eq!(len(&h), 2 * 3840, "and the pattern grew to hold it");
+    // the pattern's … menu opens on a left click and sets the length
+    let dots = h.drawn_nodes().into_iter().filter(|(t, _)| t == "…").map(|(_, r)| r).min_by(|a, b| a.top().total_cmp(&b.top())).expect("the pattern … button");
+    h.click_at(dots.center(), egui::PointerButton::Primary);
+    h.frame(vec![]);
+    assert!(h.drawn_texts().iter().any(|t| t == "Length: 2.00 bars"), "the menu opens on a left click");
+    let four = h.drawn_nodes().into_iter().find(|(t, _)| t == "4").map(|(_, r)| r).expect("the 4 bars choice");
+    h.click_at(four.center(), egui::PointerButton::Primary);
+    assert_eq!(len(&h), 4 * 3840, "set to 4 bars");
+}

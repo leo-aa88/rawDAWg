@@ -224,49 +224,48 @@ fn param_grid(
                             r.response
                         }
                         None => {
-                            let r = ui.add(egui::Slider::new(&mut idx, 0..=(steps as i64 - 1)).show_value(true));
+                            let r = ui.add(rawdawg_ui::params::slider(ui, &mut idx, 0..=(steps as i64 - 1)).show_value(true));
                             n = d.to_normalized(idx as f64);
                             r
                         }
                     }
                 }
-                _ => ui.add(egui::Slider::new(&mut n, 0.0..=1.0).show_value(false)),
+                _ => ui.add(rawdawg_ui::params::slider(ui, &mut n, 0.0..=1.0).show_value(false)),
             };
-            let resp = resp
-                .context_menu(|ui| {
-                    let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
-                    if ui.button(if locked { "Unlock for randomize" } else { "Lock for randomize" }).clicked() {
-                        app.synth_panel.evolve.locks.set_param(d.id.0, !locked);
-                        ui.close();
-                    }
-                    if ui.button("Reset to default").clicked() {
-                        edits.push((d.id, d.default_normalized, true, true));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("MIDI learn (then move a controller)").clicked() {
-                        app.arm_midi_learn(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
-                        app.remove_midi_mapping(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
-                        super::automation::create_clip_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Automate in this pattern")
-                        .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
-                        .clicked()
-                    {
-                        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                })
-                .map(|r| r.response)
-                .unwrap_or(resp);
+            let resp = rawdawg_ui::params::context_menu(&resp, |ui| {
+                let locked = app.synth_panel.evolve.locks.params.contains(&d.id.0);
+                if ui.button(if locked { "Unlock for randomize" } else { "Lock for randomize" }).clicked() {
+                    app.synth_panel.evolve.locks.set_param(d.id.0, !locked);
+                    ui.close();
+                }
+                if ui.button("Reset to default").clicked() {
+                    edits.push((d.id, d.default_normalized, true, true));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("MIDI learn (then move a controller)").clicked() {
+                    app.arm_midi_learn(instance_id, d.id.0);
+                    ui.close();
+                }
+                if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+                    app.remove_midi_mapping(instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui.button("Create automation clip").on_hover_text("A curve for this parameter on the Automation track (plays in Song mode)").clicked() {
+                    super::automation::create_clip_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui
+                    .button("Automate in this pattern")
+                    .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
+                    .clicked()
+                {
+                    super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+            })
+            .map(|r| r.response)
+            .unwrap_or(resp);
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
             if labeled.is_some() {
@@ -338,7 +337,7 @@ fn mod_matrix(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, patch: 
                     }
                 }
             });
-            let resp = ui.add(egui::Slider::new(&mut route.depth, -1.0..=1.0).fixed_decimals(2));
+            let resp = ui.add(rawdawg_ui::params::slider(ui, &mut route.depth, -1.0..=1.0).fixed_decimals(2));
             if resp.changed() {
                 // live preview of depth through the param path; commit on release
                 let id = ParamId(params::mod_param(i as u32, params::MOD_DEPTH));
@@ -404,5 +403,10 @@ pub(crate) fn commit_patch(app: &mut App, instance_id: InstanceId, patch: rawdaw
     // the committed sound plays at its own level (an Evolve level match was for its card only)
     app.synth_panel.evolve.preview_trim_db = None;
     let value: serde_json::Value = serde_json::to_value(&patch).unwrap_or(serde_json::Value::Null);
+    // the panel's controls show (and their edits start from) the mirror: it must hold the new
+    // sound too, or the next touch writes the old values back (Randomize did that)
+    if let Some(m) = app.synth_mirrors.get_mut(&instance_id) {
+        let _ = m.set_patch(patch);
+    }
     app.apply(Command::SetInstanceState { instance_id, state_version: 1, state: value });
 }

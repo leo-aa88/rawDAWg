@@ -71,7 +71,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId) {
         }
         if info.is_some_and(|i| i.has_mix) {
             let mut mix = inst.mix;
-            if ui.add(egui::Slider::new(&mut mix, 0.0..=1.0).text("Wet")).changed() {
+            if ui.add(rawdawg_ui::params::slider(ui, &mut mix, 0.0..=1.0).text("Wet")).changed() {
                 cmds.push(Command::SetInstanceMix { instance_id, mix });
             }
         }
@@ -220,45 +220,44 @@ fn param_grid(app: &mut App, ui: &mut egui::Ui, instance_id: InstanceId, descrip
             n = changed;
             let cc = app.midi_mapping_for(instance_id, d.id.0).map(|m| format!(" CC{}", m.cc)).unwrap_or_default();
             let learning = app.midi_learn.as_ref().is_some_and(|t| t.instance_id == instance_id && t.param_id == d.id.0);
-            let resp = resp
-                .context_menu(|ui| {
-                    if ui.button("MIDI learn (then move a controller)").clicked() {
-                        app.arm_midi_learn(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
-                        app.remove_midi_mapping(instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui.button("Create automation clip").clicked() {
-                        super::automation::create_clip_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Automate in this pattern")
-                        .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
-                        .clicked()
-                    {
-                        super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
-                        ui.close();
-                    }
-                    ui.menu_button("Modulate with an LFO clip", |ui| {
-                        for (shape, label) in super::automation::LFO_SHAPES.iter().enumerate() {
-                            for (cycles, rate) in [(0.25, "slow, 1 per 4 bars"), (1.0, "1 per bar"), (4.0, "1 per beat")] {
-                                if ui.button(format!("{label}, {rate}")).clicked() {
-                                    super::automation::create_lfo_for(app, instance_id, d.id.0, shape, cycles, 0.25);
-                                    ui.close();
-                                }
+            let resp = rawdawg_ui::params::context_menu(&resp, |ui| {
+                if ui.button("MIDI learn (then move a controller)").clicked() {
+                    app.arm_midi_learn(instance_id, d.id.0);
+                    ui.close();
+                }
+                if app.midi_mapping_for(instance_id, d.id.0).is_some() && ui.button("Remove MIDI mapping").clicked() {
+                    app.remove_midi_mapping(instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui.button("Create automation clip").clicked() {
+                    super::automation::create_clip_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+                if ui
+                    .button("Automate in this pattern")
+                    .on_hover_text("A curve inside the selected pattern: it plays whenever the pattern plays, in Pattern mode and in Song mode")
+                    .clicked()
+                {
+                    super::automation::create_pattern_curve_for(app, instance_id, d.id.0);
+                    ui.close();
+                }
+                ui.menu_button("Modulate with an LFO clip", |ui| {
+                    for (shape, label) in super::automation::LFO_SHAPES.iter().enumerate() {
+                        for (cycles, rate) in [(0.25, "slow, 1 per 4 bars"), (1.0, "1 per bar"), (4.0, "1 per beat")] {
+                            if ui.button(format!("{label}, {rate}")).clicked() {
+                                super::automation::create_lfo_for(app, instance_id, d.id.0, shape, cycles, 0.25);
+                                ui.close();
                             }
                         }
-                    });
-                    if ui.button("Reset to default").clicked() {
-                        edits.push((d.id, d.default_normalized, true, true));
-                        ui.close();
                     }
-                })
-                .map(|r| r.response)
-                .unwrap_or(resp);
+                });
+                if ui.button("Reset to default").clicked() {
+                    edits.push((d.id, d.default_normalized, true, true));
+                    ui.close();
+                }
+            })
+            .map(|r| r.response)
+            .unwrap_or(resp);
             let readout = rawdawg_dsp::processor::display_value(&*app.other_mirrors[&instance_id], d, n);
             ui.label(egui::RichText::new(format!("{readout}{cc}{}", if learning { " learn…" } else { "" })).monospace().color(if learning {
                 theme::WARNING

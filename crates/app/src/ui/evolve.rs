@@ -189,7 +189,7 @@ pub(crate) fn randomize_bar(app: &mut App, ui: &mut egui::Ui, instance: Instance
                 app.status_line = format!("Randomized (chaos {:.0}, seed {seed}, {} attempt(s))", r.chaos_used, r.attempts);
             }
         }
-        ui.add(egui::Slider::new(&mut app.synth_panel.evolve.chaos, 0.0..=100.0).text("Chaos").fixed_decimals(0));
+        ui.add(rawdawg_ui::params::slider(ui, &mut app.synth_panel.evolve.chaos, 0.0..=100.0).text("Chaos").fixed_decimals(0));
         if ui.selectable_label(app.synth_panel.evolve.show_locks, "Locks").clicked() {
             app.synth_panel.evolve.show_locks = !app.synth_panel.evolve.show_locks;
         }

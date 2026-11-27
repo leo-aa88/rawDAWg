@@ -376,7 +376,9 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         let r = Rect::from_min_max(pos2(x_of(l.start_tick.0), ruler_rect.min.y), pos2(x_of(l.end_tick.0), ruler_rect.max.y)).intersect(ruler_rect);
         painter.rect_filled(r, 0.0, if l.enabled { theme::ACCENT.linear_multiply(0.35) } else { theme::TEXT_SECONDARY.linear_multiply(0.2) });
     }
-    // marker row: tempo (top half) and meter markers
+    // marker row: tempo (top half) and meter markers. The row's own interaction (right-click to
+    // add) is registered first so the markers drawn on it sit on top and get their clicks.
+    let marker_resp = ui.interact(marker_rect, ui.scope_id().with("marker-row"), Sense::click());
     painter.rect_filled(marker_rect, 0.0, theme::PANEL.linear_multiply(0.8));
     let mut marker_hit: Option<(bool, usize)> = None;
     for (i, t) in app.project.tempo.iter().enumerate() {
@@ -387,7 +389,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         let label = format!("{:.1} BPM", t.us_per_quarter.bpm().0);
         let w = label.len() as f32 * 6.0 + 8.0;
         let r = Rect::from_min_size(pos2(x, marker_rect.min.y + 1.0), vec2(w, MARKER_H - 2.0));
-        let mr = ui.interact(r, ui.scope_id().with(("tempo-marker", i)), Sense::click());
+        let mr = ui.interact(r, marker_id(true, i), Sense::click());
         painter.rect(r, 2.0, theme::WARNING.linear_multiply(if mr.hovered() { 0.5 } else { 0.3 }), Stroke::new(1.0, theme::WARNING), egui::StrokeKind::Inside);
         painter.text(r.left_center() + vec2(4.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(10.0), theme::TEXT);
         if mr.clicked() {
@@ -405,7 +407,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         // put meter markers after any tempo label at the same tick
         let shift = app.project.tempo.iter().any(|t| t.tick == m.tick) as i32 as f32 * 70.0;
         let r = r.translate(vec2(shift, 0.0));
-        let mr = ui.interact(r, ui.scope_id().with(("meter-marker", i)), Sense::click());
+        let mr = ui.interact(r, marker_id(false, i), Sense::click());
         painter.rect(
             r,
             2.0,
@@ -430,7 +432,6 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
         app.playlist.marker_edit = Some(MarkerEdit { tempo, index, bpm, numerator, denominator, tick });
     }
     // marker row right-click: add markers at the pointer
-    let marker_resp = ui.interact(marker_rect, ui.scope_id().with("marker-row"), Sense::click());
     marker_resp.context_menu(|ui| {
         let at = ui.ctx().pointer_latest_pos().map(|p| snap_round(tick_at(p.x), Some(bar_t)).max(0)).unwrap_or(0);
         ui.label(format!("At bar {}", at / bar_t + 1));
@@ -1235,4 +1236,9 @@ fn marker_dialog(app: &mut App, ui: &mut egui::Ui) {
     } else if open {
         app.playlist.marker_edit = Some(m);
     }
+}
+
+/// Widget id of tempo marker `index` (`tempo`) or time-signature marker `index`.
+pub(crate) fn marker_id(tempo: bool, index: usize) -> egui::Id {
+    egui::Id::unique(("playlist-marker", tempo, index))
 }

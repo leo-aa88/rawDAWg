@@ -52,15 +52,57 @@ pub fn param_control(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::D
         ParamMapping::Discrete { .. } if labels.is_some() => step_combo(ui, salt, d, labels.unwrap_or_default(), n),
         ParamMapping::Discrete { steps } => {
             let mut idx = d.to_physical(n) as i64;
-            let r = ui.add(egui::Slider::new(&mut idx, 0..=(i64::from(steps) - 1)).show_value(true));
+            let r = ui.add(slider(ui, &mut idx, 0..=(i64::from(steps) - 1)).show_value(true));
             (r, d.to_normalized(idx as f64))
         }
         _ => {
             let mut v = n;
-            let r = ui.add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false));
+            let r = ui.add(slider(ui, &mut v, 0.0..=1.0).show_value(false));
             (r, v)
         }
     }
+}
+
+/// Whether a button other than the primary one is pressed, held or released this frame.
+pub fn non_primary_pointer(ui: &egui::Ui) -> bool {
+    ui.input(|i| {
+        [egui::PointerButton::Secondary, egui::PointerButton::Middle].into_iter().any(|b| i.pointer.button_pressed(b) || i.pointer.button_down(b) || i.pointer.button_released(b))
+    })
+}
+
+/// `egui::Slider::new`, except that only the primary button moves it: a right-click opens the
+/// control's menu (automation, MIDI learn) and leaves the value alone. egui's own slider follows
+/// any button, so a right-click used to jump the value to the pointer.
+pub fn slider<'a, N: egui::emath::Numeric>(ui: &egui::Ui, value: &'a mut N, range: std::ops::RangeInclusive<N>) -> egui::Slider<'a> {
+    let frozen = non_primary_pointer(ui);
+    let range_f64 = range.start().to_f64()..=range.end().to_f64();
+    let s = egui::Slider::from_get_set(range_f64, move |v: Option<f64>| {
+        if let Some(v) = v
+            && !frozen
+        {
+            *value = N::from_f64(v);
+        }
+        value.to_f64()
+    });
+    if N::INTEGRAL { s.integer() } else { s }
+}
+
+/// `Response::context_menu` for parameter controls: also opens when the right button is released
+/// over the control. egui's sliders sense only drags, so a right-click on one is a drag, never a
+/// secondary click, and egui's own context menu never opened there. (Sensing clicks as well would
+/// stop a left click from setting the slider.)
+pub fn context_menu<R>(r: &Response, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<egui::InnerResponse<R>> {
+    let released_here = r.hovered() && r.ctx.input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
+    let open = if r.secondary_clicked() || released_here {
+        Some(egui::SetOpenCommand::Bool(true))
+    } else if r.clicked() {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else {
+        None
+    };
+    // its own popup id: egui's default (`id.with("popup")`) is the one a ComboBox keeps its list
+    // under, so a menu on a dropdown opened the dropdown's list as well
+    egui::Popup::menu(r).id(r.id.with("rawdawg-param-menu")).open_memory(open).at_pointer_fixed().show(add)
 }
 
 /// The product wordmark: `raw` `DAW` `g` with DAW in the accent colour (UI_UX.md §1).

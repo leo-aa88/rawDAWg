@@ -824,6 +824,17 @@ impl App {
         }
     }
 
+    /// Add a fresh synth channel below the selected one and select it (one undo step).
+    pub(crate) fn add_synth_channel(&mut self) {
+        let (cmd, id) = channels::new_synth_channel(&self.project, self.selected_channel);
+        self.apply(cmd);
+        if self.project.channel(id).is_some() {
+            self.selected_channel = Some(id);
+            let name = self.project.channel(id).map(|c| c.name.clone()).unwrap_or_default();
+            self.status_line = format!("Added {name}: play it on the keys, or open it in the Synth view");
+        }
+    }
+
     fn typing_pitch(key: egui::Key) -> Option<i32> {
         use egui::Key::*;
         Some(match key {
@@ -1027,8 +1038,7 @@ impl App {
                 self.send(EngineCommand::Panic { source: None });
             }
             ui.separator();
-            let bpm = self.project.tempo.first().map(|t| t.us_per_quarter.bpm().0).unwrap_or(120.0);
-            ui.label(format!("{bpm:.2} BPM"));
+            self.tempo_control(ui);
             let (bar, beat) = match &self.audio {
                 AudioState::Running(s) => {
                     let tick = s.handle.status.position_tick.load(std::sync::atomic::Ordering::Relaxed);
@@ -1054,7 +1064,7 @@ impl App {
             if ui.button("+").on_hover_text("Octave up").clicked() {
                 self.prefs.typing_octave = (self.prefs.typing_octave + 1).min(4);
             }
-            ui.add(egui::Slider::new(&mut self.prefs.typing_velocity, 0.05..=1.0).text("Vel").fixed_decimals(2));
+            ui.add(rawdawg_ui::params::slider(ui, &mut self.prefs.typing_velocity, 0.05..=1.0).text("Vel").fixed_decimals(2));
             ui.separator();
             let undo_label = self.history.undo_label();
             if ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo")).on_hover_text(undo_label.unwrap_or("Nothing to undo")).clicked() {
@@ -1174,7 +1184,9 @@ impl App {
         ui.add(egui::TextEdit::singleline(&mut self.browser_search).hint_text("search samples and effects…").desired_width(f32::INFINITY));
         ui.separator();
         egui::CollapsingHeader::new("Instruments").default_open(true).show(ui, |ui| {
-            ui.label("rawDAWg Synth").on_hover_text("native.synth — the flagship instrument");
+            if ui.add(egui::Button::new("rawDAWg Synth").frame(false)).on_hover_text("Click: add a new rawDAWg Synth channel to the rack (the flagship instrument)").clicked() {
+                self.add_synth_channel();
+            }
         });
         egui::CollapsingHeader::new("Projects").default_open(true).show(ui, |ui| {
             if self.prefs.recent_projects.is_empty() {
@@ -1323,7 +1335,15 @@ impl App {
     }
 
     fn rack(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Channel rack");
+        ui.horizontal(|ui| {
+            ui.heading("Channel rack");
+            if ui.button("+ Synth").on_hover_text("Add a new rawDAWg Synth channel (the default sound) below the selected one").clicked() {
+                self.add_synth_channel();
+            }
+        });
+        if self.project.channels.is_empty() {
+            ui.label(egui::RichText::new("No channels yet: + Synth adds an instrument, or drop a sample or a MIDI file onto the window.").color(theme::TEXT_SECONDARY));
+        }
         ui.separator();
         let mut cmds: Vec<Command> = Vec::new();
         let mut select: Option<ChannelId> = None;
@@ -1400,7 +1420,7 @@ impl App {
                     }
                 });
                 let mut gain = ch.gain_db.0;
-                let r = ui.add(egui::Slider::new(&mut gain, -60.0..=12.0).suffix(" dB").fixed_decimals(1).show_value(true));
+                let r = ui.add(rawdawg_ui::params::slider(ui, &mut gain, -60.0..=12.0).suffix(" dB").fixed_decimals(1).show_value(true));
                 if r.drag_started() {
                     let _ = self.history.begin_gesture();
                 }
@@ -1415,7 +1435,7 @@ impl App {
                     self.recompile();
                 }
                 let mut pan = ch.pan.0;
-                let r = ui.add(egui::Slider::new(&mut pan, -1.0..=1.0).text("Pan").fixed_decimals(2));
+                let r = ui.add(rawdawg_ui::params::slider(ui, &mut pan, -1.0..=1.0).text("Pan").fixed_decimals(2));
                 if r.drag_started() {
                     let _ = self.history.begin_gesture();
                 }
@@ -1495,6 +1515,41 @@ impl App {
     /// carrying processor state across plans).
     fn recompile_gain_only(&mut self) {
         self.recompile();
+    }
+
+    /// The song's starting tempo, editable in place: drag (one undo step per drag) or click and
+    /// type. Later tempo changes are the markers above the playlist.
+    fn tempo_control(&mut self, ui: &mut egui::Ui) {
+        let mut bpm = self.project.tempo.first().map(|t| t.us_per_quarter.bpm().0).unwrap_or(120.0);
+        let r = ui
+            .add(egui::DragValue::new(&mut bpm).range(20.0..=400.0).speed(0.1).fixed_decimals(2).suffix(" BPM").update_while_editing(false))
+            .on_hover_text("Song tempo: drag, or click and type (tempo changes later in the song: right-click the marker row above the playlist)");
+        let set = |p: &rawdawg_project::Project, bpm: f64| -> Option<Command> {
+            let v = rawdawg_types::units::UsPerQuarter::from_bpm(bpm).ok()?;
+            let mut tempo = p.tempo.clone();
+            match tempo.first_mut() {
+                Some(t) if t.tick.0 == 0 => t.us_per_quarter = v,
+                _ => tempo.insert(0, rawdawg_project::TempoPoint { tick: rawdawg_types::units::Tick(0), us_per_quarter: v }),
+            }
+            Some(Command::SetTempoMap { tempo })
+        };
+        if r.drag_started() {
+            let _ = self.history.begin_gesture();
+        }
+        if r.changed()
+            && let Some(cmd) = set(&self.project, bpm)
+        {
+            if self.history.gesture_active() {
+                let _ = self.history.preview(&mut self.project, cmd);
+                self.recompile();
+            } else {
+                self.apply(cmd);
+            }
+        }
+        if r.drag_stopped() && self.history.gesture_active() {
+            let _ = self.history.commit_gesture();
+            self.recompile();
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
