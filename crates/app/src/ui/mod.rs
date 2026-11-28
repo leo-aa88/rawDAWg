@@ -1969,7 +1969,7 @@ impl App {
     /// Per-frame logic (shortcuts, input polling, engine housekeeping). Also used by headless tests.
     pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
-        mixer::finish_rename_before_save(self, ctx);
+        mixer::step_rename(self, ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
             self.save_project_checked();
         }
@@ -2051,7 +2051,6 @@ impl App {
 
     /// Window layout with selectable parts (bitmask; tests isolate interactions).
     pub(crate) fn draw_parts(&mut self, ui: &mut egui::Ui, parts: u8) {
-        mixer::finish_rename_before_ui(self, ui.ctx());
         if parts & 1 != 0 {
             egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         }
