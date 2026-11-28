@@ -2583,6 +2583,103 @@ fn mixer_rename_clears_cancelled_ime_preedit_before_outside_click() {
 }
 
 #[test]
+fn mixer_rename_drops_unconfirmed_ime_preedit_on_outside_click() {
+    let mut h = Harness::new(None);
+    // 1. Provisional preedit appended after confirmed text: outside click drops the preedit.
+    begin_mixer_rename_with(&mut h, "Vocals");
+    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
+    let pos = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+    assert!(h.app.editor_view == EditorView::Rack);
+
+    // 2. Provisional preedit temporarily replacing selected text: outside click recovers it.
+    h.app.editor_view = EditorView::Mixer;
+    let strip = h.node("Vocals").unwrap();
+    h.click_at(strip.center(), egui::PointerButton::Secondary);
+    let rename = h.node("Rename").unwrap();
+    h.click_at(rename.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Lead".into())]);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
+    let pos = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Lead");
+    assert!(h.app.editor_view == EditorView::Rack);
+}
+
+#[test]
+fn mixer_rename_enter_and_ctrl_s_order_controls_what_is_saved() {
+    let root = std::env::temp_dir().join(format!("rawdawg-ui-mixer-rename-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let project_dir = root.join("RenameSave.rawdawg");
+
+    let mut h = Harness::new(None);
+    h.app.new_project();
+    h.app.save_project_as(project_dir.clone());
+    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Insert 1");
+
+    // Enter then Ctrl+S in one frame: commits the rename first, so the saved manifest has "Vocals".
+    begin_mixer_rename_with(&mut h, "Vocal");
+    h.frame(vec![
+        egui::Event::Text("s".into()),
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+    assert!(!h.app.history.is_dirty(), "project is clean after saving post-Enter");
+    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Vocals");
+
+    // Ctrl+S then Enter in one frame: saves before the rename commits, leaving the new name dirty.
+    h.app.editor_view = EditorView::Mixer;
+    let strip = h.node("Vocals").unwrap();
+    h.click_at(strip.center(), egui::PointerButton::Secondary);
+    let rename = h.node("Rename").unwrap();
+    h.click_at(rename.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Lead".into())]);
+    h.frame(vec![
+        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
+        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Lead");
+    assert!(h.app.history.is_dirty(), "rename after Ctrl+S leaves unsaved changes");
+    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Vocals");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mixer_rename_applies_same_frame_middle_click_paste_before_outside_click() {
+    let mut h = Harness::new(None);
+    begin_mixer_rename_with(&mut h, "Vocals");
+    let field = h.node("Vocals").unwrap();
+    let paste_pos = egui::pos2(field.right() - 4.0, field.center().y);
+    let rack = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::PointerMoved(paste_pos),
+        egui::Event::PointerButton { pos: paste_pos, button: egui::PointerButton::Middle, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::MiddleClickPaste { pos: paste_pos, text: " 2".into() },
+        egui::Event::PointerButton { pos: paste_pos, button: egui::PointerButton::Middle, pressed: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerMoved(rack),
+        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals 2");
+    assert!(h.app.editor_view == EditorView::Rack);
+}
+
+#[test]
 fn mixer_rename_commits_before_dragging_the_fader() {
     let mut h = Harness::new(None);
     let strip = begin_mixer_rename(&mut h);

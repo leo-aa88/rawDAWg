@@ -18,14 +18,31 @@ use std::collections::HashMap;
 const STRIP_W: f32 = 118.0;
 const FADER_H: f32 = 150.0;
 
+struct MixerRename {
+    id: MixerChannelId,
+    /// Live TextEdit buffer (may hold provisional IME preedit text while composing).
+    draft: String,
+    /// Last confirmed text (never includes unconfirmed IME preedit).
+    confirmed: String,
+    /// Whether an IME preedit composition is currently active in `draft`.
+    composing: bool,
+    /// Last drawn interact_rect of the TextEdit.
+    rect: Option<egui::Rect>,
+}
+
+impl MixerRename {
+    fn new(id: MixerChannelId, name: String) -> Self {
+        Self { id, confirmed: name.clone(), draft: name, composing: false, rect: None }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MixerState {
     pub selected: Option<MixerChannelId>,
     /// Peak hold per mixer channel: (value, frames since set) for L and R, and clip flags.
     hold: HashMap<MixerChannelId, [(f32, u32); 2]>,
     clip: HashMap<MixerChannelId, bool>,
-    rename: Option<(MixerChannelId, String)>,
-    rename_rect: Option<egui::Rect>,
+    rename: Option<MixerRename>,
     add_search: String,
     pub add_open: bool,
     /// Give the search field the keyboard focus once, when the search opens.
@@ -197,62 +214,228 @@ fn rename_field_id(id: MixerChannelId) -> egui::Id {
     egui::Id::unique(("mixer-rename", id))
 }
 
-fn is_rename_input_event(event: &egui::Event, field_id: egui::Id) -> bool {
+#[derive(Clone, Copy)]
+enum CommitBoundary {
+    Enter(usize),
+    OutsidePress(usize),
+}
+
+impl CommitBoundary {
+    fn index(self) -> usize {
+        match self {
+            Self::Enter(i) | Self::OutsidePress(i) => i,
+        }
+    }
+
+    fn consume_end(self) -> usize {
+        match self {
+            Self::Enter(i) => i + 1,
+            Self::OutsidePress(i) => i,
+        }
+    }
+}
+
+fn is_rename_input_event(event: &egui::Event, field_id: egui::Id, field: Option<egui::Rect>) -> bool {
     match event {
         egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) | egui::Event::Text(_) | egui::Event::Key { .. } | egui::Event::Ime(_) => true,
+        egui::Event::MiddleClickPaste { pos, .. } => field.is_some_and(|rect| rect.contains(*pos)),
         egui::Event::AccessKitActionRequest(req) => req.target_node == field_id.accesskit_id() && req.target_tree == egui::accesskit::TreeId::ROOT,
         _ => false,
     }
 }
 
+fn first_commit_boundary(events: &[egui::Event], field: Option<egui::Rect>) -> Option<CommitBoundary> {
+    events.iter().enumerate().find_map(|(idx, event)| match event {
+        egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none() => Some(CommitBoundary::Enter(idx)),
+        egui::Event::PointerButton { pos, pressed: true, .. } if field.is_none_or(|rect| !rect.contains(*pos)) => Some(CommitBoundary::OutsidePress(idx)),
+        _ => None,
+    })
+}
+
+fn run_scratch_text_edit(rename: &mut MixerRename, ctx: &egui::Context, field_id: egui::Id, events: Vec<egui::Event>) -> egui::text_edit::TextEditOutput {
+    let saved_events = ctx.input_mut(|i| std::mem::replace(&mut i.events, events));
+    let rect = rename.rect.unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(STRIP_W - 10.0, 20.0)));
+    let prev_surrender = ctx.options(|o| o.input_options.surrender_focus_on);
+    ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
+    let output = {
+        let mut scratch = egui::Ui::new(ctx.clone(), egui::Id::unique("mixer-rename-flush"), egui::UiBuilder::new().max_rect(rect).invisible());
+        egui::TextEdit::singleline(&mut rename.draft).id(field_id).desired_width(STRIP_W - 10.0).show(&mut scratch)
+    };
+    ctx.options_mut(|o| o.input_options.surrender_focus_on = prev_surrender);
+    ctx.input_mut(|i| i.events = saved_events);
+    output
+}
+
+fn apply_middle_click_paste(rename: &mut MixerRename, ctx: &egui::Context, field_id: egui::Id, pos: egui::Pos2, pasted: &str) {
+    use egui::TextBuffer as _;
+    let output = run_scratch_text_edit(rename, ctx, field_id, Vec::new());
+    let ccursor = output.galley.cursor_from_pos(pos - output.galley_pos + vec2(output.galley.rect.left(), 0.0));
+    let mut ccursor = rename.draft.delete_selected(&egui::text::CCursorRange::one(ccursor));
+    let single_line = pasted.replace(['\r', '\n'], " ");
+    rename.draft.insert_text_at(&mut ccursor, &single_line, usize::MAX);
+    let mut state = output.state;
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+    state.store(ctx, field_id);
+    rename.composing = false;
+    rename.confirmed = rename.draft.clone();
+}
+
+/// Apply rename input events in chronological order via egui's own TextEdit, maintaining the
+/// separation between provisional IME preedit (`draft`) and confirmed text (`confirmed`).
+fn apply_rename_events(rename: &mut MixerRename, ctx: &egui::Context, field_id: egui::Id, events: &[egui::Event]) {
+    let mut chunk: Vec<egui::Event> = Vec::new();
+    let flush_chunk = |rename: &mut MixerRename, chunk: &mut Vec<egui::Event>| {
+        if chunk.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(chunk);
+        let output = run_scratch_text_edit(rename, ctx, field_id, batch);
+        if !rename.composing || output.response.changed() {
+            rename.composing = false;
+            rename.confirmed = rename.draft.clone();
+        }
+    };
+
+    for event in events {
+        if !ctx.memory(|m| m.has_focus(field_id)) {
+            break;
+        }
+        match event {
+            egui::Event::MiddleClickPaste { pos, text } if rename.rect.is_some_and(|r| r.contains(*pos)) => {
+                flush_chunk(rename, &mut chunk);
+                if !ctx.memory(|m| m.has_focus(field_id)) {
+                    break;
+                }
+                apply_middle_click_paste(rename, ctx, field_id, *pos, text);
+            }
+            egui::Event::Ime(ime) => {
+                flush_chunk(rename, &mut chunk);
+                if !ctx.memory(|m| m.has_focus(field_id)) {
+                    break;
+                }
+                match ime {
+                    egui::ImeEvent::Preedit { text, .. } if !text.is_empty() && text != "\n" && text != "\r" => {
+                        if !rename.composing {
+                            rename.confirmed = rename.draft.clone();
+                            rename.composing = true;
+                        }
+                        run_scratch_text_edit(rename, ctx, field_id, vec![event.clone()]);
+                    }
+                    egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text) if text.is_empty() => {
+                        let output = run_scratch_text_edit(rename, ctx, field_id, vec![event.clone()]);
+                        if rename.composing {
+                            if rename.draft != rename.confirmed {
+                                // Restore text that preedit temporarily replaced (e.g. a selection).
+                                rename.draft = rename.confirmed.clone();
+                                let mut state = output.state;
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::end_of_str(&rename.draft))));
+                                state.store(ctx, field_id);
+                            }
+                            rename.composing = false;
+                        }
+                    }
+                    egui::ImeEvent::Commit(text) if text != "\n" && text != "\r" => {
+                        run_scratch_text_edit(rename, ctx, field_id, vec![event.clone()]);
+                        rename.composing = false;
+                        rename.confirmed = rename.draft.clone();
+                    }
+                    egui::ImeEvent::DeleteSurrounding { .. } => {
+                        run_scratch_text_edit(rename, ctx, field_id, vec![event.clone()]);
+                        if !rename.composing {
+                            rename.confirmed = rename.draft.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => chunk.push(event.clone()),
+        }
+    }
+    flush_chunk(rename, &mut chunk);
+}
+
+fn commit_at_boundary(app: &mut App, ctx: &egui::Context, field_id: egui::Id, boundary: CommitBoundary) {
+    let field = app.mixer.rename.as_ref().and_then(|r| r.rect);
+    let prefix: Vec<egui::Event> = ctx.input(|i| i.events[..boundary.index()].iter().filter(|event| is_rename_input_event(event, field_id, field)).cloned().collect());
+    if !prefix.is_empty()
+        && let Some(rename) = app.mixer.rename.as_mut()
+    {
+        apply_rename_events(rename, ctx, field_id, &prefix);
+    }
+    let consume_end = boundary.consume_end();
+    ctx.input_mut(|i| {
+        let mut idx = 0;
+        i.events.retain(|event| {
+            let keep = idx >= consume_end || !is_rename_input_event(event, field_id, field);
+            idx += 1;
+            keep
+        });
+    });
+    ctx.memory_mut(|m| m.surrender_focus(field_id));
+    finish_inactive_rename(app, ctx);
+}
+
+/// Resolve a mixer rename before `App::step`'s global `Ctrl+S` snapshots the project whenever
+/// the rename's commit boundary (Enter, Escape, or outside press) precedes `Ctrl+S` in the frame.
+pub(super) fn finish_rename_before_save(app: &mut App, ctx: &egui::Context) {
+    let Some(rename) = &app.mixer.rename else { return };
+    let field_id = rename_field_id(rename.id);
+    let field = rename.rect;
+    let save_idx = ctx.input(|i| {
+        i.events
+            .iter()
+            .position(|event| matches!(event, egui::Event::Key { key: egui::Key::S, pressed: true, modifiers, .. } if modifiers.matches_logically(egui::Modifiers::CTRL)))
+    });
+    if app.editor_view != EditorView::Mixer || !ctx.memory(|m| m.has_focus(field_id)) {
+        // Focus already left (e.g. Escape in egui's begin_pass): only defer if Ctrl+S preceded Escape.
+        let escape_idx =
+            ctx.input(|i| i.events.iter().position(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, modifiers, .. } if modifiers.is_none())));
+        if let (Some(save), Some(esc)) = (save_idx, escape_idx)
+            && save < esc
+        {
+            return;
+        }
+        finish_inactive_rename(app, ctx);
+        return;
+    }
+    let Some(save_idx) = save_idx else { return };
+    let boundary = ctx.input(|i| first_commit_boundary(&i.events, field));
+    if let Some(boundary) = boundary
+        && boundary.index() < save_idx
+    {
+        commit_at_boundary(app, ctx, field_id, boundary);
+    }
+}
+
 pub(super) fn finish_rename_before_ui(app: &mut App, ctx: &egui::Context) {
-    let Some((id, _)) = &app.mixer.rename else { return };
-    let field_id = rename_field_id(*id);
+    let Some(rename) = &app.mixer.rename else { return };
+    let field_id = rename_field_id(rename.id);
     if app.editor_view == EditorView::Mixer && ctx.memory(|m| m.has_focus(field_id)) && ctx.input(|i| i.pointer.any_pressed()) {
         // Use the rect recorded when the field drew; `ctx.read_response` triggers `get_response`,
         // which would surrender focus on an outside press before TextEdit can consume pending edits.
-        let field = app.mixer.rename_rect;
-        let press_idx = ctx
-            .input(|i| i.events.iter().position(|event| matches!(event, egui::Event::PointerButton { pos, pressed: true, .. } if field.is_none_or(|rect| !rect.contains(*pos)))));
-        if let Some(press_idx) = press_idx {
-            let has_pending_edit = ctx.input(|i| i.events[..press_idx].iter().any(|event| is_rename_input_event(event, field_id)));
-            if has_pending_edit && let Some((_, draft)) = app.mixer.rename.as_mut() {
-                // Let egui's own TextEdit process edits preceding the outside press (typing,
-                // backspace, clipboard, IME cancellation, etc.) without painting or touching layout.
-                let all_events = ctx.input_mut(|i| {
-                    let all = std::mem::take(&mut i.events);
-                    i.events = all[..press_idx].iter().filter(|e| is_rename_input_event(e, field_id)).cloned().collect();
-                    all
-                });
-                let rect = field.unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(STRIP_W - 10.0, 20.0)));
-                let prev_surrender = ctx.options(|o| o.input_options.surrender_focus_on);
-                ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
-                {
-                    let mut scratch = egui::Ui::new(ctx.clone(), egui::Id::unique("mixer-rename-flush"), egui::UiBuilder::new().max_rect(rect).invisible());
-                    scratch.add(egui::TextEdit::singleline(draft).id(field_id).desired_width(STRIP_W - 10.0));
-                }
-                ctx.options_mut(|o| o.input_options.surrender_focus_on = prev_surrender);
-                ctx.input_mut(|i| {
-                    i.events =
-                        all_events.into_iter().enumerate().filter_map(|(idx, event)| (idx >= press_idx || !is_rename_input_event(&event, field_id)).then_some(event)).collect();
-                });
-            }
-            ctx.memory_mut(|m| m.surrender_focus(field_id));
+        let field = rename.rect;
+        let has_outside_press =
+            ctx.input(|i| i.events.iter().any(|event| matches!(event, egui::Event::PointerButton { pos, pressed: true, .. } if field.is_none_or(|rect| !rect.contains(*pos)))));
+        if has_outside_press && let Some(boundary) = ctx.input(|i| first_commit_boundary(&i.events, field)) {
+            commit_at_boundary(app, ctx, field_id, boundary);
+            return;
         }
     }
     finish_inactive_rename(app, ctx);
 }
 
 pub(super) fn finish_inactive_rename(app: &mut App, ctx: &egui::Context) {
-    let Some((id, _)) = &app.mixer.rename else { return };
-    if app.history.gesture_active() || (app.editor_view == EditorView::Mixer && ctx.memory(|m| m.has_focus(rename_field_id(*id)))) {
+    let Some(rename) = &app.mixer.rename else { return };
+    if app.history.gesture_active() || (app.editor_view == EditorView::Mixer && ctx.memory(|m| m.has_focus(rename_field_id(rename.id)))) {
         return;
     }
-    let (id, draft) = app.mixer.rename.take().unwrap();
-    app.mixer.rename_rect = None;
-    let name = draft.trim();
-    if !name.is_empty() && app.project.mixer_channel(id).is_some_and(|channel| channel.name != name) {
-        app.apply(Command::RenameMixerChannel { id, name: name.to_owned() });
+    let rename = app.mixer.rename.take().unwrap();
+    if rename.composing {
+        ctx.memory_mut(|m| m.interrupt_ime());
+    }
+    let name = rename.confirmed.trim();
+    if !name.is_empty() && app.project.mixer_channel(rename.id).is_some_and(|channel| channel.name != name) {
+        app.apply(Command::RenameMixerChannel { id: rename.id, name: name.to_owned() });
     }
 }
 
@@ -337,9 +520,25 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
         ui.vertical(|ui| {
             // name
             let rename_id = rename_field_id(m.id);
-            if let Some((_, name)) = app.mixer.rename.as_mut().filter(|(id, _)| *id == m.id) {
-                let r = ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
-                app.mixer.rename_rect = Some(r.interact_rect);
+            if let Some(rename) = app.mixer.rename.as_mut().filter(|r| r.id == m.id) {
+                let has_ime = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+                if has_ime {
+                    // Process this frame's rename events in order so `confirmed` tracks IME
+                    // boundaries accurately, then draw the visible field without re-applying them.
+                    let all_events = ui.ctx().input_mut(|i| std::mem::take(&mut i.events));
+                    let field = rename.rect;
+                    let rename_events: Vec<egui::Event> = all_events.iter().filter(|e| is_rename_input_event(e, rename_id, field)).cloned().collect();
+                    apply_rename_events(rename, ui.ctx(), rename_id, &rename_events);
+                    ui.ctx().input_mut(|i| {
+                        i.events = all_events.into_iter().filter(|e| !is_rename_input_event(e, rename_id, field)).collect();
+                    });
+                }
+                let r = ui.add(egui::TextEdit::singleline(&mut rename.draft).id(rename_id).desired_width(STRIP_W - 10.0));
+                rename.rect = Some(r.interact_rect);
+                if !has_ime && (!rename.composing || r.changed()) {
+                    rename.composing = false;
+                    rename.confirmed = rename.draft.clone();
+                }
             } else {
                 let r = ui.add(egui::Button::selectable(selected, egui::RichText::new(&m.name).strong()).min_size(vec2(STRIP_W - 10.0, 0.0)));
                 if r.clicked() {
@@ -360,8 +559,7 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
                     }
                 });
                 if rename {
-                    app.mixer.rename = Some((m.id, m.name.clone()));
-                    app.mixer.rename_rect = None;
+                    app.mixer.rename = Some(MixerRename::new(m.id, m.name.clone()));
                     ui.memory_mut(|mem| mem.request_focus(rename_id));
                 }
             }

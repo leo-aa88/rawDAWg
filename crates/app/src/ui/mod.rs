@@ -1969,6 +1969,7 @@ impl App {
     /// Per-frame logic (shortcuts, input polling, engine housekeeping). Also used by headless tests.
     pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
+        mixer::finish_rename_before_save(self, ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
             self.save_project_checked();
         }
