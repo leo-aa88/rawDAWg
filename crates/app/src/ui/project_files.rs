@@ -332,6 +332,7 @@ impl App {
                 self.history = History::continuing_from(floor);
                 self.history.mark_dirty();
                 self.project = p;
+                self.mixer.close_rename();
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
                 self.rebuild_mirrors();
                 self.recompile();
@@ -395,6 +396,7 @@ impl App {
         self.files.lock = None;
         self.files.read_only = None;
         self.project = Project::new_default("Untitled", serde_json::to_value(rawdawg_synthesizer::Patch::default()).unwrap_or(serde_json::Value::Null));
+        self.mixer.close_rename();
         self.history = History::new();
         self.project_path = None;
         self.selected_channel = self.project.channels.first().map(|c| c.id);
@@ -537,9 +539,9 @@ impl App {
         }
     }
 
-    /// Close the frontmost dialog (Escape): prompts first, then file dialogs, Settings, the
-    /// add-effect search and Export. Whether one was open.
-    pub(crate) fn close_top_dialog(&mut self) -> bool {
+    /// Close the frontmost dialog (Escape): modal prompts first, then whichever dialog owns
+    /// keyboard focus, then file dialogs, Rename windows, Settings, the add-effect search and Export.
+    pub(crate) fn close_top_dialog(&mut self, ctx: &egui::Context) -> bool {
         if self.files.open_prompt.take().is_some() {
             return true;
         }
@@ -547,15 +549,31 @@ impl App {
             self.files.close_prompt = false;
             return true;
         }
-        if self.files.rename.take().is_some() {
+        // Escape clears text focus in egui's begin_pass, so check both current and previous focus.
+        let owned = |id: egui::Id| ctx.memory(|m| m.has_focus(id) || m.had_focus_last_frame(id));
+        if self.files.dialog.is_some() && owned(file_dialog_field_id()) {
+            self.files.dialog = None;
+            self.files.close_after_save = false;
+            self.files.open_after_save = None;
             return true;
         }
-        if self.mixer.close_rename() {
+        if self.files.rename.is_some() && owned(project_rename_field_id()) {
+            self.files.rename = None;
+            return true;
+        }
+        if self.mixer.rename_field_id().is_some_and(owned) {
+            self.mixer.close_rename();
             return true;
         }
         if self.files.dialog.take().is_some() {
             self.files.close_after_save = false;
             self.files.open_after_save = None;
+            return true;
+        }
+        if self.files.rename.take().is_some() {
+            return true;
+        }
+        if self.mixer.close_rename() {
             return true;
         }
         if self.show_settings {
@@ -602,6 +620,14 @@ impl App {
     }
 }
 
+fn file_dialog_field_id() -> egui::Id {
+    egui::Id::unique("file-dialog-path")
+}
+
+fn project_rename_field_id() -> egui::Id {
+    egui::Id::unique("project-rename-field")
+}
+
 pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
     // a prompt's note belongs to that prompt
     if app.files.open_prompt.is_none() && !app.files.close_prompt {
@@ -646,7 +672,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
                     } else {
                         "New folder for the project (…/Song.rawdawg); assets are copied, the current folder is left as is:"
                     });
-                    let field = ui.add(egui::TextEdit::singleline(&mut app.files.path_input).hint_text("/path/to/Song.rawdawg").desired_width(f32::INFINITY));
+                    let field =
+                        ui.add(egui::TextEdit::singleline(&mut app.files.path_input).id(file_dialog_field_id()).hint_text("/path/to/Song.rawdawg").desired_width(f32::INFINITY));
                     if std::mem::take(&mut app.files.focus_field) {
                         field.request_focus();
                     }
@@ -913,7 +940,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         let mut done = false;
         egui::Window::new("Rename project").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("The name proposes export file names and titles exported MIDI files.");
-            let field = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
+            let field = ui.add(egui::TextEdit::singleline(&mut name).id(project_rename_field_id()).desired_width(320.0));
             if std::mem::take(&mut app.files.focus_rename) {
                 field.request_focus();
             }

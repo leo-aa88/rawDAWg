@@ -217,6 +217,8 @@ pub(crate) struct App {
     screenshot: Option<(PathBuf, std::time::Duration)>,
     started: std::time::Instant,
     screenshot_requested: bool,
+    /// Set when a same-frame `Ctrl+S` follows `Enter` in the mixer rename dialog and must run after it commits.
+    deferred_save: bool,
 }
 
 impl App {
@@ -337,6 +339,7 @@ impl App {
             screenshot: opts.screenshot.clone(),
             started: std::time::Instant::now(),
             screenshot_requested: false,
+            deferred_save: false,
             prefs,
             piano_roll: Default::default(),
             playlist: Default::default(),
@@ -583,6 +586,11 @@ impl App {
 
     /// Apply a persistent command as one undo entry and recompile.
     pub(crate) fn apply(&mut self, cmd: Command) {
+        let _ = self.try_apply(cmd);
+    }
+
+    /// Apply a persistent command as one undo entry and recompile; returns whether it was accepted.
+    pub(crate) fn try_apply(&mut self, cmd: Command) -> bool {
         match self.history.apply(&mut self.project, cmd) {
             Ok(()) => {
                 self.rebuild_mirrors_if_needed();
@@ -594,8 +602,12 @@ impl App {
                         self.status_line = format!("{} plugin(s) not available (state preserved): {}", missing.len(), missing.join("; "));
                     }
                 }
+                true
             }
-            Err(e) => self.status_line = format!("Edit rejected: {e}"),
+            Err(e) => {
+                self.status_line = format!("Edit rejected: {e}");
+                false
+            }
         }
     }
 
@@ -961,7 +973,7 @@ impl App {
         // of those it is the panic key below
         let fresh_escape = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. })));
         let gesture = self.piano_roll.gesture_active() || self.playlist.gesture_active() || self.automation.gesture_active();
-        if fresh_escape && !gesture && !egui::Popup::is_any_open(ctx) && self.close_top_dialog() {
+        if fresh_escape && !gesture && !egui::Popup::is_any_open(ctx) && self.close_top_dialog(ctx) {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             return;
         }
@@ -1433,6 +1445,7 @@ impl App {
                 self.history = History::continuing_from(p.revision.max(rawdawg_project::persist::highest_autosave_revision(&path)));
                 self.project = p;
                 self.project_path = Some(path.clone());
+                self.mixer.close_rename();
                 self.selected_channel = self.project.channels.first().map(|c| c.id);
                 self.prefs.remember_project(path.clone());
                 self.save_prefs();
@@ -1969,7 +1982,8 @@ impl App {
     /// Per-frame logic (shortcuts, input polling, engine housekeeping). Also used by headless tests.
     pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
-        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
+        self.deferred_save = mixer::split_save_around_rename_enter(self, ctx);
+        if !self.deferred_save && ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
             self.save_project_checked();
         }
         self.poll_project_files(ctx);
@@ -2087,6 +2101,9 @@ impl App {
         }
         project_files::show(self, ui.ctx());
         mixer::rename_window(self, ui.ctx());
+        if std::mem::take(&mut self.deferred_save) && ui.ctx().input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
+            self.save_project_checked();
+        }
         recording::latency_window(self, ui.ctx());
         if self.show_help {
             let mut open = self.show_help;

@@ -20,14 +20,21 @@ const FADER_H: f32 = 150.0;
 
 struct MixerRename {
     id: MixerChannelId,
+    /// Live TextEdit buffer (may hold provisional IME preedit while composing).
     name: String,
+    /// Last confirmed text (never includes unconfirmed IME preedit).
+    confirmed: String,
+    /// Selection range in `confirmed` before an active IME preedit replaced it.
+    ime_selection: Option<egui::text::CCursorRange>,
+    /// Whether an IME preedit composition is currently active in `name`.
+    composing: bool,
     focus: bool,
     shown: bool,
 }
 
 impl MixerRename {
     fn new(id: MixerChannelId, name: String) -> Self {
-        Self { id, name, focus: true, shown: false }
+        Self { id, confirmed: name.clone(), name, ime_selection: None, composing: false, focus: true, shown: false }
     }
 }
 
@@ -115,6 +122,10 @@ impl MixerState {
 
     pub(crate) fn close_rename(&mut self) -> bool {
         self.rename.take().is_some()
+    }
+
+    pub(crate) fn rename_field_id(&self) -> Option<egui::Id> {
+        self.rename.as_ref().map(|r| rename_field_id(r.id))
     }
 }
 
@@ -213,26 +224,127 @@ fn rename_field_id(id: MixerChannelId) -> egui::Id {
     egui::Id::unique(("mixer-rename", id))
 }
 
+fn is_save_event(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { key: egui::Key::S, pressed: true, modifiers, .. } if modifiers.matches_logically(egui::Modifiers::CTRL))
+}
+
+fn is_enter_event(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.matches_logically(egui::Modifiers::NONE))
+}
+
+/// When the Rename channel text field has focus and this frame contains both `Enter` and a later
+/// `Ctrl+S`, handle any `Ctrl+S` before `Enter` now and defer the post-`Enter` `Ctrl+S` until
+/// `rename_window` has committed the rename.
+pub(super) fn split_save_around_rename_enter(app: &mut App, ctx: &egui::Context) -> bool {
+    let Some(rename) = &app.mixer.rename else { return false };
+    if !rename.shown || !ctx.memory(|m| m.has_focus(rename_field_id(rename.id))) {
+        return false;
+    }
+    let (enter_idx, save_before, save_after) = ctx.input(|i| {
+        let Some(enter_idx) = i.events.iter().position(is_enter_event) else {
+            return (None, false, false);
+        };
+        let save_before = i.events[..enter_idx].iter().any(is_save_event);
+        let save_after = i.events[enter_idx + 1..].iter().any(is_save_event);
+        (Some(enter_idx), save_before, save_after)
+    });
+    let (Some(enter_idx), true) = (enter_idx, save_after) else {
+        return false;
+    };
+    if save_before {
+        app.save_project_checked();
+        ctx.input_mut(|i| {
+            let mut idx = 0;
+            i.events.retain(|e| {
+                let keep = idx >= enter_idx || !is_save_event(e);
+                idx += 1;
+                keep
+            });
+        });
+    }
+    true
+}
+
 /// Dedicated dialog for renaming a mixer channel (explicit Enter / Rename confirmation,
-/// Cancel / Escape to discard), leaving text editing and IME composition entirely to egui.
+/// Cancel / Escape to discard), leaving text editing and IME composition to egui while
+/// keeping confirmed text separate from provisional IME preedit.
 pub(super) fn rename_window(app: &mut App, ctx: &egui::Context) {
     let Some(current_name) = app.mixer.rename.as_ref().and_then(|r| app.project.mixer_channel(r.id).map(|c| c.name.clone())) else {
         app.mixer.rename = None;
         return;
     };
     let Some(mut rename) = app.mixer.rename.take() else { return };
+    let field_id = rename_field_id(rename.id);
     let just_opened = !rename.shown;
     rename.shown = true;
     let mut open = true;
     let mut commit = false;
     let mut cancel = false;
-    egui::Window::new("Rename channel").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-        let field = ui.add(egui::TextEdit::singleline(&mut rename.name).id(rename_field_id(rename.id)).desired_width(260.0));
-        if std::mem::take(&mut rename.focus) {
-            field.request_focus();
+    let center = ctx.content_rect().center();
+    let mut window = egui::Window::new("Rename channel").open(&mut open).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_CENTER).default_pos(center);
+    if just_opened {
+        window = window.current_pos(center);
+    }
+    window.show(ctx, |ui| {
+        let (ime_events, edit_after_last_ime) = ui.input(|i| {
+            let mut ime_events = Vec::new();
+            let mut last_ime_idx = None;
+            for (idx, e) in i.events.iter().enumerate() {
+                if let egui::Event::Ime(ime) = e {
+                    ime_events.push(ime.clone());
+                    last_ime_idx = Some(idx);
+                }
+            }
+            let edit_after_last_ime = last_ime_idx.is_some_and(|last| {
+                i.events[last + 1..].iter().any(|e| {
+                    matches!(e, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::MiddleClickPaste { .. } | egui::Event::Key { pressed: true, .. })
+                })
+            });
+            (ime_events, edit_after_last_ime)
+        });
+        let starts_preedit = ime_events.iter().any(|ime| matches!(ime, egui::ImeEvent::Preedit { text, .. } if !text.is_empty() && text != "\n" && text != "\r"));
+        if starts_preedit && !rename.composing {
+            rename.confirmed = rename.name.clone();
+            rename.ime_selection = egui::TextEdit::load_state(ui.ctx(), field_id).and_then(|s| s.cursor.char_range());
+            rename.composing = true;
         }
-        let valid = !rename.name.trim().is_empty();
-        let enter = !just_opened && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let out = egui::TextEdit::singleline(&mut rename.name).id(field_id).desired_width(260.0).show(ui);
+        if ime_events.is_empty() || edit_after_last_ime {
+            if !rename.composing || out.response.changed() {
+                rename.composing = false;
+                rename.ime_selection = None;
+                rename.confirmed = rename.name.clone();
+            }
+        } else {
+            match ime_events.last() {
+                Some(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text)) if text.is_empty() => {
+                    if rename.composing {
+                        rename.name = rename.confirmed.clone();
+                        let range = rename.ime_selection.unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::end_of_str(&rename.name)));
+                        let mut state = out.state;
+                        state.cursor.set_char_range(Some(range));
+                        state.store(ui.ctx(), field_id);
+                        rename.composing = false;
+                        rename.ime_selection = None;
+                        ui.ctx().request_repaint();
+                    }
+                }
+                Some(egui::ImeEvent::Commit(text)) if text != "\n" && text != "\r" => {
+                    rename.composing = false;
+                    rename.ime_selection = None;
+                    rename.confirmed = rename.name.clone();
+                }
+                Some(egui::ImeEvent::DeleteSurrounding { .. }) if !rename.composing => {
+                    rename.confirmed = rename.name.clone();
+                }
+                _ => {}
+            }
+        }
+        if std::mem::take(&mut rename.focus) {
+            out.response.request_focus();
+        }
+        let valid = !rename.confirmed.trim().is_empty();
+        let enter = !just_opened && out.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         ui.horizontal(|ui| {
             if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() || (enter && valid) {
                 commit = true;
@@ -243,12 +355,21 @@ pub(super) fn rename_window(app: &mut App, ctx: &egui::Context) {
         });
     });
     if commit {
-        let trimmed = rename.name.trim();
-        if !trimmed.is_empty() && trimmed != current_name {
-            app.apply(Command::RenameMixerChannel { id: rename.id, name: trimmed.to_owned() });
+        if rename.composing {
+            ctx.memory_mut(|m| m.interrupt_ime());
+            rename.name = rename.confirmed.clone();
+            rename.composing = false;
+            rename.ime_selection = None;
+        }
+        let trimmed = rename.confirmed.trim();
+        let applied = !trimmed.is_empty() && (trimmed == current_name || app.try_apply(Command::RenameMixerChannel { id: rename.id, name: trimmed.to_owned() }));
+        if !applied {
+            app.mixer.rename = Some(rename);
         }
     } else if !cancel && open {
         app.mixer.rename = Some(rename);
+    } else if rename.composing {
+        ctx.memory_mut(|m| m.interrupt_ime());
     }
 }
 
