@@ -2451,351 +2451,105 @@ fn with_audio_off_the_ruler_seeks_and_clips_split_at_the_playhead_or_where_right
     assert!(ends.iter().any(|e| (e - here).abs() <= 240), "split where right-clicked: {ends:?} vs {here}");
 }
 
-fn check_mixer_rename(press_enter: bool) {
-    let mut h = Harness::new(None);
+fn open_mixer_rename_dialog(h: &mut Harness, channel_name: &str, double_click: bool) -> egui::Rect {
     h.app.editor_view = EditorView::Mixer;
-    let strip = h.drawn_nodes().into_iter().filter(|(t, _)| t == "Insert 1").map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
-    if press_enter {
+    h.frame(vec![]);
+    let strip = h.drawn_nodes().into_iter().filter(|(t, _)| t == channel_name).map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+    if double_click {
+        h.click_at(strip.center(), egui::PointerButton::Primary);
+        h.click_at(strip.center(), egui::PointerButton::Primary);
+    } else {
         h.click_at(strip.center(), egui::PointerButton::Secondary);
         let rename = h.node("Rename").expect("strip context menu");
         h.click_at(rename.center(), egui::PointerButton::Primary);
-    } else {
-        h.click_at(strip.center(), egui::PointerButton::Primary);
-        h.click_at(strip.center(), egui::PointerButton::Primary);
     }
-    let depth = h.app.history.undo_len();
-    h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text("Drums".into())]);
-    assert!(h.node("Drums").is_some(), "the field accepts typing as soon as it opens");
-    if press_enter {
-        h.key(egui::Key::Enter, egui::Modifiers::NONE);
-    } else {
-        let hint = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Double-click a fader")).unwrap().1;
-        h.click_at(hint.center(), egui::PointerButton::Primary);
-    }
-    assert_eq!(h.app.project.mixer.channels[1].name, "Drums");
-    assert_eq!(h.app.history.undo_len(), depth + 1);
-    // The name is a strip button again.
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    assert!(h.node("Rename").is_some());
-    h.app.undo();
-    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
-}
-
-#[test]
-fn mixer_rename_applies_on_enter() {
-    check_mixer_rename(true);
-}
-
-#[test]
-fn mixer_rename_applies_on_outside_click() {
-    check_mixer_rename(false);
-}
-
-fn begin_mixer_rename_with(h: &mut Harness, text: &str) -> egui::Rect {
-    h.app.editor_view = EditorView::Mixer;
-    let strip = h.node("Insert 1").unwrap();
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    let rename = h.node("Rename").unwrap();
-    h.click_at(rename.center(), egui::PointerButton::Primary);
-    h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text(text.into())]);
+    // Let the newly opened window finish its initial sizing frame.
+    h.frame(vec![]);
     strip
 }
 
-fn begin_mixer_rename(h: &mut Harness) -> egui::Rect {
-    begin_mixer_rename_with(h, "Vocals")
-}
-
 #[test]
-fn leaving_the_mixer_commits_the_channel_name() {
+fn mixer_rename_dialog_commits_on_enter_and_button_and_undoes_cleanly() {
     let mut h = Harness::new(None);
-    begin_mixer_rename(&mut h);
-    let pos = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert!(h.app.editor_view == EditorView::Rack);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
-}
-
-#[test]
-fn mixer_rename_applies_pending_typing_before_an_outside_click_in_the_same_frame() {
-    let mut h = Harness::new(None);
-    begin_mixer_rename_with(&mut h, "Vocal");
     h.app.typing_enabled = true;
     h.app.live_log.clear();
+
+    // 1. Context menu → type → Enter commits in one undo step without triggering typing notes.
+    let strip = open_mixer_rename_dialog(&mut h, "Insert 1", false);
+    assert!(h.node("Rename channel").is_some(), "dialog is open");
     let depth = h.app.history.undo_len();
-    let pos = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Text("s".into()),
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }, egui::Event::Text("Drums".into())]);
+    assert!(h.app.live_log.is_empty(), "keys typed in the dialog do not trigger typing notes");
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Drums");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    assert!(h.node("Rename channel").is_none(), "dialog closed after Enter");
+    // The strip stays a normal control and undo restores the old name.
+    h.click_at(strip.center(), egui::PointerButton::Secondary);
+    assert!(h.node("Rename").is_some());
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    h.app.undo();
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
+
+    // 2. Double-click → type → Rename button commits in one undo step.
+    let mut h = Harness::new(None);
+    open_mixer_rename_dialog(&mut h, "Insert 1", true);
+    assert!(h.node("Rename channel").is_some(), "double-click opened the rename dialog");
+    let depth = h.app.history.undo_len();
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Vocals".into())]);
+    let btn = h.node("Rename").expect("Rename confirm button");
+    h.click_at(btn.center(), egui::PointerButton::Primary);
     assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
     assert_eq!(h.app.history.undo_len(), depth + 1);
-    assert!(h.app.live_log.is_empty(), "the key typed into the rename field must not trigger a typing note");
-    assert!(h.app.editor_view == EditorView::Rack);
+    assert!(h.node("Rename channel").is_none(), "dialog closed after clicking Rename");
 }
 
 #[test]
-fn mixer_rename_applies_editing_keys_before_outside_click_and_ignores_post_click_text() {
+fn mixer_rename_dialog_cancels_on_escape_and_cancel_and_rejects_empty_names() {
     let mut h = Harness::new(None);
-    begin_mixer_rename_with(&mut h, "Vocals");
-    h.app.typing_enabled = true;
-    h.app.live_log.clear();
-    let hint = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Double-click a fader")).unwrap().1.center();
-    h.frame(vec![
-        egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Text(" 2".into()),
-        egui::Event::PointerMoved(hint),
-        egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Text("z".into()),
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocal 2");
-    assert!(h.app.live_log.is_empty());
-    // After the rename ends, typing keys work again on the next frame.
-    h.key_event(egui::Key::Z, true, false, egui::Modifiers::NONE);
-    h.key_event(egui::Key::Z, false, false, egui::Modifiers::NONE);
-    assert!(!h.app.live_log.is_empty(), "typing keyboard resumes after the rename commits");
-}
+    h.app.held_notes.track(&TimedEvent::note_on(0, rawdawg_types::events::EventSource::Mouse, 0, 1, 60, 0.8));
 
-#[test]
-fn mixer_rename_clears_cancelled_ime_preedit_before_outside_click() {
-    let mut h = Harness::new(None);
-    begin_mixer_rename_with(&mut h, "Vocal");
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
-    let pos = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }),
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocal");
-    assert!(h.app.editor_view == EditorView::Rack);
-}
-
-#[test]
-fn mixer_rename_drops_unconfirmed_ime_preedit_on_outside_click() {
-    let mut h = Harness::new(None);
-    // 1. Provisional preedit appended after confirmed text: outside click drops the preedit.
-    begin_mixer_rename_with(&mut h, "Vocals");
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
-    let pos = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
-    assert!(h.app.editor_view == EditorView::Rack);
-
-    // 2. Provisional preedit temporarily replacing selected text: outside click recovers it.
-    h.app.editor_view = EditorView::Mixer;
-    let strip = h.node("Vocals").unwrap();
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    let rename = h.node("Rename").unwrap();
-    h.click_at(rename.center(), egui::PointerButton::Primary);
+    // 1. Escape cancels the dialog without committing or triggering panic.
+    open_mixer_rename_dialog(&mut h, "Insert 1", false);
+    let depth = h.app.history.undo_len();
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text("Lead".into())]);
+    h.frame(vec![egui::Event::Text("Draft".into())]);
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.node("Rename channel").is_none(), "Escape closed the dialog");
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
+    assert_eq!(h.app.history.undo_len(), depth);
+    assert!(h.app.held_notes.contains(60), "Escape closed the dialog instead of triggering panic");
+
+    // 2. Cancel button discards edits.
+    open_mixer_rename_dialog(&mut h, "Insert 1", false);
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
-    let pos = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::PointerMoved(pos),
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Lead");
-    assert!(h.app.editor_view == EditorView::Rack);
-}
+    h.frame(vec![egui::Event::Text("Draft".into())]);
+    let cancel = h.node("Cancel").expect("Cancel button");
+    h.click_at(cancel.center(), egui::PointerButton::Primary);
+    assert!(h.node("Rename channel").is_none());
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
 
-#[test]
-fn mixer_rename_enter_and_ctrl_s_order_controls_what_is_saved() {
-    let root = std::env::temp_dir().join(format!("rawdawg-ui-mixer-rename-save-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    let project_dir = root.join("RenameSave.rawdawg");
-
-    let mut h = Harness::new(None);
-    h.app.new_project();
-    h.app.save_project_as(project_dir.clone());
-    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Insert 1");
-
-    // Enter then Ctrl+S in one frame: commits the rename first, so the saved manifest has "Vocals".
-    begin_mixer_rename_with(&mut h, "Vocal");
-    h.frame(vec![
-        egui::Event::Text("s".into()),
-        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
-    assert!(!h.app.history.is_dirty(), "project is clean after saving post-Enter");
-    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Vocals");
-
-    // Ctrl+S then Enter in one frame: saves before the rename commits, leaving the new name dirty.
-    h.app.editor_view = EditorView::Mixer;
-    let strip = h.node("Vocals").unwrap();
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    let rename = h.node("Rename").unwrap();
-    h.click_at(rename.center(), egui::PointerButton::Primary);
+    // 3. Whitespace-only name cannot be confirmed by Enter.
+    open_mixer_rename_dialog(&mut h, "Insert 1", false);
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text("Lead".into())]);
-    h.frame(vec![
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
-        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Lead");
-    assert!(h.app.history.is_dirty(), "rename after Ctrl+S leaves unsaved changes");
-    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Vocals");
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn mixer_rename_applies_same_frame_middle_click_paste_before_outside_click() {
-    let mut h = Harness::new(None);
-    begin_mixer_rename_with(&mut h, "Vocals");
-    let field = h.node("Vocals").unwrap();
-    let paste_pos = egui::pos2(field.right() - 4.0, field.center().y);
-    let rack = h.node("Rack").unwrap().center();
-    h.frame(vec![
-        egui::Event::PointerMoved(paste_pos),
-        egui::Event::PointerButton { pos: paste_pos, button: egui::PointerButton::Middle, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::MiddleClickPaste { pos: paste_pos, text: " 2".into() },
-        egui::Event::PointerButton { pos: paste_pos, button: egui::PointerButton::Middle, pressed: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerMoved(rack),
-        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals 2");
-    assert!(h.app.editor_view == EditorView::Rack);
-}
-
-#[test]
-fn mixer_rename_keeps_focus_across_ime_preedit_and_replaces_selection_on_clear_and_commit() {
-    let mut h = Harness::new(None);
-    // 1. Native winit clear-and-commit sequence split across frames after selecting the whole name.
-    begin_mixer_rename_with(&mut h, "Vocals");
-    h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
-    assert!(h.ctx.memory(|m| m.focused().is_some()), "provisional IME preedit must keep focus on the rename field");
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None })]);
-    assert!(h.ctx.memory(|m| m.focused().is_some()), "empty IME preedit must keep focus on the rename field");
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Commit("Song".into()))]);
-    assert!(h.ctx.memory(|m| m.focused().is_some()), "IME commit keeps the rename field open until Enter or outside click");
+    h.frame(vec![egui::Event::Text("   ".into())]);
     h.key(egui::Key::Enter, egui::Modifiers::NONE);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Song");
-
-    // 2. Native winit clear-and-commit sequence in a single frame after selecting the whole name.
-    h.app.editor_view = EditorView::Mixer;
-    let strip = h.node("Song").unwrap();
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    let rename = h.node("Rename").unwrap();
-    h.click_at(rename.center(), egui::PointerButton::Primary);
-    h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
-    assert!(h.ctx.memory(|m| m.focused().is_some()));
-    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }), egui::Event::Ime(egui::ImeEvent::Commit("Bass".into()))]);
-    assert!(h.ctx.memory(|m| m.focused().is_some()));
-    h.key(egui::Key::Enter, egui::Modifiers::NONE);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Bass");
+    assert!(h.node("Rename channel").is_some(), "empty name keeps the dialog open");
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    assert!(h.node("Rename channel").is_none());
 }
 
 #[test]
-fn mixer_rename_shift_enter_and_multiple_ctrl_s_respect_event_order() {
-    let root = std::env::temp_dir().join(format!("rawdawg-ui-mixer-rename-save-order-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    let project_dir = root.join("RenameSaveOrder.rawdawg");
-
+fn mixer_rename_dialog_survives_fader_drag_and_editor_switch_with_separate_undo() {
     let mut h = Harness::new(None);
-    h.app.new_project();
-    h.app.save_project_as(project_dir.clone());
-
-    // 1. Shift+Enter followed by Ctrl+S commits and saves the new name.
-    begin_mixer_rename_with(&mut h, "Vocals");
-    h.frame(vec![
-        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::SHIFT },
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
-    assert!(!h.app.history.is_dirty());
-    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Vocals");
-
-    // 2. Ctrl+S on both sides of Enter saves the old revision first and the committed rename second.
-    h.app.editor_view = EditorView::Mixer;
-    let strip = h.node("Vocals").unwrap();
-    h.click_at(strip.center(), egui::PointerButton::Secondary);
-    let rename = h.node("Rename").unwrap();
-    h.click_at(rename.center(), egui::PointerButton::Primary);
+    let strip = open_mixer_rename_dialog(&mut h, "Insert 1", false);
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text("Lead".into())]);
-    h.frame(vec![
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
-        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL },
-    ]);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Lead");
-    assert!(!h.app.history.is_dirty(), "post-Enter Ctrl+S saved the committed rename");
-    assert_eq!(rawdawg_project::load_project_dir(&project_dir).unwrap().mixer.channels[1].name, "Lead");
+    h.frame(vec![egui::Event::Text("Vocals".into())]);
 
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn mixer_rename_batched_caret_click_typing_and_enter_before_escape_match_separate_frames() {
-    // 1. Click at start of "Vocals", type "Drum ", click Rack: separate frames vs one batch.
-    let mut separate = Harness::new(None);
-    begin_mixer_rename_with(&mut separate, "Vocals");
-    let field = separate.node("Vocals").unwrap();
-    let start = egui::pos2(field.left() + 2.0, field.center().y);
-    let rack = separate.node("Rack").unwrap().center();
-    separate.click_at(start, egui::PointerButton::Primary);
-    separate.frame(vec![egui::Event::Text("Drum ".into())]);
-    separate.click_at(rack, egui::PointerButton::Primary);
-    assert_eq!(separate.app.project.mixer.channels[1].name, "Drum Vocals");
-    assert!(separate.app.editor_view == EditorView::Rack);
-
-    let mut batched = Harness::new(None);
-    begin_mixer_rename_with(&mut batched, "Vocals");
-    let field = batched.node("Vocals").unwrap();
-    let start = egui::pos2(field.left() + 2.0, field.center().y);
-    let rack = batched.node("Rack").unwrap().center();
-    batched.frame(vec![
-        egui::Event::PointerMoved(start),
-        egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Text("Drum ".into()),
-        egui::Event::PointerMoved(rack),
-        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-        egui::Event::PointerButton { pos: rack, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(batched.app.project.mixer.channels[1].name, separate.app.project.mixer.channels[1].name);
-    assert!(batched.app.editor_view == EditorView::Rack);
-
-    // 2. Text("s"), Enter, then Escape in one batch still saves "Vocals".
-    let mut esc_batch = Harness::new(None);
-    begin_mixer_rename_with(&mut esc_batch, "Vocal");
-    esc_batch.frame(vec![
-        egui::Event::Text("s".into()),
-        egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
-    ]);
-    assert_eq!(esc_batch.app.project.mixer.channels[1].name, "Vocals");
-}
-
-#[test]
-fn mixer_rename_commits_before_dragging_the_fader() {
-    let mut h = Harness::new(None);
-    let strip = begin_mixer_rename(&mut h);
+    // Dragging the channel's fader keeps the dialog open and records its own undo step.
     let fader = h
         .accessibility_nodes()
         .iter()
@@ -2806,15 +2560,46 @@ fn mixer_rename_commits_before_dragging_the_fader() {
     let gain = h.app.project.mixer.channels[1].gain_db;
     let depth = h.app.history.undo_len();
     h.drag(fader.center(), egui::pos2(fader.center().x, fader.bottom() - 10.0), egui::PointerButton::Primary);
-
     assert_ne!(h.app.project.mixer.channels[1].gain_db, gain);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1", "not committed yet");
+    assert!(h.node("Rename channel").is_some(), "dialog survives dragging the fader");
+
+    // Switching to another editor keeps the dialog open; confirming commits as a second undo step.
+    let rack = h.node("Rack").unwrap().center();
+    h.click_at(rack, egui::PointerButton::Primary);
+    assert!(h.app.editor_view == EditorView::Rack);
+    assert!(h.node("Rename channel").is_some(), "dialog survives leaving the mixer");
+    let btn = h.node("Rename").expect("Rename confirm button");
+    h.click_at(btn.center(), egui::PointerButton::Primary);
     assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
     assert_eq!(h.app.history.undo_len(), depth + 2);
     h.app.undo();
-    assert_eq!(h.app.project.mixer.channels[1].gain_db, gain);
-    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
-    h.app.undo();
     assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
+    assert_ne!(h.app.project.mixer.channels[1].gain_db, gain);
+    h.app.undo();
+    assert_eq!(h.app.project.mixer.channels[1].gain_db, gain);
+}
+
+#[test]
+fn mixer_rename_dialog_handles_ime_composition_and_closes_when_channel_is_deleted() {
+    let mut h = Harness::new(None);
+    open_mixer_rename_dialog(&mut h, "Insert 1", false);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
+    assert!(h.ctx.memory(|m| m.focused().is_some()), "IME preedit keeps focus in the dialog");
+    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }), egui::Event::Ime(egui::ImeEvent::Commit("Song".into()))]);
+    assert!(h.ctx.memory(|m| m.focused().is_some()));
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Song");
+
+    // If the target channel disappears while the dialog is open, the dialog closes cleanly.
+    let plus = h.drawn_nodes().into_iter().find(|(t, _)| t == "+ Bus").unwrap().1;
+    h.click_at(plus.center(), egui::PointerButton::Primary);
+    open_mixer_rename_dialog(&mut h, "Bus 2", false);
+    assert!(h.node("Rename channel").is_some());
+    h.app.undo();
+    h.frame(vec![]);
+    assert!(h.node("Rename channel").is_none(), "dialog closed after its channel was removed");
 }
 
 #[test]

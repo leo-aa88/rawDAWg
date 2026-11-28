@@ -41,6 +41,14 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 - `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (549 passed, 0 failed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0 (HL-01..12, E2E-02/04/05/06 PASS).
 - `umask 022 && rm -rf target/package && env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0: PL-01/02, E2E-07/08 (deb lintian 0 errors / 0 warnings, 12 info tags) and QA-01 PASS; GUI-02 BLOCKED in this sandbox (`DISPLAY` unset, `xvfb-run` not installed); PL-03/04/05 and clean-machine install remain BLOCKED. Native desktop GUI-01 remains open.
 
+### Mixer rename dedicated dialog redesign (2026-11-28, CORE-05, PR #35)
+
+- Replaced the inline mixer-strip text editor and custom event-replay plumbing (~340 lines removed) with a dedicated dark `Rename channel` dialog (`mixer::rename_window`, matching `Rename project` in `project_files.rs`) opened from right-click → **Rename** or double-clicking a strip name. Text editing, pointer selection, clipboard, accessibility, and IME composition stay completely under egui's control; **Enter** (from the focused field) or **Rename** commits one undo step (empty/whitespace names rejected), **Cancel** / **Escape** (wired into `close_top_dialog`) discards, fader drags and editor switches leave the dialog intact with separate undo entries, and deleting the target channel closes the dialog cleanly. Updated `docs/USER_GUIDE.md`.
+- Regression tests (4 dialog tests): `mixer_rename_dialog_commits_on_enter_and_button_and_undoes_cleanly`, `mixer_rename_dialog_cancels_on_escape_and_cancel_and_rejects_empty_names`, `mixer_rename_dialog_survives_fader_drag_and_editor_switch_with_separate_undo`, and `mixer_rename_dialog_handles_ime_composition_and_closes_when_channel_is_deleted`. Mutation-checked (removing initial focus and disabling `close_rename` caused all 4 tests to fail with exit 101).
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings` each exited 0.
+- `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (540 passed, 0 failed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0 (HL-01..12, E2E-02/04/05/06 PASS).
+- `umask 022 && rm -rf target/package && env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0: PL-01/02, E2E-07/08 (deb lintian 0 errors / 0 warnings, 12 info tags) and QA-01 PASS; GUI-02 BLOCKED in this sandbox (`DISPLAY` unset, `xvfb-run` not installed); PL-03/04/05 and clean-machine install remain BLOCKED. Native desktop GUI-01 remains open.
+
 ## Commands and results (this machine, 2026-11-24)
 
 | Command | Result |

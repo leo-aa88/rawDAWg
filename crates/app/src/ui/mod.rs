@@ -1969,7 +1969,6 @@ impl App {
     /// Per-frame logic (shortcuts, input polling, engine housekeeping). Also used by headless tests.
     pub(crate) fn step(&mut self, ctx: &egui::Context) {
         theme::apply(ctx);
-        mixer::step_rename(self, ctx);
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::S))) {
             self.save_project_checked();
         }
@@ -2087,6 +2086,7 @@ impl App {
             export::show(self, ui.ctx());
         }
         project_files::show(self, ui.ctx());
+        mixer::rename_window(self, ui.ctx());
         recording::latency_window(self, ui.ctx());
         if self.show_help {
             let mut open = self.show_help;
@@ -2110,8 +2110,6 @@ impl App {
             });
             self.show_help = open;
         }
-        // Enter releases the name field’s focus while egui draws it.
-        mixer::finish_inactive_rename(self, ui.ctx());
         // a drag whose release no control saw (its panel was hidden mid-drag) is committed now
         if !ui.ctx().input(|i| i.pointer.any_down()) {
             synth_panel::finish_abandoned(self);

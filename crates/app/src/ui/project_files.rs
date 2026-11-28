@@ -550,6 +550,9 @@ impl App {
         if self.files.rename.take().is_some() {
             return true;
         }
+        if self.mixer.close_rename() {
+            return true;
+        }
         if self.files.dialog.take().is_some() {
             self.files.close_after_save = false;
             self.files.open_after_save = None;
