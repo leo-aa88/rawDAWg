@@ -8,6 +8,14 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 - **Environment used:** Ubuntu 22.04 (WSL2, WSLg), Rust 1.99.0, 16 cores. Audio output available through WSLg's PulseAudio bridge via ALSA (`Default Audio Device`), which is *not* a real Ubuntu desktop/hardware device. No Windows machine, no display screenshots captured, no MIDI hardware, no independent plugin hosts or validators installed.
 - **Build label:** pre-release (version 0.1.0 in `Cargo.toml`; releases are versioned by tag through `.github/workflows/release.yml`).
 
+### Mixer channel rename (2026-11-27, CORE-05, issue #34)
+
+- The strip requests focus once when Rename opens. Enter commits the edit on focus loss. An outside pointer press commits it before the clicked control can switch editors.
+- Regression checks used real egui text and pointer input. `ALSA_CONFIG_PATH=/dev/null cargo test -p rawdawg --locked mixer_rename_applies` exited 101 on the original implementation (both interactions left the name at “Insert 1”) and 0 with one-time focus. `ALSA_CONFIG_PATH=/dev/null cargo test -p rawdawg --locked leaving_the_mixer` exited 101 before handling the outside press. All three passed in the subsequent workspace test run.
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`, and `cargo build --workspace --locked` each exited 0. `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (539 passed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0.
+- `env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0 on the local X display. PL-01/02, GUI-02, E2E-07/08 and QA-01 passed. PL-03/04/05 remain blocked on external validators and independent hosts. Evidence in `target/verification/verify-{headless,plugins}.json`.
+- The default ALSA device probe stalled in this sandbox (interrupted, exit 130). Headless UI tests used an empty ALSA configuration. Native desktop GUI-01 remains open.
+
 ## Commands and results (this machine, 2026-11-24)
 
 | Command | Result |

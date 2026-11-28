@@ -2445,6 +2445,63 @@ fn with_audio_off_the_ruler_seeks_and_clips_split_at_the_playhead_or_where_right
     assert!(ends.iter().any(|e| (e - here).abs() <= 240), "split where right-clicked: {ends:?} vs {here}");
 }
 
+fn check_mixer_rename(press_enter: bool) {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Mixer;
+    let strip = h.drawn_nodes().into_iter().filter(|(t, _)| t == "Insert 1").map(|(_, r)| r).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+    if press_enter {
+        h.click_at(strip.center(), egui::PointerButton::Secondary);
+        let rename = h.node("Rename").expect("strip context menu");
+        h.click_at(rename.center(), egui::PointerButton::Primary);
+    } else {
+        h.click_at(strip.center(), egui::PointerButton::Primary);
+        h.click_at(strip.center(), egui::PointerButton::Primary);
+    }
+    let depth = h.app.history.undo_len();
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Drums".into())]);
+    assert!(h.node("Drums").is_some(), "the field accepts typing as soon as it opens");
+    if press_enter {
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    } else {
+        let hint = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Double-click a fader")).unwrap().1;
+        h.click_at(hint.center(), egui::PointerButton::Primary);
+    }
+    assert_eq!(h.app.project.mixer.channels[1].name, "Drums");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    // The name is a strip button again.
+    h.click_at(strip.center(), egui::PointerButton::Secondary);
+    assert!(h.node("Rename").is_some());
+    h.app.undo();
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
+}
+
+#[test]
+fn mixer_rename_applies_on_enter() {
+    check_mixer_rename(true);
+}
+
+#[test]
+fn mixer_rename_applies_on_outside_click() {
+    check_mixer_rename(false);
+}
+
+#[test]
+fn leaving_the_mixer_commits_the_channel_name() {
+    let mut h = Harness::new(None);
+    h.app.editor_view = EditorView::Mixer;
+    let strip = h.node("Insert 1").unwrap();
+    h.click_at(strip.center(), egui::PointerButton::Secondary);
+    let rename = h.node("Rename").unwrap();
+    h.click_at(rename.center(), egui::PointerButton::Primary);
+    h.key(egui::Key::A, egui::Modifiers::COMMAND);
+    h.frame(vec![egui::Event::Text("Vocals".into())]);
+    let rack = h.node("Rack").unwrap();
+    h.click_at(rack.center(), egui::PointerButton::Primary);
+    assert!(h.app.editor_view == EditorView::Rack);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+}
+
 #[test]
 fn mixer_strips_are_deleted_from_their_menu_and_a_deleted_channel_takes_its_own_strip() {
     let mut h = Harness::new(None);

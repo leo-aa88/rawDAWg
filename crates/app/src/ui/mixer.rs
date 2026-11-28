@@ -272,12 +272,14 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
         ui.spacing_mut().slider_width = FADER_H;
         ui.vertical(|ui| {
             // name
+            let rename_id = egui::Id::unique(("mixer-rename", m.id));
             let editing = app.mixer.rename.as_ref().is_some_and(|(id, _)| *id == m.id);
             if editing {
                 if let Some((_, name)) = app.mixer.rename.as_mut() {
-                    let te = ui.add(egui::TextEdit::singleline(name).desired_width(STRIP_W - 10.0));
-                    te.request_focus();
-                    if te.lost_focus() {
+                    let te = ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
+                    // A toolbar click can hide the mixer on release, so finish the edit on the outside press.
+                    if te.lost_focus() || (!te.contains_pointer() && ui.input(|i| i.pointer.any_pressed())) {
+                        te.surrender_focus();
                         let n = name.trim().to_owned();
                         if !n.is_empty() && n != m.name {
                             cmds.push(Command::RenameMixerChannel { id: m.id, name: n });
@@ -290,12 +292,10 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
                 if r.clicked() {
                     app.mixer.selected = Some(m.id);
                 }
-                if r.double_clicked() {
-                    app.mixer.rename = Some((m.id, m.name.clone()));
-                }
+                let mut rename = r.double_clicked();
                 r.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
-                        app.mixer.rename = Some((m.id, m.name.clone()));
+                        rename = true;
                         ui.close();
                     }
                     if !is_master && ui.button("Delete strip (undoable)").on_hover_text("What plays into it is rerouted to where it plays; sends to it are removed").clicked() {
@@ -306,6 +306,10 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
                         ui.close();
                     }
                 });
+                if rename {
+                    app.mixer.rename = Some((m.id, m.name.clone()));
+                    ui.memory_mut(|mem| mem.request_focus(rename_id));
+                }
             }
             ui.horizontal(|ui| {
                 let mut mute = m.mute;
