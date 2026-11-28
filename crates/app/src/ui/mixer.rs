@@ -25,6 +25,7 @@ pub(crate) struct MixerState {
     hold: HashMap<MixerChannelId, [(f32, u32); 2]>,
     clip: HashMap<MixerChannelId, bool>,
     rename: Option<(MixerChannelId, String)>,
+    rename_rect: Option<egui::Rect>,
     add_search: String,
     pub add_open: bool,
     /// Give the search field the keyboard focus once, when the search opens.
@@ -198,211 +199,44 @@ fn rename_field_id(id: MixerChannelId) -> egui::Id {
 
 fn is_rename_input_event(event: &egui::Event, field_id: egui::Id) -> bool {
     match event {
-        egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) | egui::Event::Text(_) | egui::Event::Ime(_) => true,
-        // Global Ctrl+S still saves even while a text field has focus.
-        egui::Event::Key { key, modifiers, .. } => !(*key == egui::Key::S && modifiers.ctrl && !modifiers.alt),
+        egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) | egui::Event::Text(_) | egui::Event::Key { .. } | egui::Event::Ime(_) => true,
         egui::Event::AccessKitActionRequest(req) => req.target_node == field_id.accesskit_id() && req.target_tree == egui::accesskit::TreeId::ROOT,
         _ => false,
     }
 }
 
-fn insert_singleline(text: &mut String, cursor_range: &egui::text::CCursorRange, inserted: &str) -> egui::text::CCursor {
-    use egui::TextBuffer as _;
-    let mut ccursor = text.delete_selected(cursor_range);
-    let single_line = inserted.replace(['\r', '\n'], " ");
-    text.insert_text_at(&mut ccursor, &single_line, usize::MAX);
-    ccursor
-}
-
-fn apply_mutating_key_press(
-    os: egui::os::OperatingSystem,
-    cursor_range: &egui::text::CCursorRange,
-    text: &mut String,
-    galley: &egui::text::Galley,
-    modifiers: &egui::Modifiers,
-    key: egui::Key,
-) -> Option<egui::text::CCursorRange> {
-    use egui::TextBuffer as _;
-    match key {
-        egui::Key::Backspace => {
-            let ccursor = if modifiers.mac_cmd {
-                text.delete_paragraph_before_cursor(galley, cursor_range)
-            } else if let Some(cursor) = cursor_range.single() {
-                if modifiers.alt || modifiers.ctrl { text.delete_previous_word(cursor) } else { text.delete_previous_char(cursor) }
-            } else {
-                text.delete_selected(cursor_range)
-            };
-            Some(egui::text::CCursorRange::one(ccursor))
-        }
-        egui::Key::Delete if !modifiers.shift || os != egui::os::OperatingSystem::Windows => {
-            let ccursor = if modifiers.mac_cmd {
-                text.delete_paragraph_after_cursor(galley, cursor_range)
-            } else if let Some(cursor) = cursor_range.single() {
-                if modifiers.alt || modifiers.ctrl { text.delete_next_word(cursor) } else { text.delete_next_char(cursor) }
-            } else {
-                text.delete_selected(cursor_range)
-            };
-            Some(egui::text::CCursorRange::one(egui::text::CCursor { prefer_next_row: true, ..ccursor }))
-        }
-        egui::Key::H if modifiers.ctrl => Some(egui::text::CCursorRange::one(text.delete_previous_char(cursor_range.primary))),
-        egui::Key::K if modifiers.ctrl => Some(egui::text::CCursorRange::one(text.delete_paragraph_after_cursor(galley, cursor_range))),
-        egui::Key::U if modifiers.ctrl => Some(egui::text::CCursorRange::one(text.delete_paragraph_before_cursor(galley, cursor_range))),
-        egui::Key::W if modifiers.ctrl => {
-            let ccursor = if let Some(cursor) = cursor_range.single() { text.delete_previous_word(cursor) } else { text.delete_selected(cursor_range) };
-            Some(egui::text::CCursorRange::one(ccursor))
-        }
-        _ => None,
-    }
-}
-
-/// Apply keyboard/text events that arrived before an outside pointer press in the same frame,
-/// returning how many leading events belong to the rename field so they are not re-handled later.
-fn apply_pending_rename_events(app: &mut App, ctx: &egui::Context, field_id: egui::Id, press_idx: usize) -> usize {
-    use egui::TextBuffer as _;
-    if press_idx == 0 {
-        return 0;
-    }
-    let (events, time) = ctx.input(|i| (i.events[..press_idx].to_vec(), i.time));
-    if !events.iter().any(|event| is_rename_input_event(event, field_id)) {
-        return 0;
-    }
-    let Some((_, draft)) = app.mixer.rename.as_mut() else { return 0 };
-    let os = ctx.os();
-    let owns_ime_events = ctx.memory(|m| m.owns_ime_events(field_id));
-    let font_id = egui::TextStyle::Body.resolve(&ctx.global_style());
-    let layout_galley = |text: &str| {
-        ctx.fonts_mut(|f| {
-            let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font_id.clone(), theme::TEXT);
-            job.keep_trailing_whitespace = true;
-            f.layout_job(job)
-        })
-    };
-    let mut state = egui::TextEdit::load_state(ctx, field_id).unwrap_or_default();
-    let mut galley = layout_galley(draft);
-    let mut cursor_range = state.cursor.range(&galley).unwrap_or_else(|| egui::text::CCursorRange::one(galley.end()));
-    let mut undoer = state.undoer();
-    undoer.feed_state(time, &(cursor_range, draft.clone()));
-
-    let mut consumed = events.len();
-    for (idx, event) in events.iter().enumerate() {
-        let next_cursor = match event {
-            event if cursor_range.on_event(os, event, &galley, field_id) => None,
-            egui::Event::Copy => {
-                if !cursor_range.is_empty() {
-                    ctx.copy_text(cursor_range.slice_str(draft.as_str()).to_owned());
-                }
-                None
-            }
-            egui::Event::Cut => {
-                if cursor_range.is_empty() {
-                    None
-                } else {
-                    ctx.copy_text(cursor_range.slice_str(draft.as_str()).to_owned());
-                    Some(egui::text::CCursorRange::one(draft.delete_selected(&cursor_range)))
-                }
-            }
-            egui::Event::Paste(text) if !text.is_empty() => Some(egui::text::CCursorRange::one(insert_singleline(draft, &cursor_range, text))),
-            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::SetValue,
-                target_node,
-                target_tree,
-                data: Some(egui::accesskit::ActionData::Value(text)),
-            }) if *target_node == field_id.accesskit_id() && *target_tree == egui::accesskit::TreeId::ROOT => {
-                let all = egui::text::CCursorRange::select_all_str(draft.as_str());
-                Some(egui::text::CCursorRange::one(insert_singleline(draft, &all, text)))
-            }
-            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::ReplaceSelectedText,
-                target_node,
-                target_tree,
-                data: Some(egui::accesskit::ActionData::Value(text)),
-            }) if *target_node == field_id.accesskit_id() && *target_tree == egui::accesskit::TreeId::ROOT => {
-                Some(egui::text::CCursorRange::one(insert_singleline(draft, &cursor_range, text)))
-            }
-            egui::Event::Text(text) if !text.is_empty() && text != "\n" && text != "\r" => {
-                let mut ccursor = draft.delete_selected(&cursor_range);
-                draft.insert_text_at(&mut ccursor, text, usize::MAX);
-                Some(egui::text::CCursorRange::one(ccursor))
-            }
-            egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none() => {
-                consumed = idx + 1;
-                break;
-            }
-            egui::Event::Key { key, pressed: true, modifiers, .. }
-                if (modifiers.matches_logically(egui::Modifiers::COMMAND) && *key == egui::Key::Y)
-                    || (modifiers.matches_logically(egui::Modifiers::SHIFT | egui::Modifiers::COMMAND) && *key == egui::Key::Z) =>
-            {
-                if let Some((redo_range, redo_text)) = undoer.redo(&(cursor_range, draft.clone())) {
-                    draft.replace_with(redo_text);
-                    Some(*redo_range)
-                } else {
-                    None
-                }
-            }
-            egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. } if modifiers.matches_logically(egui::Modifiers::COMMAND) => {
-                if let Some((undo_range, undo_text)) = undoer.undo(&(cursor_range, draft.clone())) {
-                    draft.replace_with(undo_text);
-                    Some(*undo_range)
-                } else {
-                    None
-                }
-            }
-            egui::Event::Key { key, pressed: true, modifiers, .. } => apply_mutating_key_press(os, &cursor_range, draft, &galley, modifiers, *key),
-            egui::Event::Ime(ime_event) if owns_ime_events => match ime_event {
-                egui::ImeEvent::Commit(text) if !text.is_empty() && text != "\n" && text != "\r" => {
-                    let mut ccursor = draft.delete_selected(&cursor_range);
-                    draft.insert_text_at(&mut ccursor, text, usize::MAX);
-                    Some(egui::text::CCursorRange::one(ccursor))
-                }
-                egui::ImeEvent::Preedit { text, .. } if !text.is_empty() && text != "\n" && text != "\r" => {
-                    let mut ccursor = draft.delete_selected(&cursor_range);
-                    let start = ccursor;
-                    draft.insert_text_at(&mut ccursor, text, usize::MAX);
-                    Some(egui::text::CCursorRange::two(start, ccursor))
-                }
-                egui::ImeEvent::DeleteSurrounding { before_chars, after_chars } => Some(draft.delete_surrounding_chars(cursor_range, *before_chars, *after_chars)),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(new_range) = next_cursor {
-            galley = layout_galley(draft);
-            cursor_range = new_range;
-        }
-    }
-
-    state.cursor.set_char_range(Some(cursor_range));
-    undoer.feed_state(time, &(cursor_range, draft.clone()));
-    state.set_undoer(undoer);
-    state.store(ctx, field_id);
-    consumed
-}
-
-fn consume_rename_events(ctx: &egui::Context, field_id: egui::Id, consumed: usize) {
-    if consumed == 0 {
-        return;
-    }
-    ctx.input_mut(|i| {
-        let mut idx = 0;
-        i.events.retain(|event| {
-            let keep = idx >= consumed || !is_rename_input_event(event, field_id);
-            idx += 1;
-            keep
-        });
-    });
-}
-
-pub(super) fn finish_rename_before_input(app: &mut App, ctx: &egui::Context) {
+pub(super) fn finish_rename_before_ui(app: &mut App, ctx: &egui::Context) {
     let Some((id, _)) = &app.mixer.rename else { return };
     let field_id = rename_field_id(*id);
     if app.editor_view == EditorView::Mixer && ctx.memory(|m| m.has_focus(field_id)) && ctx.input(|i| i.pointer.any_pressed()) {
-        // egui hit-tests new input against the previous pass, even if this press changes editors.
-        let field = ctx.read_response(field_id).map(|r| r.interact_rect);
+        // Use the rect recorded when the field drew; `ctx.read_response` triggers `get_response`,
+        // which would surrender focus on an outside press before TextEdit can consume pending edits.
+        let field = app.mixer.rename_rect;
         let press_idx = ctx
             .input(|i| i.events.iter().position(|event| matches!(event, egui::Event::PointerButton { pos, pressed: true, .. } if field.is_none_or(|rect| !rect.contains(*pos)))));
         if let Some(press_idx) = press_idx {
-            let consumed = apply_pending_rename_events(app, ctx, field_id, press_idx);
-            consume_rename_events(ctx, field_id, consumed);
+            let has_pending_edit = ctx.input(|i| i.events[..press_idx].iter().any(|event| is_rename_input_event(event, field_id)));
+            if has_pending_edit && let Some((_, draft)) = app.mixer.rename.as_mut() {
+                // Let egui's own TextEdit process edits preceding the outside press (typing,
+                // backspace, clipboard, IME cancellation, etc.) without painting or touching layout.
+                let all_events = ctx.input_mut(|i| {
+                    let all = std::mem::take(&mut i.events);
+                    i.events = all[..press_idx].iter().filter(|e| is_rename_input_event(e, field_id)).cloned().collect();
+                    all
+                });
+                let rect = field.unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(STRIP_W - 10.0, 20.0)));
+                let prev_surrender = ctx.options(|o| o.input_options.surrender_focus_on);
+                ctx.options_mut(|o| o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never);
+                {
+                    let mut scratch = egui::Ui::new(ctx.clone(), egui::Id::unique("mixer-rename-flush"), egui::UiBuilder::new().max_rect(rect).invisible());
+                    scratch.add(egui::TextEdit::singleline(draft).id(field_id).desired_width(STRIP_W - 10.0));
+                }
+                ctx.options_mut(|o| o.input_options.surrender_focus_on = prev_surrender);
+                ctx.input_mut(|i| {
+                    i.events =
+                        all_events.into_iter().enumerate().filter_map(|(idx, event)| (idx >= press_idx || !is_rename_input_event(&event, field_id)).then_some(event)).collect();
+                });
+            }
             ctx.memory_mut(|m| m.surrender_focus(field_id));
         }
     }
@@ -415,6 +249,7 @@ pub(super) fn finish_inactive_rename(app: &mut App, ctx: &egui::Context) {
         return;
     }
     let (id, draft) = app.mixer.rename.take().unwrap();
+    app.mixer.rename_rect = None;
     let name = draft.trim();
     if !name.is_empty() && app.project.mixer_channel(id).is_some_and(|channel| channel.name != name) {
         app.apply(Command::RenameMixerChannel { id, name: name.to_owned() });
@@ -503,7 +338,8 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
             // name
             let rename_id = rename_field_id(m.id);
             if let Some((_, name)) = app.mixer.rename.as_mut().filter(|(id, _)| *id == m.id) {
-                ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
+                let r = ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
+                app.mixer.rename_rect = Some(r.interact_rect);
             } else {
                 let r = ui.add(egui::Button::selectable(selected, egui::RichText::new(&m.name).strong()).min_size(vec2(STRIP_W - 10.0, 0.0)));
                 if r.clicked() {
@@ -525,6 +361,7 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
                 });
                 if rename {
                     app.mixer.rename = Some((m.id, m.name.clone()));
+                    app.mixer.rename_rect = None;
                     ui.memory_mut(|mem| mem.request_focus(rename_id));
                 }
             }

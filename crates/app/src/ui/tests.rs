@@ -2556,11 +2556,30 @@ fn mixer_rename_applies_editing_keys_before_outside_click_and_ignores_post_click
         egui::Event::PointerMoved(hint),
         egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
         egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
-        egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
         egui::Event::Text("z".into()),
     ]);
     assert_eq!(h.app.project.mixer.channels[1].name, "Vocal 2");
-    assert!(!h.app.live_log.is_empty(), "a key pressed after the outside click still reaches the typing keyboard");
+    assert!(h.app.live_log.is_empty());
+    // After the rename ends, typing keys work again on the next frame.
+    h.key_event(egui::Key::Z, true, false, egui::Modifiers::NONE);
+    h.key_event(egui::Key::Z, false, false, egui::Modifiers::NONE);
+    assert!(!h.app.live_log.is_empty(), "typing keyboard resumes after the rename commits");
+}
+
+#[test]
+fn mixer_rename_clears_cancelled_ime_preedit_before_outside_click() {
+    let mut h = Harness::new(None);
+    begin_mixer_rename_with(&mut h, "Vocal");
+    h.frame(vec![egui::Event::Ime(egui::ImeEvent::Preedit { text: "ka".into(), active_range_chars: None })]);
+    let pos = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }),
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocal");
+    assert!(h.app.editor_view == EditorView::Rack);
 }
 
 #[test]
