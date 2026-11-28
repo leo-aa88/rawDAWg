@@ -23,6 +23,14 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 - `cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`, and `cargo build --workspace --locked` exited 0. `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (540 passed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0.
 - `env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0. PL-01/02, GUI-02, E2E-07/08 and QA-01 passed. PL-03/04/05 and the clean-machine install gate remain blocked.
 
+### Mixer rename same-frame typing follow-up (2026-11-28, CORE-05, PR #35)
+
+- When an outside pointer press lands in the same frame as pending keyboard/text events, `finish_rename_before_input` now applies the rename field's events preceding that press (`apply_pending_rename_events`) and removes those consumed rename events (`consume_rename_events`) before surrendering focus and committing the draft. Events arriving after the outside press remain intact; global `Ctrl+S` is preserved.
+- Added `mixer_rename_applies_pending_typing_before_an_outside_click_in_the_same_frame` (text + `Key::S` with typing keyboard enabled + same-frame click on Rack commits `"Vocals"`, switches to Rack, and plays zero typing notes) and `mixer_rename_applies_editing_keys_before_outside_click_and_ignores_post_click_text` (Backspace + Space + text before click, `Key::Z` + text after click). Mutation-checked both: skipping `apply_pending_rename_events` failed both new tests (exit 101); skipping `consume_rename_events` failed the typing-note assertion (exit 101).
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings` each exited 0.
+- `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (542 passed, 0 failed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0 (HL-01..12, E2E-02/04/05/06 PASS).
+- `umask 022 && rm -rf target/package && env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0: PL-01/02, E2E-07/08 (deb lintian 0 errors / 0 warnings) and QA-01 PASS; GUI-02 BLOCKED in this sandbox (`DISPLAY` unset, `xvfb-run` not installed); PL-03/04/05 and clean-machine install remain BLOCKED. Native desktop GUI-01 remains open.
+
 ## Commands and results (this machine, 2026-11-24)
 
 | Command | Result |

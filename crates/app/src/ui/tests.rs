@@ -2492,15 +2492,19 @@ fn mixer_rename_applies_on_outside_click() {
     check_mixer_rename(false);
 }
 
-fn begin_mixer_rename(h: &mut Harness) -> egui::Rect {
+fn begin_mixer_rename_with(h: &mut Harness, text: &str) -> egui::Rect {
     h.app.editor_view = EditorView::Mixer;
     let strip = h.node("Insert 1").unwrap();
     h.click_at(strip.center(), egui::PointerButton::Secondary);
     let rename = h.node("Rename").unwrap();
     h.click_at(rename.center(), egui::PointerButton::Primary);
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
-    h.frame(vec![egui::Event::Text("Vocals".into())]);
+    h.frame(vec![egui::Event::Text(text.into())]);
     strip
+}
+
+fn begin_mixer_rename(h: &mut Harness) -> egui::Rect {
+    begin_mixer_rename_with(h, "Vocals")
 }
 
 #[test]
@@ -2515,6 +2519,48 @@ fn leaving_the_mixer_commits_the_channel_name() {
     ]);
     assert!(h.app.editor_view == EditorView::Rack);
     assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+}
+
+#[test]
+fn mixer_rename_applies_pending_typing_before_an_outside_click_in_the_same_frame() {
+    let mut h = Harness::new(None);
+    begin_mixer_rename_with(&mut h, "Vocal");
+    h.app.typing_enabled = true;
+    h.app.live_log.clear();
+    let depth = h.app.history.undo_len();
+    let pos = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::Key { key: egui::Key::S, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text("s".into()),
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+    assert_eq!(h.app.history.undo_len(), depth + 1);
+    assert!(h.app.live_log.is_empty(), "the key typed into the rename field must not trigger a typing note");
+    assert!(h.app.editor_view == EditorView::Rack);
+}
+
+#[test]
+fn mixer_rename_applies_editing_keys_before_outside_click_and_ignores_post_click_text() {
+    let mut h = Harness::new(None);
+    begin_mixer_rename_with(&mut h, "Vocals");
+    h.app.typing_enabled = true;
+    h.app.live_log.clear();
+    let hint = h.drawn_nodes().into_iter().find(|(t, _)| t.starts_with("Double-click a fader")).unwrap().1.center();
+    h.frame(vec![
+        egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text(" 2".into()),
+        egui::Event::PointerMoved(hint),
+        egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos: hint, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+        egui::Event::Text("z".into()),
+    ]);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocal 2");
+    assert!(!h.app.live_log.is_empty(), "a key pressed after the outside click still reaches the typing keyboard");
 }
 
 #[test]
