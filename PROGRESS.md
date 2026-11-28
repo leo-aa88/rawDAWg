@@ -16,6 +16,13 @@ Live checkpoint for the implementation agent. Facts only; see `docs/verification
 - `env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0 on the local X display. PL-01/02, GUI-02, E2E-07/08 and QA-01 passed. PL-03/04/05 remain blocked on external validators and independent hosts. Evidence in `target/verification/verify-{headless,plugins}.json`.
 - The default ALSA device probe stalled in this sandbox (interrupted, exit 130). Headless UI tests used an empty ALSA configuration. Native desktop GUI-01 remains open.
 
+### Mixer rename review follow-up (2026-11-28, CORE-05, PR #35)
+
+- Before toolbar or mixer controls handle an outside press, the app commits the draft as its own history entry. It also commits when Enter releases focus during the UI frame.
+- `ALSA_CONFIG_PATH=/dev/null cargo test -p rawdawg --locked --bin rawdawg -- mixer_rename leaving_the_mixer` exited 101 on the original PR commit with both reviewed failures reproduced. It exited 0 after the fix (4 passed). The fader test checks the rename and gain change persist and undo separately. The editor-switch test puts both pointer events in one egui frame.
+- `cargo fmt --all -- --check`, `git diff --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`, and `cargo build --workspace --locked` exited 0. `ALSA_CONFIG_PATH=/dev/null cargo test --workspace --locked` exited 0 (540 passed, 5 ignored). `ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite headless` exited 0.
+- `env -u WAYLAND_DISPLAY ALSA_CONFIG_PATH=/dev/null cargo xtask verify --suite plugins` exited 0. PL-01/02, GUI-02, E2E-07/08 and QA-01 passed. PL-03/04/05 and the clean-machine install gate remain blocked.
+
 ## Commands and results (this machine, 2026-11-24)
 
 | Command | Result |

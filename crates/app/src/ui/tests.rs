@@ -114,6 +114,20 @@ impl Harness {
 
     /// Text and on-screen bounds of every labelled widget drawn in one frame.
     fn drawn_nodes(&mut self) -> Vec<(String, egui::Rect)> {
+        self.accessibility_nodes()
+            .iter()
+            .flat_map(|n| {
+                let r = Self::node_rect(n);
+                n.label().into_iter().chain(n.value()).map(move |t| (t.to_owned(), r))
+            })
+            .collect()
+    }
+
+    fn node_rect(node: &egui::accesskit::Node) -> egui::Rect {
+        node.bounds().map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))).unwrap_or(egui::Rect::NOTHING)
+    }
+
+    fn accessibility_nodes(&mut self) -> Vec<egui::accesskit::Node> {
         self.ctx.enable_accesskit();
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)), ..Default::default() };
         let app = &mut self.app;
@@ -123,15 +137,7 @@ impl Harness {
             app.draw_parts(ui, parts);
         });
         out.textures_delta.clear();
-        let update = out.platform_output.accesskit_update.expect("accessibility tree");
-        update
-            .nodes
-            .iter()
-            .flat_map(|(_, n)| {
-                let r = n.bounds().map(|b| egui::Rect::from_min_max(egui::pos2(b.x0 as f32, b.y0 as f32), egui::pos2(b.x1 as f32, b.y1 as f32))).unwrap_or(egui::Rect::NOTHING);
-                n.label().into_iter().chain(n.value()).map(move |t| (t.to_owned(), r))
-            })
-            .collect()
+        out.platform_output.accesskit_update.expect("accessibility tree").nodes.into_iter().map(|(_, node)| node).collect()
     }
 
     fn rect(&self, id: egui::Id) -> egui::Rect {
@@ -2486,9 +2492,7 @@ fn mixer_rename_applies_on_outside_click() {
     check_mixer_rename(false);
 }
 
-#[test]
-fn leaving_the_mixer_commits_the_channel_name() {
-    let mut h = Harness::new(None);
+fn begin_mixer_rename(h: &mut Harness) -> egui::Rect {
     h.app.editor_view = EditorView::Mixer;
     let strip = h.node("Insert 1").unwrap();
     h.click_at(strip.center(), egui::PointerButton::Secondary);
@@ -2496,10 +2500,46 @@ fn leaving_the_mixer_commits_the_channel_name() {
     h.click_at(rename.center(), egui::PointerButton::Primary);
     h.key(egui::Key::A, egui::Modifiers::COMMAND);
     h.frame(vec![egui::Event::Text("Vocals".into())]);
-    let rack = h.node("Rack").unwrap();
-    h.click_at(rack.center(), egui::PointerButton::Primary);
+    strip
+}
+
+#[test]
+fn leaving_the_mixer_commits_the_channel_name() {
+    let mut h = Harness::new(None);
+    begin_mixer_rename(&mut h);
+    let pos = h.node("Rack").unwrap().center();
+    h.frame(vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ]);
     assert!(h.app.editor_view == EditorView::Rack);
     assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+}
+
+#[test]
+fn mixer_rename_commits_before_dragging_the_fader() {
+    let mut h = Harness::new(None);
+    let strip = begin_mixer_rename(&mut h);
+    let fader = h
+        .accessibility_nodes()
+        .iter()
+        .filter(|n| n.role() == egui::Role::Slider && n.min_numeric_value() == Some(-60.0) && n.max_numeric_value() == Some(12.0))
+        .map(Harness::node_rect)
+        .find(|r| strip.x_range().contains(r.center().x))
+        .expect("the channel's fader");
+    let gain = h.app.project.mixer.channels[1].gain_db;
+    let depth = h.app.history.undo_len();
+    h.drag(fader.center(), egui::pos2(fader.center().x, fader.bottom() - 10.0), egui::PointerButton::Primary);
+
+    assert_ne!(h.app.project.mixer.channels[1].gain_db, gain);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+    assert_eq!(h.app.history.undo_len(), depth + 2);
+    h.app.undo();
+    assert_eq!(h.app.project.mixer.channels[1].gain_db, gain);
+    assert_eq!(h.app.project.mixer.channels[1].name, "Vocals");
+    h.app.undo();
+    assert_eq!(h.app.project.mixer.channels[1].name, "Insert 1");
 }
 
 #[test]

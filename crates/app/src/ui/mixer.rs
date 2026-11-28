@@ -192,6 +192,37 @@ fn strip_meter(ui: &mut egui::Ui, hold: [(f32, u32); 2], clip: bool) -> bool {
     resp.on_hover_text("Peak meters with hold; red bar = clipped (click to reset)").clicked()
 }
 
+fn rename_field_id(id: MixerChannelId) -> egui::Id {
+    egui::Id::unique(("mixer-rename", id))
+}
+
+pub(super) fn finish_rename_before_input(app: &mut App, ctx: &egui::Context) {
+    let Some((id, _)) = &app.mixer.rename else { return };
+    let field_id = rename_field_id(*id);
+    if ctx.input(|i| i.pointer.any_pressed()) {
+        // egui hit-tests new input against the previous pass, even if this press changes editors.
+        let field = ctx.read_response(field_id).map(|r| r.interact_rect);
+        let pressed_outside =
+            ctx.input(|i| i.events.iter().any(|event| matches!(event, egui::Event::PointerButton { pos, pressed: true, .. } if field.is_none_or(|rect| !rect.contains(*pos)))));
+        if pressed_outside {
+            ctx.memory_mut(|m| m.surrender_focus(field_id));
+        }
+    }
+    finish_inactive_rename(app, ctx);
+}
+
+pub(super) fn finish_inactive_rename(app: &mut App, ctx: &egui::Context) {
+    let Some((id, _)) = &app.mixer.rename else { return };
+    if app.history.gesture_active() || (app.editor_view == EditorView::Mixer && ctx.memory(|m| m.has_focus(rename_field_id(*id)))) {
+        return;
+    }
+    let (id, draft) = app.mixer.rename.take().unwrap();
+    let name = draft.trim();
+    if !name.is_empty() && app.project.mixer_channel(id).is_some_and(|channel| channel.name != name) {
+        app.apply(Command::RenameMixerChannel { id, name: name.to_owned() });
+    }
+}
+
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     poll_meters(app);
     let mut cmds: Vec<Command> = Vec::new();
@@ -272,21 +303,9 @@ fn strip(app: &mut App, ui: &mut egui::Ui, m: &MixerChannel, all: &[MixerChannel
         ui.spacing_mut().slider_width = FADER_H;
         ui.vertical(|ui| {
             // name
-            let rename_id = egui::Id::unique(("mixer-rename", m.id));
-            let editing = app.mixer.rename.as_ref().is_some_and(|(id, _)| *id == m.id);
-            if editing {
-                if let Some((_, name)) = app.mixer.rename.as_mut() {
-                    let te = ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
-                    // A toolbar click can hide the mixer on release, so finish the edit on the outside press.
-                    if te.lost_focus() || (!te.contains_pointer() && ui.input(|i| i.pointer.any_pressed())) {
-                        te.surrender_focus();
-                        let n = name.trim().to_owned();
-                        if !n.is_empty() && n != m.name {
-                            cmds.push(Command::RenameMixerChannel { id: m.id, name: n });
-                        }
-                        app.mixer.rename = None;
-                    }
-                }
+            let rename_id = rename_field_id(m.id);
+            if let Some((_, name)) = app.mixer.rename.as_mut().filter(|(id, _)| *id == m.id) {
+                ui.add(egui::TextEdit::singleline(name).id(rename_id).desired_width(STRIP_W - 10.0));
             } else {
                 let r = ui.add(egui::Button::selectable(selected, egui::RichText::new(&m.name).strong()).min_size(vec2(STRIP_W - 10.0, 0.0)));
                 if r.clicked() {
